@@ -1,7 +1,7 @@
 // The client's link to the record: sign-in, the event stream, and appending events. It holds no
 // state beyond what the server sent, and has no outbox: a send that cannot reach the server fails,
 // and the caller keeps the draft. Framework-neutral; the UI subscribes to changes.
-import { makeEvent, uuidv7, type EventOf, type EventType, type MyelinEvent } from "@myelin/core";
+import { makeEvent, uuidv7, type Anchor, type EventOf, type EventType, type MyelinEvent } from "@myelin/core";
 
 export type Ev = MyelinEvent & { seq: number };
 export interface Me {
@@ -16,14 +16,25 @@ export interface Draft {
   text: string;
   done: boolean;
   error?: string;
+  /** Set when the reply belongs in an aside. */
+  anchor?: Anchor | null;
 }
 
 export class SignInError extends Error {}
-export class SendError extends Error {}
+/** The server answered and refused. `stale` means a page edit was made against an old revision. */
+export class SendError extends Error {
+  constructor(
+    message: string,
+    readonly status = 0,
+    readonly stale = false,
+  ) {
+    super(message);
+  }
+}
 
 async function json<T>(r: Response): Promise<T> {
-  const body = (await r.json().catch(() => ({}))) as T & { error?: string };
-  if (!r.ok) throw new SendError(body.error ?? `HTTP ${r.status}`);
+  const body = (await r.json().catch(() => ({}))) as T & { error?: string; stale?: boolean };
+  if (!r.ok) throw new SendError(body.error ?? `HTTP ${r.status}`, r.status, body.stale === true);
   return body;
 }
 
@@ -139,11 +150,12 @@ export class Sync {
   }
 
   /**
-   * Appends one event. The id is made here, so a retry after a dropped response cannot duplicate it.
-   * Resolves once the server has stored it; the event itself arrives over the stream.
+   * Appends one event. The id is made here (or by the caller), so a retry after a dropped response
+   * cannot duplicate it. Resolves once the server has stored it; the event itself arrives over the stream.
    */
-  async append<T extends EventType>(type: T, payload: Parameters<typeof makeEvent<T>>[1], attempts = 3): Promise<EventOf<T>> {
-    const event = makeEvent(type, payload, { id: uuidv7(), device_id: this.session.device_id, ts: Date.now() });
+  async append<T extends EventType>(type: T, payload: Parameters<typeof makeEvent<T>>[1], opts: { id?: string; ts?: number; attempts?: number } = {}): Promise<EventOf<T>> {
+    const attempts = opts.attempts ?? 3;
+    const event = makeEvent(type, payload, { id: opts.id ?? uuidv7(), device_id: this.session.device_id, ts: opts.ts ?? Date.now() });
     let lastError: unknown;
     for (let i = 0; i < attempts; i++) {
       try {

@@ -1,6 +1,6 @@
 // What the tutor is told at the start of a sitting. The thread is endless, so the tutor gets a
 // summary built from the store, never the whole transcript.
-import { isRebuildable, type Scheduler, type State, type Unit } from "@myelin/core";
+import { isRebuildable, lineAt, mapRange, pageText, type Anchor, type PageState, type Scheduler, type State, type Unit } from "@myelin/core";
 
 export interface ThreadMessage {
   id: string;
@@ -8,6 +8,8 @@ export interface ThreadMessage {
   ts: number;
   author: "learner" | "tutor";
   text: string;
+  /** Set when the message belongs to an aside on a page. */
+  anchor?: Anchor | null;
   /** When the learner saw the tutor's last message, started typing, and sent. Learner messages only. */
   timing?: { shown_at: number | null; input_started_at: number | null; sent_at: number | null } | null;
 }
@@ -20,6 +22,8 @@ export interface SittingInput {
   tail: ThreadMessage[];
   timeZone?: string | undefined;
   scheduler?: Scheduler | undefined;
+  /** The page the learner is working on, if any. */
+  page?: PageState | null | undefined;
 }
 
 const TAIL_MESSAGES = 30;
@@ -48,6 +52,38 @@ export function formatAgo(ms: number): string {
 
 function sameDay(a: number, b: number, timeZone?: string): boolean {
   return formatDate(a, timeZone) === formatDate(b, timeZone);
+}
+
+/** A page counts as open while it was touched this recently. */
+export const OPEN_PAGE_MS = 12 * 3_600_000;
+
+/** The page the learner is working on: the one touched last, by an edit or an aside, if recent enough. */
+export function openPage(state: State, messages: readonly ThreadMessage[], now: number): PageState | null {
+  const touched = new Map<string, number>();
+  for (const p of Object.values(state.pages)) touched.set(p.id, Math.max(p.created_at, p.edited_at));
+  for (const m of messages) {
+    const id = m.anchor?.page_id;
+    if (id && touched.has(id)) touched.set(id, Math.max(touched.get(id)!, m.ts));
+  }
+  let best: PageState | null = null;
+  let at = -Infinity;
+  for (const [id, t] of touched) {
+    if (t > at) {
+      at = t;
+      best = state.pages[id]!;
+    }
+  }
+  return best && now - at < OPEN_PAGE_MS ? best : null;
+}
+
+/** Where an anchored message sits now, for the tutor: the page, the line and the passage. */
+export function anchorLabel(state: State, anchor: Anchor): string {
+  const page = state.pages[anchor.page_id];
+  if (!page) return `on an unknown page, at "${anchor.quote}"`;
+  const range = mapRange(page, anchor.rev, anchor.from, anchor.to);
+  if (!range) return `on page "${page.title}" (id ${page.id}), at a passage since deleted: "${anchor.quote}"`;
+  const line = lineAt(page, range.from);
+  return `on page "${page.title}" (id ${page.id}), at line ${line?.n ?? "?"}: "${anchor.quote}"`;
 }
 
 /** The newest messages that fit, oldest first. */
@@ -89,7 +125,7 @@ export function relevantUnits(state: State, limit = UNITS): Unit[] {
     .slice(0, limit);
 }
 
-export function buildSittingContext({ name, now, state, tail, timeZone, scheduler }: SittingInput): string {
+export function buildSittingContext({ name, now, state, tail, timeZone, scheduler, page }: SittingInput): string {
   const lines: string[] = ["# This sitting", ""];
   lines.push(`It is ${formatWhen(now, timeZone)}. The learner is ${name}.`);
   const last = tail.at(-1);
@@ -125,7 +161,11 @@ export function buildSittingContext({ name, now, state, tail, timeZone, schedule
   if (tail.length === 0) lines.push("Nothing yet.");
   for (const m of tail) {
     const when = sameDay(m.ts, now, timeZone) ? formatWhen(m.ts, timeZone, false) : `${formatDate(m.ts, timeZone)} ${formatWhen(m.ts, timeZone, false)}`;
-    lines.push(`[${m.author === "learner" ? "Learner" : "You"}, ${when}] ${m.text}`);
+    const where = m.anchor ? `, in an aside ${anchorLabel(state, m.anchor)}` : "";
+    lines.push(`[${m.author === "learner" ? "Learner" : "You"}, ${when}${where}] ${m.text}`);
+  }
+  if (page) {
+    lines.push("", "## The open page", "The learner wrote this; you cannot edit it. Line numbers are for open_aside only. The learner does not see them, so never mention them; quote the words instead.", "", pageText(page));
   }
   lines.push("", "Messages from the learner follow. Use search_memory for anything older than this tail.");
   return lines.join("\n");

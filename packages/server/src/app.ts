@@ -9,7 +9,7 @@ import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { streamSSE } from "hono/streaming";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
-import { ConflictError, type Appended } from "./store.js";
+import { ConflictError, StaleError, type Appended } from "./store.js";
 import type { Stores } from "./stores.js";
 import type { Draft, Tutors } from "./tutor/tutor.js";
 
@@ -127,6 +127,7 @@ export function createApp({ registry, stores, webRoot, tutors }: AppOptions): Ho
       return c.json({ results: stores.get(user.id).append(events) });
     } catch (e) {
       if (e instanceof ConflictError) return c.json({ error: e.message }, 409);
+      if (e instanceof StaleError) return c.json({ error: e.message, stale: true }, 409);
       if (e instanceof EventError) return c.json({ error: e.message }, 400);
       throw e;
     }
@@ -218,7 +219,8 @@ export function createApp({ registry, stores, webRoot, tutors }: AppOptions): Ho
   app.all("/api/*", (c) => c.json({ error: "not found" }, 404));
 
   if (webRoot && existsSync(join(webRoot, "index.html"))) {
-    const index = readFileSync(join(webRoot, "index.html"), "utf8");
+    // Read on each request, so a rebuild is picked up without a restart.
+    const index = join(webRoot, "index.html");
     app.use("/assets/*", async (c, next) => {
       await next();
       if (c.res.ok) c.header("Cache-Control", "public, max-age=31536000, immutable");
@@ -228,7 +230,7 @@ export function createApp({ registry, stores, webRoot, tutors }: AppOptions): Ho
     // POST, so a link preview that fetches the URL cannot use it up.
     app.get("*", (c) => {
       c.header("Cache-Control", "no-cache");
-      return c.html(index);
+      return c.html(readFileSync(index, "utf8"));
     });
   }
 

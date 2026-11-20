@@ -3,12 +3,27 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { applyEvent, canonicalJson, emptyState, parseEvent, type MyelinEvent, type Scheduler, type State } from "@myelin/core";
+import {
+  applyEvent,
+  applyPageEdit,
+  canonicalJson,
+  emptyState,
+  EventError,
+  newPage,
+  PageEditError,
+  parseEvent,
+  type MyelinEvent,
+  type PageState,
+  type Scheduler,
+  type State,
+} from "@myelin/core";
 
 export type Appended = MyelinEvent & { seq: number };
 export type Listener = (events: Appended[]) => void;
 
 export class ConflictError extends Error {}
+/** A page edit made against a revision that is no longer current. The device reloads and rebases. */
+export class StaleError extends Error {}
 
 interface Row {
   seq: number;
@@ -80,6 +95,12 @@ export class EventStore {
     const out: { id: string; seq: number; duplicate: boolean }[] = [];
     const find = this.db.prepare("SELECT * FROM events WHERE id = ?");
     const insert = this.db.prepare("INSERT INTO events (id, device_id, ts, type, v, payload) VALUES (?, ?, ?, ?, ?, ?)");
+    // Page events are checked against scratch copies of the pages, so later edits in the batch see earlier ones.
+    const scratch = new Map<string, PageState | null>();
+    const page = (id: string) => {
+      if (!scratch.has(id)) scratch.set(id, this.state.pages[id] ? structuredClone(this.state.pages[id]) : null);
+      return scratch.get(id)!;
+    };
     this.db.exec("BEGIN IMMEDIATE");
     try {
       for (const e of events) {
@@ -89,6 +110,19 @@ export class EventStore {
           if (!same) throw new ConflictError(`event ${e.id} already exists with different content`);
           out.push({ id: e.id, seq: existing.seq, duplicate: true });
           continue;
+        }
+        if (e.type === "page.created") {
+          if (page(e.payload.page_id)) throw new EventError(`page ${e.payload.page_id} already exists`);
+          scratch.set(e.payload.page_id, newPage(e.payload.page_id, e.payload.title, e.payload.starter, e.ts));
+        } else if (e.type === "page.edited") {
+          const p = page(e.payload.page_id);
+          if (!p) throw new EventError(`no page ${e.payload.page_id}`);
+          try {
+            applyPageEdit(p, e.payload.base_rev, e.payload.steps, e.ts);
+          } catch (err) {
+            if (!(err instanceof PageEditError)) throw err;
+            throw err.stale ? new StaleError(err.message) : new EventError(`event ${e.id}: ${err.message}`);
+          }
         }
         const r = insert.run(e.id, e.device_id, e.ts, e.type, e.v, JSON.stringify(e.payload));
         out.push({ id: e.id, seq: Number(r.lastInsertRowid), duplicate: false });

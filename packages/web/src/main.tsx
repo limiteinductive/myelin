@@ -1,4 +1,5 @@
 // Boot: spend a login link if the URL holds one, then show the thread or the sign-in screen.
+import "katex/dist/katex.min.css";
 import "../../../design/tokens.css";
 import "../../../design/components/bundle.css";
 import "./app.css";

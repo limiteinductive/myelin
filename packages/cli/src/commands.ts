@@ -29,7 +29,7 @@ export function promptPath(): string {
 
 /** The tutor, if the host has a key for the model in MYELIN_MODEL. Never logs the key. */
 export async function tutorFromEnv(dir: string, log: (s: string) => void): Promise<TutorOptions | undefined> {
-  const spec = process.env.MYELIN_MODEL || "google/gemini-flash-latest";
+  const spec = process.env.MYELIN_MODEL || "google/gemini-4-neon";
   const keyName = keyEnvFor(spec.split("/")[0] ?? "");
   const apiKey = process.env[keyName];
   if (!apiKey) {

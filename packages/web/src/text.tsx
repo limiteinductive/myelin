@@ -1,6 +1,8 @@
 // Message text to elements. Only a small, safe subset: paragraphs, line breaks, fenced code,
-// inline code, bold and italic. Everything else shows as typed. No HTML is ever parsed.
+// inline code, math, bold and italic. Everything else shows as typed. No HTML is ever parsed; math
+// is KaTeX's own output for the TeX between the dollar signs.
 import type { JSX } from "@solidjs/web";
+import { mathHtml } from "./math.js";
 
 type Block = { kind: "p"; text: string } | { kind: "code"; text: string };
 
@@ -21,7 +23,7 @@ export function blocks(text: string): Block[] {
   return out;
 }
 
-const INLINE = /(`[^`\n]+`|\*\*[^*\n]+\*\*|(?<![\w*])\*[^*\s][^*\n]*?\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*?_(?![\w_]))/g;
+const INLINE = /(`[^`\n]+`|\$\$[^$\n]+?\$\$|\$(?=[^\s$])[^$\n]*?[^\s$\\]\$(?!\d)|\*\*[^*\n]+\*\*|(?<![\w*])\*[^*\s][^*\n]*?\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*?_(?![\w_]))/g;
 
 export function inline(text: string): JSX.Element[] {
   const out: JSX.Element[] = [];
@@ -31,6 +33,8 @@ export function inline(text: string): JSX.Element[] {
       if (!piece) continue;
       if (i % 2 === 0) out.push(piece);
       else if (piece.startsWith("`")) out.push(<code class="app-code">{piece.slice(1, -1)}</code>);
+      else if (piece.startsWith("$$")) out.push(<span class="myl-math app-math-display" innerHTML={mathHtml(piece.slice(2, -2).trim(), true)} />);
+      else if (piece.startsWith("$")) out.push(<span class="myl-math" innerHTML={mathHtml(piece.slice(1, -1), false)} />);
       else if (piece.startsWith("**")) out.push(<strong>{piece.slice(2, -2)}</strong>);
       else out.push(<em>{piece.slice(1, -1)}</em>);
     }

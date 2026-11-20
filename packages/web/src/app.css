@@ -10,3 +10,54 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 .app-code { padding: 0.1em 0.3em; border-radius: var(--radius-control); background: var(--code-surface); font: 400 0.88em/1 var(--font-mono); }
 .myl-message .myl-code pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .app-editing { outline: none; border-bottom: 1px solid var(--accent); cursor: text; }
+
+/* ---------- a page beside the thread ---------- */
+.app-desk { height: 100dvh; overflow-y: auto; background-image: url(../../../design/assets/Texture/paper-grain.svg); }
+.app-desk > .myl-desk { min-height: 100%; align-items: stretch; }
+.app-page { animation: app-open 240ms ease-out; }
+.app-margin { animation: app-open 240ms ease-out; gap: 0; }
+.app-thread-card { max-height: 40vh; overflow-y: auto; overscroll-behavior: contain; }
+.app-thread-card > .myl-unit, .app-thread-card > .myl-pagelink { margin-inline: calc(-1 * var(--space-2)); }
+.app-asides { display: flow-root; margin-top: var(--space-3); }
+.app-asides:empty { display: none; }
+.app-dock { position: sticky; bottom: var(--space-4); margin-top: auto; padding-top: var(--space-3); }
+.myl-aside__message p { margin: 0; }
+.myl-aside__message p + p { margin-top: var(--space-2); }
+.app-aside-turn { margin-top: var(--space-6); }
+.myl-thread > div > .myl-aside { margin-block: var(--space-2); }
+@keyframes app-open { from { opacity: 0; transform: translateX(-8px); } }
+
+@media (max-width: 959.98px) {
+  .app-desk > .myl-desk { flex-direction: column; align-items: stretch; padding-bottom: calc(var(--target-min) + var(--space-8) * 2 + env(safe-area-inset-bottom)); }
+  .app-desk .myl-margin { width: 100%; max-width: calc(var(--reading-width) + 2 * var(--space-6)); margin-inline: auto; padding-top: 0; }
+  .app-dock { position: fixed; left: var(--space-4); right: var(--space-4); bottom: 0; z-index: 1; margin: 0; padding: var(--space-2) 0 calc(var(--space-4) + env(safe-area-inset-bottom)); background: var(--paper); }
+  .app-dock > .myl-composer { max-width: var(--reading-width); margin-inline: auto; }
+}
+
+/* ---------- the page on a phone: read-only over the thread ---------- */
+.app-sheet { position: fixed; inset: 0; z-index: 2; overflow-y: auto; background-color: var(--paper); background-image: url(../../../design/assets/Texture/paper-grain.svg); animation: app-rise 240ms ease-out; }
+.app-sheet > .myl-page { padding-inline: var(--space-4); padding-bottom: calc(var(--space-8) + env(safe-area-inset-bottom)); }
+.app-sheet .myl-page__bar { justify-content: flex-start; }
+@keyframes app-rise { from { opacity: 0; transform: translateY(12px); } }
+
+/* ---------- the document ---------- */
+.app-doc { outline: none; white-space: pre-wrap; overflow-wrap: break-word; min-height: 30vh; caret-color: var(--accent); }
+.app-doc[contenteditable="false"] { min-height: 0; }
+.app-doc pre { margin: 0 0 var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-card); background: var(--code-surface); font: 400 14px/1.6 var(--font-mono); white-space: pre-wrap; }
+.app-doc h2 { margin-top: var(--space-6); }
+.app-doc ::selection { background: var(--selection); }
+.app-math-hidden { display: none; }
+.app-math-source { font-family: var(--font-mono); font-size: 0.88em; color: var(--accent); }
+.myl-math { cursor: text; }
+.app-math-display { display: block; margin: var(--space-2) 0; text-align: center; white-space: normal; }
+.myl-message .app-math-display { overflow-x: auto; }
+
+@media (prefers-contrast: more), (prefers-reduced-transparency: reduce) {
+  .app-desk, .app-sheet { background-image: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .app-page, .app-margin, .app-sheet { animation: none; }
+}
+
+/* The quoted passage in the composer's scope line: one line, cut with an ellipsis. */
+.app-scope-quote { display: inline-block; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }

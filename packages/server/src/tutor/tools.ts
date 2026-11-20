@@ -1,8 +1,11 @@
 // The tutor's tools. The tool list is the safety boundary: Pi's file and shell tools are off, and
-// every tool here only reads the record or appends events. No tool can edit a page.
+// every tool here only reads the record or appends events. No tool can edit a page: open_page
+// creates one with its problem statement, and open_aside only posts a message anchored to it.
 import {
   DAY_MS,
+  findPassage,
   isRebuildable,
+  pageLines,
   nextProbe,
   resolveUnit,
   uuidv7,
@@ -19,10 +22,10 @@ import {
 } from "@myelin/core";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { formatDate, type ThreadMessage } from "./context.js";
+import { formatDate, openPage, type ThreadMessage } from "./context.js";
 
 /** A card carried on the tutor's reply. The client draws a unit card or the grey trace line. */
-export type Card = { kind: "unit"; unit_id: string; how: string; note: string | null } | { kind: "trace"; text: string };
+export type Card = { kind: "unit"; unit_id: string; how: string; note: string | null } | { kind: "trace"; text: string } | { kind: "page"; page_id: string };
 
 /** What the tools know about the turn in progress. */
 export interface TurnInfo {
@@ -93,6 +96,14 @@ export function searchMemory(host: Pick<ToolHost, "state" | "messages" | "timeZo
     if (u.status !== "active") continue;
     const s = score(`${u.text} ${u.kind} ${u.topic ?? ""}`);
     if (s > 0) hits.push({ score: s + 0.5, at: u.found_at, line: `[unit ${u.id}, ${u.kind}] ${u.text}` });
+  }
+  for (const page of Object.values(host.state.pages)) {
+    const t = score(page.title);
+    if (t > 0) hits.push({ score: t + 0.5, at: page.edited_at, line: `[page "${page.title}", id ${page.id}, ${formatDate(page.created_at, host.timeZone)}]` });
+    for (const l of pageLines(page)) {
+      const s = score(l.text);
+      if (s > 0) hits.push({ score: s, at: page.edited_at, line: `[page "${page.title}", id ${page.id}, line ${l.n}] ${l.text.slice(0, 400)}` });
+    }
   }
   hits.sort((a, b) => b.score - a.score || b.at - a.at);
   if (hits.length === 0) return "Nothing found.";
@@ -530,6 +541,59 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     },
   });
 
+  const openPageTool = defineTool({
+    name: "open_page",
+    label: "Open page",
+    description:
+      "Opens a page beside the thread for work that needs room: a derivation, a proof, code, an explanation. The learner writes on it; you never can. " +
+      "The starter is the problem statement shown at the top, never a solution or a hint. The app puts a link to the page under your reply.",
+    parameters: Type.Object({
+      title: Type.String({ description: "A short title, such as 'Bayes with a rare disease'" }),
+      starter: Type.Optional(Type.String({ description: "The problem statement, if there is one. Never part of a solution" })),
+    }),
+    async execute(_id, p) {
+      const title = p.title.trim();
+      if (!title) return ok("A page needs a title.");
+      const page_id = uuidv7(host.now());
+      host.append("page.created", { page_id, title, starter: p.starter?.trim() || null });
+      host.turn().cards.push({ kind: "page", page_id });
+      return ok(`Page opened (page_id ${page_id}). The link is shown under your reply. Tell them what to do on it in one line, then stay quiet while they work.`);
+    },
+  });
+
+  const openAside = defineTool({
+    name: "open_aside",
+    label: "Open aside",
+    description:
+      "Posts a message anchored to a passage on a page, shown beside that passage. Use it at a real flaw in the reasoning: a question at the line, never the fix. " +
+      "Quote the passage exactly as it is written on the page, a few words to one line.",
+    parameters: Type.Object({
+      passage: Type.String({ description: "The words on the page the aside is about, copied exactly" }),
+      text: Type.String({ description: "The aside: one question, at most 100 words, without the fix" }),
+      line: Type.Optional(Type.Number({ description: "The line number the passage is on, from the page text" })),
+      page_id: Type.Optional(Type.String({ description: "The page. Defaults to the open page" })),
+    }),
+    async execute(_id, p) {
+      const s = host.state;
+      const page = p.page_id ? s.pages[p.page_id] : openPage(s, host.messages(), host.now());
+      if (!page) return ok(p.page_id ? `No page with id ${p.page_id}.` : "No page is open. Pass page_id.");
+      const text = p.text.trim();
+      if (!text) return ok("An aside needs text.");
+      const n = text.split(/\s+/).length;
+      if (n > 100) return ok(`That is ${n} words. Keep an aside to 100 words or fewer: one question.`);
+      const found = findPassage(page, p.passage, p.line);
+      if (!found) return ok(`Could not find "${p.passage}" on page ${page.id}. Quote a few words exactly as they are written.`);
+      host.append("message.added", {
+        author: "tutor",
+        text,
+        cards: [],
+        anchor: { page_id: page.id, rev: page.rev, from: found.from, to: found.to, quote: found.quote },
+        timing: null,
+      });
+      return ok(`Aside posted at "${found.quote}". It is shown beside the passage, so do not repeat it in your reply. Write nothing else unless they asked something else in the thread.`);
+    },
+  });
+
   const stayQuiet = defineTool({
     name: "stay_quiet",
     label: "Stay quiet",
@@ -540,5 +604,19 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     },
   });
 
-  return [setGoal, setBudget, setPreference, search, getProfile, findUnit, reviseUnit, nextProbeTool, recordProbe, observeUnit, stayQuiet] as unknown as ToolDefinition[];
+  return [
+    setGoal,
+    setBudget,
+    setPreference,
+    search,
+    getProfile,
+    findUnit,
+    reviseUnit,
+    nextProbeTool,
+    recordProbe,
+    observeUnit,
+    openPageTool,
+    openAside,
+    stayQuiet,
+  ] as unknown as ToolDefinition[];
 }

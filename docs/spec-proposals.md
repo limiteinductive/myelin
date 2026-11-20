@@ -45,7 +45,7 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 13. **Day dividers in the thread.** A small "Today", "Yesterday" or dated label (`myl-day`) sits between days. It is text, not a control.
     *Spec change:* add to "The thread": "Days are separated by a dated label."
 
-14. **The CLI reads `.env`.** `myelin up` loads `.env` from the working directory and the repo root. The model is `MYELIN_MODEL` (default `google/gemini-flash-latest`) and the key is the provider's usual variable (`GEMINI_API_KEY`). With no key, the server runs and says the tutor is off.
+14. **The CLI reads `.env`.** `myelin up` loads `.env` from the working directory and the repo root. The model is `MYELIN_MODEL` (default `google/gemini-4-neon`, was `google/gemini-flash-latest` until milestone 5) and the key is the provider's usual variable (`GEMINI_API_KEY`). With no key, the server runs and says the tutor is off.
     *Spec change:* in "Deploy CLI and sharing", name `MYELIN_MODEL` and the provider key variable.
 
 15. **Pi's SDK docs link.** The SDK page is now under `docs.pi.dev/latest`. The two links in the spec point at the old path.
@@ -81,4 +81,75 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
     *Spec change:* amend proposal 11 to "A model error writes no text."
 
 25. **Math in the thread renders with milestone 5.** The tutor writes TeX such as `$\nabla p$`. The thread shows it as typed until KaTeX arrives with the page, and it will render math in thread messages too.
+    *Spec change:* none.
+
+## Milestone 5
+
+26. **Pages are opened in words; the plus button still waits.** A page opens when the learner asks for one and the tutor calls `open_page`. The plus button has nothing to attach until milestone 7.
+    *Spec change:* amend proposal 12 to "until milestone 7".
+
+27. **A page's title is fixed for now.** The spec says naming is asked for in words, but the data model has no rename event. `open_page` sets the title, and asking to rename gets a plain "not yet".
+    *Spec change:* add `page.renamed {page_id, title}` to Pages and a `rename_page` tool. I suggest doing it at milestone 9 with `show_card`.
+
+28. **"In progress" and "kept".** A page link reads "in progress" while the page is open on this device, or while it is the most recently edited page and was edited within 30 minutes. Otherwise it reads "kept".
+    *Spec change:* none; the PageLink README leaves the rule open.
+
+29. **The tutor's open page.** For the tutor, the open page is the most recently created or edited page touched within the last 12 hours. Its text, with line numbers, goes into the context. When its revision changes mid-sitting, the next turn starts with `[app: the open page now reads: …]`. Line numbers are only for `open_aside`; the tutor is told never to mention them.
+    *Spec change:* add to "Tutor agent / Context".
+
+30. **A reply in an aside carries its anchor forward.** A learner message sent while the composer is aimed at an aside carries that aside's anchor. The tutor sees `[app: this is in an aside on page "…", at line N: "…"]`, and its reply joins the same aside. Anchors are mapped to the current revision; the quote stays as first written.
+    *Spec change:* none.
+
+31. **The problem is the first block of the page.** `page.created`'s starter becomes a `problem` node at the top of the document. The editor refuses any step that touches it, so the learner cannot change the problem and the tutor never edits the page.
+    *Spec change:* add to "Data model / Pages".
+
+32. **A page's revision is its step count.** `rev` counts every editor step applied. Every device and the server fold `page.edited` with the same core code, so a `base_rev` and an anchor's `rev` mean the same thing everywhere.
+    *Spec change:* add to "Data model / Pages".
+
+33. **Math on a page is text.** TeX between dollar signs is stored as typed and rendered with decorations. With the cursor in a formula it shows as source. This uses the thread's math rule, so `$5 and $6` is not math. An aside highlight over a formula marks the rendered formula.
+    *Spec change:* none; the spec says "typed math".
+
+34. **Asides that overlap are one aside.** Asides group by anchor range. A message whose range overlaps an existing aside's range on the same page joins it. Asides are ordered by their passage's position.
+    *Spec change:* add to "The experience / Asides".
+
+35. **What the composer is aimed at.** A selection on the page aims the composer at that passage ("About "…""). A selection or a cursor inside an aside's passage aims it at that aside ("In the aside on "…""). Escape aims it back at the thread. The line is rendered as it reads, math included.
+    *Spec change:* none; it is the "composer follows the selection" rule made concrete.
+
+36. **Edits are batched and timed.** A `page.edited` carries `started_at` and `ended_at`. A batch is sent after 1 second idle, or at once once it is 10 seconds old or a send is waiting on it.
+    *Spec change:* add the two fields to the data model table.
+
+37. **A stale edit is rebased.** The server refuses an edit whose `base_rev` is behind (409, `stale`). The device takes the newer steps, rebases its own with `prosemirror-collab` and sends again.
+    *Spec change:* none.
+
+38. **Unsent steps survive a reload, carefully.** A device keeps its unconfirmed steps in local storage with the revision they were made on. They are restored only when the page is still at that revision. A batch that was sent but not confirmed is re-posted with the same id and timestamp, so the server's dedupe makes it idempotent. This extends "keep an unsent draft" to the page.
+    *Spec change:* amend "no offline mode beyond keeping an unsent draft" to "an unsent draft or unsent page edits".
+
+39. **Each tab is its own editor.** Every tab gets its own collab client id, so two tabs on one device rebase against each other like two devices.
+    *Spec change:* none.
+
+40. **The margin's thread card shows the last four messages.** It keeps the thread visible beside the page without crowding out the asides. The full thread is one link away.
+    *Spec change:* none.
+
+41. **Who raised an aside sets its colours.** A learner-raised aside uses `myl-highlight--resting` on the page and the accent rule on its quote. A tutor-raised aside uses `--asked` and the source rule.
+    *Spec change:* none; it follows the Aside README.
+
+42. **Asides whose passage was deleted.** They leave the margin, since nothing on the page is level with them, and stay in the thread view with their quote.
+    *Spec change:* add to the Aside README.
+
+43. **On a phone the composer stays with the thread.** The page opens read-only in a sheet over the thread. Asides appear in the thread as quote plus messages, and a reply there goes to the thread, not the aside.
+    *Spec change:* none; pages on a phone are read-only.
+
+44. **The tutor's new page opens itself on a desk.** When `open_page` posts a page link while the app is open on a wide screen, the page opens beside the thread. On a phone the link waits for a tap.
+    *Spec change:* add to the DeskPage README.
+
+45. **Page link facts.** The link reads "N lines · edited 14:05". When the tutor has asked questions on the page, it reads "N lines, K questions from the tutor".
+    *Spec change:* none.
+
+46. **Unit cards in asides stay in the thread.** A unit found inside an aside shows its card in the thread view, not in the desk margin, to keep the margin to the conversation.
+    *Spec change:* none.
+
+47. **Marking a passage as a note waits.** The Page README allows showing reasoning in `muted` if the learner marks it as a note, but no control for marking exists, and adding one needs your say. Deferred.
+    *Spec change:* none yet.
+
+48. **A link to an existing page waits for `show_card`.** For now the only page link is the one `open_page` posts. Pointing back to an older page needs `show_card(page link)`, which arrives with milestone 9.
     *Spec change:* none.

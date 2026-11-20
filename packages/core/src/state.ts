@@ -9,6 +9,7 @@
 //   so a later grade correction recomputes it exactly.
 import type { Depth, EventOf, EventType, Grade, MyelinEvent, Origin, Payload, SlotKind } from "./events.js";
 import { isCorrection } from "./events.js";
+import { applyPageEdit, newPage, PageEditError, type PageState } from "./page.js";
 import type { Scheduler, UnitMemory } from "./scheduler.js";
 
 export const DAY_MS = 86_400_000;
@@ -113,13 +114,14 @@ export interface State {
   goals: Record<string, Goal>;
   preferences: Record<string, Preference>;
   budget: { seconds: number; note: string | null; set_at: number } | null;
+  pages: Record<string, PageState>;
   anomalies: Anomaly[];
 }
 
 export class ReplayError extends Error {}
 
 export function emptyState(scheduler: Scheduler): State {
-  return { seq: 0, scheduler: scheduler.name, units: {}, evidence: {}, goals: {}, preferences: {}, budget: null, anomalies: [] };
+  return { seq: 0, scheduler: scheduler.name, units: {}, evidence: {}, goals: {}, preferences: {}, budget: null, pages: {}, anomalies: [] };
 }
 
 /** A unit can be rebuilt from others when it rests on something. Otherwise it is arbitrary. */
@@ -413,6 +415,24 @@ const reducers: { [T in EventType]?: Reducer<T> } = {
     if (p.present) u.observations.present++;
     else u.observations.missing++;
     u.observations.last_at = e.ts;
+  },
+
+  "page.created": (state, e) => {
+    const p = e.payload;
+    if (state.pages[p.page_id]) return anomaly(state, e, `page ${p.page_id} already exists`);
+    state.pages[p.page_id] = newPage(p.page_id, p.title, p.starter, e.ts);
+  },
+
+  "page.edited": (state, e) => {
+    const p = e.payload;
+    const page = state.pages[p.page_id];
+    if (!page) return anomaly(state, e, `edit of unknown page ${p.page_id}`);
+    try {
+      applyPageEdit(page, p.base_rev, p.steps, e.ts);
+    } catch (err) {
+      if (!(err instanceof PageEditError)) throw err;
+      anomaly(state, e, `edit of page ${p.page_id} refused: ${err.message}`);
+    }
   },
 
   "goal.set": (state, e) => {

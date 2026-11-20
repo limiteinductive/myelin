@@ -3,7 +3,7 @@
 // The reply becomes a message.added event when the turn ends; the draft itself is never stored.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { makeEvent, STUDY_MODE_DEVICE, uuidv7, type EventType, type MyelinEvent } from "@myelin/core";
+import { makeEvent, mapRange, pageText, STUDY_MODE_DEVICE, uuidv7, type Anchor, type EventType, type MyelinEvent } from "@myelin/core";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -16,7 +16,7 @@ import {
 import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
-import { buildSittingContext, formatAgo, tailOf, type ThreadMessage } from "./context.js";
+import { anchorLabel, buildSittingContext, formatAgo, openPage, tailOf, type ThreadMessage } from "./context.js";
 import { describeProbe, offerProbe, tutorTools, type Card, type Offer, type ToolHost, type TurnInfo } from "./tools.js";
 
 /** The device id on everything the tutor writes. */
@@ -29,6 +29,8 @@ export interface Draft {
   text: string;
   done: boolean;
   error?: string;
+  /** Set when the reply belongs to an aside. */
+  anchor?: Anchor | null;
 }
 
 export interface ModelChoice {
@@ -81,6 +83,8 @@ export class Tutor {
   private offers = new Map<string, Offer>();
   /** Things the app tells the tutor at the start of its next prompt, such as a learner's rewording. */
   private notes: string[] = [];
+  /** The revision of each page the tutor has read in this sitting. */
+  private seenRev = new Map<string, number>();
   private readonly gap: number;
   private readonly now: () => number;
 
@@ -140,7 +144,7 @@ export class Tutor {
   private index(e: MyelinEvent & { seq?: number }): ThreadMessage | null {
     if (e.type !== "message.added" || e.seq === undefined) return null;
     const p = e.payload;
-    const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, timing: p.timing ?? null };
+    const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, anchor: p.anchor ?? null, timing: p.timing ?? null };
     this.messages.push(m);
     if (e.device_id === STUDY_MODE_DEVICE) this.imported.add(e.id);
     return m;
@@ -188,10 +192,13 @@ export class Tutor {
   private async turn(triggers: Set<Trigger>): Promise<void> {
     const now = this.now();
     const asked = this.unanswered();
+    if (asked.length === 0 && !triggers.has("greeting")) return;
+    const session = await this.sitting(now, new Set(asked.map((m) => m.id)));
+    const state = this.store.state;
     let prompt: string;
     if (asked.length > 0) {
-      prompt = asked.map((m) => m.text).join("\n\n");
-    } else if (triggers.has("greeting")) {
+      prompt = asked.map((m) => (m.anchor ? `[app: this is in an aside ${anchorLabel(state, m.anchor)}]\n${m.text}` : m.text)).join("\n\n");
+    } else {
       const last = this.messages.at(-1);
       const opened = `[app: the learner just opened the app${last ? `; the last message was ${formatAgo(now - last.ts)}` : ""}. `;
       const probe = offerProbe(this.toolHost(), { kind: "greeting", seconds: 30, context: [] }, now);
@@ -199,16 +206,15 @@ export class Tutor {
         ? `${opened}Greet them in a few words, then open with one short probe before anything else. ${describeProbe(probe, this.store.state)} ` +
           "Once it is graded, ask what they want to work on now, toward their goal if they have one.]"
         : `${opened}Greet them in one short line, then ask what they want to work on now, toward their goal if they have one. One question.]`;
-    } else {
-      return;
     }
-    if (this.notes.length > 0) {
-      prompt = `${this.notes.join("\n")}\n\n${prompt}`;
-      this.notes = [];
-    }
+    const notes = [...this.notes, ...this.pageNotes(now)];
+    this.notes = [];
+    if (notes.length > 0) prompt = `${notes.join("\n")}\n\n${prompt}`;
 
-    const session = await this.sitting(now, new Set(asked.map((m) => m.id)));
-    const draft: Draft = { id: uuidv7(now), text: "", done: false };
+    // A reply to a message in an aside stays in that aside.
+    const lastAsked = asked.at(-1);
+    const anchor = lastAsked?.anchor ? this.carry(lastAsked.anchor) : null;
+    const draft: Draft = { id: uuidv7(now), text: "", done: false, anchor };
     const info: TurnInfo = { replyId: draft.id, answer: asked[0] ?? null, cards: [] };
     this.turnInfo = info;
     this.current = draft;
@@ -247,15 +253,15 @@ export class Tutor {
       this.log(`tutor could not answer ${this.userId}: ${error}`);
       this.endSitting();
       // Units already recorded in this turn still get their cards.
-      if (info.cards.length > 0) this.post(draft.id, "", info.cards);
-      this.emit({ id: draft.id, text: "", done: true, error: "The tutor could not answer just now. Your message is kept, and it will answer when you next send." });
+      if (info.cards.length > 0) this.post(draft.id, "", info.cards, anchor);
+      this.emit({ id: draft.id, text: "", done: true, anchor, error: "The tutor could not answer just now. Your message is kept, and it will answer when you next send." });
       return;
     }
     if (asked.length > 0) this.answeredThrough = Math.max(this.answeredThrough, ...asked.map((m) => m.seq));
     this.lastTurnAt = this.now();
     const text = draft.text.trim();
-    if (text || info.cards.length > 0) this.post(draft.id, text, info.cards);
-    this.emit({ id: draft.id, text, done: true });
+    if (text || info.cards.length > 0) this.post(draft.id, text, info.cards, anchor);
+    this.emit({ id: draft.id, text, done: true, anchor });
   }
 
   /** The session for this sitting. A new sitting starts after a long enough break. */
@@ -265,6 +271,8 @@ export class Tutor {
     this.endSitting();
 
     const host = this.toolHost();
+    const page = openPage(this.store.state, this.messages, now);
+    if (page) this.seenRev.set(page.id, page.rev);
     const context = buildSittingContext({
       name: this.nameOf(),
       now,
@@ -272,6 +280,7 @@ export class Tutor {
       tail: tailOf(this.messages.filter((m) => !exclude.has(m.id))),
       timeZone: this.opts.timeZone,
       scheduler: this.store.scheduler,
+      page,
     });
     mkdirSync(this.opts.agentDir, { recursive: true });
     const loader = new DefaultResourceLoader({
@@ -308,7 +317,24 @@ export class Tutor {
     return session;
   }
 
+  /** The open page again when it changed since the tutor last read it. */
+  private pageNotes(now: number): string[] {
+    const page = openPage(this.store.state, this.messages, now);
+    if (!page || this.seenRev.get(page.id) === page.rev) return [];
+    const changed = this.seenRev.has(page.id);
+    this.seenRev.set(page.id, page.rev);
+    return [`[app: the open page ${changed ? "now reads" : "reads"}:\n${pageText(page)}]`];
+  }
+
+  /** An anchor carried to the page's current revision. The quote stays as first written. */
+  private carry(a: Anchor): Anchor {
+    const page = this.store.state.pages[a.page_id];
+    const r = page ? mapRange(page, a.rev, a.from, a.to) : null;
+    return page && r ? { ...a, rev: page.rev, from: r.from, to: r.to } : a;
+  }
+
   private endSitting(): void {
+    this.seenRev.clear();
     const s = this.session;
     this.session = null;
     if (!s) return;
@@ -339,8 +365,8 @@ export class Tutor {
     return e as MyelinEvent;
   }
 
-  private post(id: string, text: string, cards: Card[] = []): void {
-    this.write("message.added", { author: "tutor", text, cards, anchor: null, timing: null }, id);
+  private post(id: string, text: string, cards: Card[] = [], anchor: Anchor | null = null): void {
+    this.write("message.added", { author: "tutor", text, cards, anchor, timing: null }, id);
   }
 
   private emit(d: Draft): void {
@@ -378,7 +404,7 @@ export class Tutors {
   }
 }
 
-/** The model named by a spec like "google/gemini-flash-latest", with the host's key. */
+/** The model named by a spec like "google/gemini-4-neon", with the host's key. */
 export async function hostModel(opts: { spec: string; apiKey: string; agentDir: string }): Promise<ModelSource> {
   const [provider, ...rest] = opts.spec.split("/");
   const id = rest.join("/");

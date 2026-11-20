@@ -5,7 +5,8 @@ import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, registerFauxProvider, type FauxResponseStep } from "@earendil-works/pi-ai/compat";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { makeEvent, uuidv7, type MyelinEvent } from "@myelin/core";
+import { groupAsides, makeEvent, mapRange, pageDoc, pageSchema, passageText, uuidv7, type Anchor, type AnchoredMessage, type MyelinEvent } from "@myelin/core";
+import { Transform } from "prosemirror-transform";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FIRST_RUN_TEXT, startServer, TUTOR_DEVICE, type Draft, type RunningServer, type User } from "../src/index.js";
 
@@ -122,6 +123,7 @@ async function until(f: () => boolean, ms = 5000): Promise<void> {
 
 /** Everything the model was shown, as one string. */
 const shown = (context: unknown) => JSON.stringify(context);
+const lastToolResult = (context: unknown) => JSON.stringify((context as { messages: { role: string; content: unknown }[] }).messages.findLast((m) => m.role === "toolResult")?.content);
 const lastUser = (context: { messages: { role: string; content: unknown }[] }) => JSON.stringify(context.messages.findLast((m) => m.role === "user")?.content);
 
 async function learner(name = "ada"): Promise<[User, Device]> {
@@ -403,6 +405,103 @@ describe("tutor", () => {
     const r = await fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ events: [forged] }) });
     expect(r.status).toBe(403);
     expect(Object.keys(srv.stores.get(u.id).state.units)).toHaveLength(1);
+    a.stop();
+  });
+});
+
+describe("pages", () => {
+  it("opens a page, asks a question at a line, and keeps the aside on its passage through edits", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    const store = srv.stores.get(u.id);
+
+    // The tutor opens a page with the problem statement.
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("open_page", { title: "Bayes", starter: "A test is 99% accurate and 1% have the disease. Find P(sick | +)." }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Work it out on the page."),
+    ]);
+    await a.say("give me a Bayes problem");
+    await until(() => a.messages().length === 3);
+    const pageId = a.of("page.created")[0]!.payload.page_id;
+    expect(a.messages()[2]!.cards).toEqual([{ kind: "page", page_id: pageId }]);
+    const page = () => store.state.pages[pageId]!;
+
+    // The learner writes. Each batch names the revision it was made against.
+    const edit = async (fn: (tr: Transform) => void, base = page().rev) => {
+      const tr = new Transform(pageDoc(page()));
+      fn(tr);
+      const steps = tr.steps.map((st) => st.toJSON());
+      const e = makeEvent("page.edited", { page_id: pageId, base_rev: base, steps, started_at: Date.now() - 5000, ended_at: Date.now() }, { id: uuidv7(), device_id: a.id, ts: Date.now() });
+      return fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ events: [e] }) });
+    };
+    const S = pageSchema;
+    const body = pageDoc(page()).child(0).nodeSize + 1;
+    let r = await edit((tr) => {
+      tr.insert(body, S.text("P(sick | +) = P(+ | sick) P(sick) / P(+)"));
+      tr.insert(tr.doc.content.size, S.node("paragraph", null, S.text("P(+) = 0.99 · 0.01 = 0.0099")));
+      tr.insert(tr.doc.content.size, S.node("paragraph", null, S.text("so the answer is $1$")));
+    });
+    expect(r.status).toBe(200);
+    // A stale batch is refused, and says so, so the device can reload.
+    r = await edit((tr) => tr.insert(body, S.text("x")), 0);
+    expect(r.status).toBe(409);
+    expect(await r.json()).toMatchObject({ stale: true });
+
+    // Asked to check, the tutor reads the page with line numbers and asks at the line.
+    let context = "";
+    let retry = "";
+    faux.setResponses([
+      (ctx) => {
+        context = shown(ctx);
+        return fauxAssistantMessage(fauxToolCall("open_aside", { passage: "0.99 · 0.01", line: 3, text: Array(101).fill("word").join(" ") }), { stopReason: "toolUse" });
+      },
+      (ctx) => {
+        retry = lastToolResult(ctx);
+        return fauxAssistantMessage(fauxToolCall("open_aside", { passage: "0.99 · 0.01", line: 3, text: "Who else tests positive, besides the sick?" }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage(""),
+    ]);
+    await a.say("can you check my working?");
+    await until(() => a.drafts.filter((d) => d.done).length === 2);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(context).toContain("3: P(+) = 0.99 · 0.01 = 0.0099");
+    expect(retry).toContain("That is 101 words");
+    const asked = a.of("message.added").at(-1)!;
+    expect(asked.payload).toMatchObject({ author: "tutor", text: "Who else tests positive, besides the sick?", anchor: { page_id: pageId, rev: 3, quote: "0.99 · 0.01" } });
+    expect(a.messages()).toHaveLength(5);
+    const anchor = asked.payload.anchor!;
+    expect(passageText(page(), anchor.from, anchor.to)).toBe("0.99 · 0.01");
+
+    // An edit above the line moves the passage; the anchor follows it.
+    r = await edit((tr) => tr.insert(body - 1, S.node("paragraph", null, S.text("By Bayes:"))));
+    expect(r.status).toBe(200);
+    const moved = mapRange(page(), anchor.rev, anchor.from, anchor.to)!;
+    expect(passageText(page(), moved.from, moved.to)).toBe("0.99 · 0.01");
+
+    // The learner answers in the aside. The tutor hears where, sees the new page, and replies there.
+    let prompt = "";
+    faux.setResponses([
+      (ctx) => {
+        prompt = lastUser(ctx as never);
+        return fauxAssistantMessage("Yes. So what is P(+)?");
+      },
+    ]);
+    const reply = makeEvent("message.added", { author: "learner", text: "oh, the false positives", anchor }, { id: uuidv7(), device_id: a.id, ts: Date.now() });
+    await a.post(reply);
+    await until(() => a.messages().length === 7);
+    expect(prompt).toContain('in an aside on page \\"Bayes\\"');
+    expect(prompt).toContain('at line 4: \\"0.99 · 0.01\\"');
+    expect(prompt).toContain("the open page now reads");
+    const answer = a.of("message.added").at(-1)!;
+    expect(answer.payload.anchor).toMatchObject({ page_id: pageId, rev: page().rev, from: moved.from, to: moved.to, quote: "0.99 · 0.01" });
+    const anchored = a
+      .of("message.added")
+      .filter((e) => e.payload.anchor)
+      .map((e): AnchoredMessage => ({ id: e.id, author: e.payload.author, text: e.payload.text, ts: e.ts, anchor: e.payload.anchor as Anchor }));
+    const asides = groupAsides(anchored, store.state.pages);
+    expect(asides).toHaveLength(1);
+    expect(asides[0]!.messages.map((m) => m.author)).toEqual(["tutor", "learner", "tutor"]);
     a.stop();
   });
 });

@@ -24,6 +24,8 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "prosemirror-model": "1.25.12",
+    "prosemirror-transform": "1.12.5",
     "typescript": "^7.0.2",
     "vitest": "^5.1.1"
   }
