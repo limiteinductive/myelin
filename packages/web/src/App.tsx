@@ -135,6 +135,18 @@ async function sendEdit(s: Sync, payload: EditPayload, id: string, ts: number): 
   }
 }
 
+/** Runs a page's code on the server. The output arrives as a `page.ran` event; this says only if it failed to run. */
+async function runPage(pageId: string): Promise<string | null> {
+  try {
+    const r = await fetch(`/api/pages/${encodeURIComponent(pageId)}/run`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    if (r.ok) return null;
+    if (r.status === 501) return "Code does not run on this server";
+    return "The page could not run just now";
+  } catch {
+    return "The page could not run while offline";
+  }
+}
+
 function Thread(props: { session: Me; go: (s: Screen) => void }) {
   const [view, setView] = createStore({
     events: [] as Ev[],
@@ -659,7 +671,7 @@ function PageView(props: { page: PageState; editable: boolean; sync: () => Sync 
       page: props.page,
       editable: props.editable,
       changed: props.changed,
-      ...(s && props.editable ? { send: (payload: EditPayload, id: string, ts: number) => sendEdit(s, payload, id, ts) } : {}),
+      ...(s && props.editable ? { send: (payload: EditPayload, id: string, ts: number) => sendEdit(s, payload, id, ts), run: () => runPage(props.page.id) } : {}),
       logged: (id) => s?.events.some((e) => e.id === id) ?? false,
     });
     if (s) ed.receive(s.events);

@@ -3,16 +3,17 @@
 // revision it was made against. Every edit comes back over the stream: ours as confirmation, others'
 // with our unsent steps rebased on top. Unsent steps are kept in browser storage until confirmed.
 // Framework-neutral: the UI passes in the aside highlights and reads the selection back as a scope.
-import { pageDoc, pageSchema, uuidv7, type Anchor, type MyelinEvent, type PageState } from "@myelin/core";
+import { pageDoc, pageSchema, uuidv7, type Anchor, type MyelinEvent, type PageRun, type PageState } from "@myelin/core";
 import { collab, getVersion, receiveTransaction, sendableSteps } from "prosemirror-collab";
-import { baseKeymap } from "prosemirror-commands";
+import { baseKeymap, exitCode } from "prosemirror-commands";
 import { history, redo, undo } from "prosemirror-history";
 import { inputRules, textblockTypeInputRule } from "prosemirror-inputrules";
 import { keymap } from "prosemirror-keymap";
 import type { Node as PMNode } from "prosemirror-model";
-import { EditorState, Plugin, PluginKey, TextSelection, type Transaction } from "prosemirror-state";
+import { EditorState, Plugin, PluginKey, TextSelection, type Command, type Transaction } from "prosemirror-state";
 import { Mapping, Step, StepMap } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView } from "prosemirror-view";
+import { codeBlockView, type CodeInfo } from "./codeblock.js";
 import { mathElement, mathSpans, type MathSpan } from "./math.js";
 
 /** An aside's passage, in the positions of the page at `rev` (see setHighlights). */
@@ -52,6 +53,8 @@ export interface EditorOptions {
   logged?: (id: string) => boolean;
   /** After any change of document, selection or focus. */
   changed?: () => void;
+  /** Runs the page as the server has it. Resolves to null, or to why it did not run. */
+  run?: () => Promise<string | null>;
 }
 
 /** A batch is sent after this long without an edit, or once it is this old. */
@@ -62,6 +65,9 @@ interface Ui {
   focused: boolean;
   rev: number;
   highlights: Highlight[];
+  run: PageRun | null;
+  running: boolean;
+  runError: string | null;
 }
 const uiKey = new PluginKey<Ui>("myelin-ui");
 
@@ -106,6 +112,48 @@ function blockText(node: PMNode): string {
   return s;
 }
 
+const INDENT = "    ";
+
+/** In code, Tab indents rather than leaving the page. */
+const codeIndent: Command = (state, dispatch) => {
+  if (!state.selection.$from.parent.type.spec.code) return false;
+  dispatch?.(state.tr.insertText(INDENT).scrollIntoView());
+  return true;
+};
+
+/** In code, Shift-Tab takes up to one indent off the start of the line. */
+const codeDedent: Command = (state, dispatch) => {
+  const { $from } = state.selection;
+  if (!$from.parent.type.spec.code) return false;
+  const text = $from.parent.textContent;
+  const lineStart = text.lastIndexOf("\n", $from.parentOffset - 1) + 1;
+  const spaces = /^ */.exec(text.slice(lineStart))![0].length;
+  const n = Math.min(spaces, INDENT.length);
+  if (n > 0 && dispatch) dispatch(state.tr.delete($from.start() + lineStart, $from.start() + lineStart + n).scrollIntoView());
+  return true;
+};
+
+/** In code, a new line keeps the indent, and goes one further after a colon. */
+const codeNewline: Command = (state, dispatch) => {
+  const { $from, $to } = state.selection;
+  if (!$from.parent.type.spec.code || !$from.sameParent($to)) return false;
+  const before = $from.parent.textContent.slice(0, $from.parentOffset);
+  const line = before.slice(before.lastIndexOf("\n") + 1);
+  let indent = /^ */.exec(line)![0];
+  if (/:\s*$/.test(line)) indent += INDENT;
+  dispatch?.(state.tr.insertText(`\n${indent}`).scrollIntoView());
+  return true;
+};
+
+/** Down from the last line of a code block at the end of the page makes a paragraph after it. */
+const codeExitDown: Command = (state, dispatch, view) => {
+  const { $head, empty } = state.selection;
+  if (!empty || !$head.parent.type.spec.code || $head.after() !== state.doc.content.size) return false;
+  if ($head.parent.textContent.slice($head.parentOffset).includes("\n")) return false;
+  if (view && !view.endOfTextblock("down")) return false;
+  return exitCode(state, dispatch);
+};
+
 export class PageEditor {
   readonly view: EditorView;
   private readonly page: PageState;
@@ -135,6 +183,7 @@ export class PageEditor {
       state: this.fresh(),
       editable: () => opts.editable,
       dispatchTransaction: (tr) => this.dispatch(tr),
+      nodeViews: { code_block: codeBlockView(opts.editable && opts.run ? () => void this.runPage() : null) },
       attributes: { class: "app-doc", "aria-label": "Page", spellcheck: "true" },
     });
     if (opts.editable) this.restore();
@@ -148,6 +197,7 @@ export class PageEditor {
         history(),
         inputRules({ rules: [textblockTypeInputRule(/^#\s$/, s.nodes.heading!), textblockTypeInputRule(/^```$/, s.nodes.code_block!)] }),
         keymap({ "Mod-z": undo, "Shift-Mod-z": redo, "Mod-y": redo }),
+        keymap({ Tab: codeIndent, "Shift-Tab": codeDedent, Enter: codeNewline, ArrowDown: codeExitDown }),
         keymap(baseKeymap),
         problemGuard(),
       );
@@ -160,7 +210,7 @@ export class PageEditor {
     return new Plugin<Ui>({
       key: uiKey,
       state: {
-        init: () => ({ focused: false, rev: this.page.rev, highlights: [] }),
+        init: () => ({ focused: false, rev: this.page.rev, highlights: [], run: this.page.run, running: false, runError: null }),
         apply: (tr, v) => {
           const m = tr.getMeta(uiKey) as Partial<Ui> | undefined;
           return m ? { ...v, ...m } : v;
@@ -299,6 +349,10 @@ export class PageEditor {
     if (this.destroyed) return;
     for (; this.cursor < events.length; this.cursor++) {
       const e = events[this.cursor]!;
+      if (e.type === "page.ran" && e.payload.page_id === this.page.id) {
+        this.view.dispatch(this.view.state.tr.setMeta(uiKey, { run: this.page.run }));
+        continue;
+      }
       if (e.type !== "page.edited" || e.payload.page_id !== this.page.id) continue;
       const version = getVersion(this.view.state);
       if (e.payload.base_rev < version) continue;
@@ -345,6 +399,24 @@ export class PageEditor {
     const w = this.waiters;
     this.waiters = [];
     for (const f of w) f();
+  }
+
+  // ---------- running ----------
+
+  /** Runs every code block on the page once the server has the latest edits. */
+  async runPage(): Promise<void> {
+    const ui = uiKey.getState(this.view.state)!;
+    if (ui.running || !this.opts.run || this.destroyed) return;
+    this.view.dispatch(this.view.state.tr.setMeta(uiKey, { running: true, runError: null }));
+    await this.settle(10_000);
+    let error: string | null;
+    try {
+      error = await this.opts.run();
+    } catch {
+      error = "The page could not run just now";
+    }
+    if (this.destroyed) return;
+    this.view.dispatch(this.view.state.tr.setMeta(uiKey, { running: false, runError: error, run: this.page.run }));
   }
 
   // ---------- highlights, math and scope ----------
@@ -396,6 +468,15 @@ export class PageEditor {
     // With the focus in the composer, the passage it is aimed at stays marked.
     if (!ui.focused && !sel.empty) marks.push({ from: sel.from, to: sel.to, cls: "myl-highlight myl-highlight--selection" });
     for (const k of marks) decos.push(Decoration.inline(k.from, k.to, { class: k.cls }));
+    // Each code block learns its output and status from a node decoration. The attribute changes
+    // with them, so the block's view is told.
+    let index = 0;
+    state.doc.forEach((node, offset) => {
+      if (node.type !== pageSchema.nodes.code_block) return;
+      const code: CodeInfo = { index, run: ui.run, running: ui.running, error: ui.runError };
+      decos.push(Decoration.node(offset, offset + node.nodeSize, { "data-run": `${index}:${ui.run?.at ?? 0}:${ui.running ? 1 : 0}:${ui.runError ?? ""}` }, { code }));
+      index++;
+    });
     // Math shows rendered, and as typed while the cursor is in it. Its source is hidden, so a
     // highlight over it marks the rendered formula instead.
     for (const m of this.math(state.doc)) {

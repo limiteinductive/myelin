@@ -22,6 +22,7 @@ import {
 } from "@myelin/core";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { RunResult } from "../sandbox.js";
 import { formatDate, openPage, type ThreadMessage } from "./context.js";
 
 /** A card carried on the tutor's reply. The client draws a unit card or the grey trace line. */
@@ -52,6 +53,8 @@ export interface ToolHost {
   timeZone?: string | undefined;
   turn(): TurnInfo;
   readonly offers: Map<string, Offer>;
+  /** Runs Python in the sandbox. Absent when code does not run on this server. */
+  run?: ((code: string) => Promise<RunResult>) | undefined;
 }
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
@@ -156,7 +159,7 @@ export function probeHint(u: Unit, depth: Depth, state: State): string {
     case "use":
       return "Pose one small fresh problem that needs it without naming it.";
     case "explain":
-      return "Play a newcomer and ask the naive question it answers. Let them explain.";
+      return `An explanation needs a page: call open_page with unit_id ${u.id} and depth explain, and a starter that says what to explain and to whom (a newcomer who knows what it rests on, not the idea itself), never the explanation. While they write you play that newcomer.`;
   }
 }
 
@@ -164,7 +167,7 @@ export function describeProbe(p: Probe, state: State): string {
   const u = state.units[p.unit_id]!;
   return (
     `Probe unit ${u.id} at depth ${p.depth}: "${u.text}" (${u.kind}). Predicted recall ${pct(p.predicted_recall)}. ` +
-    `${probeHint(u, p.depth, state)} Ask it as one ordinary question. When they answer, grade it with record_probe ` +
+    `${probeHint(u, p.depth, state)}${p.depth === "explain" ? " Offer it in one line first." : " Ask it as one ordinary question."} When they answer, grade it with record_probe ` +
     `(unit_id ${u.id}, depth ${p.depth}). If they say "not now", drop it without comment.`
   );
 }
@@ -491,10 +494,15 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
       const answer = turn.answer;
       const offered = host.offers.get(u.id);
       const offer = offered && now - offered.at < OFFER_TTL_MS && offered.probe.depth === p.depth ? offered : undefined;
-      const t = answer?.timing;
+      // A probe done on a page was answered there, not by the message that says it is finished. Its
+      // time is the page's, which the time accounting measures; the message's latency would mislead.
+      const open = openPage(s, host.messages(), now);
+      const onPage = open?.probe && resolveUnit(s, open.probe.unit_id)?.id === u.id && open.probe.depth === p.depth ? open : null;
+      const t = onPage ? null : answer?.timing;
       const latency = t && t.sent_at !== null && t.shown_at !== null && t.sent_at >= t.shown_at ? t.sent_at - t.shown_at : null;
       const asked = answer ? host.messages().findLast((m) => m.author === "tutor" && m.seq < answer.seq) : undefined;
-      const prompt = p.prompt?.trim() || asked?.text.slice(0, 1000) || "";
+      const pagePrompt = onPage ? `On page "${onPage.title}"${onPage.starter ? `: ${onPage.starter}` : ""}` : "";
+      const prompt = p.prompt?.trim() || pagePrompt.slice(0, 1000) || asked?.text.slice(0, 1000) || "";
       const e = host.append("unit.probed", {
         unit_id: u.id,
         depth: p.depth,
@@ -546,18 +554,29 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     label: "Open page",
     description:
       "Opens a page beside the thread for work that needs room: a derivation, a proof, code, an explanation. The learner writes on it; you never can. " +
-      "The starter is the problem statement shown at the top, never a solution or a hint. The app puts a link to the page under your reply.",
+      "The starter is the problem statement shown at the top, never a solution or a hint. The app puts a link to the page under your reply. " +
+      "For a probe done on the page, such as an explanation for a newcomer, pass the unit and depth.",
     parameters: Type.Object({
       title: Type.String({ description: "A short title, such as 'Bayes with a rare disease'" }),
       starter: Type.Optional(Type.String({ description: "The problem statement, if there is one. Never part of a solution" })),
+      unit_id: Type.Optional(Type.String({ description: "The unit this page probes, if it is for a probe" })),
+      depth: Type.Optional(StringEnum(DEPTHS, { description: "The depth the page probes. explain for an explanation" })),
     }),
     async execute(_id, p) {
       const title = p.title.trim();
       if (!title) return ok("A page needs a title.");
+      let probe: { unit_id: string; depth: Depth } | null = null;
+      if (p.unit_id || p.depth) {
+        if (!p.unit_id || !p.depth) return ok("A probe page needs both unit_id and depth.");
+        const u = activeUnit(host.state, p.unit_id);
+        if (typeof u === "string") return ok(u);
+        probe = { unit_id: u.id, depth: p.depth };
+      }
       const page_id = uuidv7(host.now());
-      host.append("page.created", { page_id, title, starter: p.starter?.trim() || null });
+      host.append("page.created", { page_id, title, starter: p.starter?.trim() || null, probe });
       host.turn().cards.push({ kind: "page", page_id });
-      return ok(`Page opened (page_id ${page_id}). The link is shown under your reply. Tell them what to do on it in one line, then stay quiet while they work.`);
+      const after = probe?.depth === "explain" ? " While they write you are the newcomer: ask only naive questions, as asides." : "";
+      return ok(`Page opened (page_id ${page_id}). The link is shown under your reply. Tell them what to do on it in one line, then stay quiet while they work.${after}`);
     },
   });
 
@@ -594,6 +613,24 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     },
   });
 
+  const runCode = defineTool({
+    name: "run_code",
+    label: "Run code",
+    description:
+      "Runs Python in a fresh sandbox and returns what it printed and the value of its last line. The learner does not see it. " +
+      "Use it to check a numeric or algebraic result before you state it, or to see what the learner's code does. numpy, sympy and PyTorch may be installed. " +
+      "If the learner should see the code or its output, put them in your reply as fenced blocks.",
+    parameters: Type.Object({ code: Type.String({ description: "The Python to run" }) }),
+    async execute(_id, p) {
+      if (!host.run) return ok("Code does not run on this server.");
+      const r = await host.run(p.code);
+      const b = r.blocks[0];
+      if (!b) return ok("Nothing ran.");
+      const output = b.output.trimEnd() || "(nothing printed)";
+      return ok(`${b.failed ? (r.timed_out ? "Stopped" : "Failed") : "Ran"} in ${duration(r.duration_ms)}. Output:\n${output}`);
+    },
+  });
+
   const stayQuiet = defineTool({
     name: "stay_quiet",
     label: "Stay quiet",
@@ -617,6 +654,7 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     observeUnit,
     openPageTool,
     openAside,
+    runCode,
     stayQuiet,
   ] as unknown as ToolDefinition[];
 }

@@ -9,7 +9,7 @@
 //   so a later grade correction recomputes it exactly.
 import type { Depth, EventOf, EventType, Grade, MyelinEvent, Origin, Payload, SlotKind } from "./events.js";
 import { isCorrection } from "./events.js";
-import { applyPageEdit, newPage, PageEditError, type PageState } from "./page.js";
+import { applyPageEdit, applyPageRun, newPage, PageEditError, type PageState } from "./page.js";
 import type { Scheduler, UnitMemory } from "./scheduler.js";
 
 export const DAY_MS = 86_400_000;
@@ -420,7 +420,14 @@ const reducers: { [T in EventType]?: Reducer<T> } = {
   "page.created": (state, e) => {
     const p = e.payload;
     if (state.pages[p.page_id]) return anomaly(state, e, `page ${p.page_id} already exists`);
-    state.pages[p.page_id] = newPage(p.page_id, p.title, p.starter, e.ts);
+    state.pages[p.page_id] = newPage(p.page_id, p.title, p.starter, e.ts, p.probe);
+  },
+
+  "page.ran": (state, e) => {
+    const p = e.payload;
+    const page = state.pages[p.page_id];
+    if (!page) return anomaly(state, e, `run of unknown page ${p.page_id}`);
+    applyPageRun(page, p, e.ts);
   },
 
   "page.edited": (state, e) => {

@@ -4,6 +4,7 @@
 // view, so the learner's text stays as typed.
 import { Node as PMNode, Schema } from "prosemirror-model";
 import { Mapping, Step, StepMap } from "prosemirror-transform";
+import type { Depth } from "./events.js";
 
 export const pageSchema = new Schema({
   nodes: {
@@ -46,6 +47,24 @@ export interface PageState {
   doc: unknown;
   /** One step map per step, as [start, oldSize, newSize, …], to carry positions forward. */
   maps: number[][];
+  /** The probe this page was opened for, if any. */
+  probe: PageProbe | null;
+  /** The latest run of its code. */
+  run: PageRun | null;
+}
+
+export interface PageProbe {
+  unit_id: string;
+  depth: Depth;
+}
+
+export interface PageRun {
+  /** The revision that ran. */
+  rev: number;
+  at: number;
+  /** One result per code block that ran, in page order. A run stops at the first block that fails. */
+  blocks: { output: string; failed: boolean }[];
+  timed_out: boolean;
 }
 
 export interface Anchor {
@@ -72,8 +91,22 @@ export function starterDoc(starter: string | null): PMNode {
   return s.node("doc", null, blocks);
 }
 
-export function newPage(id: string, title: string, starter: string | null, at: number): PageState {
-  return { id, title, starter, created_at: at, edited_at: at, rev: 0, doc: starterDoc(starter).toJSON(), maps: [] };
+export function newPage(id: string, title: string, starter: string | null, at: number, probe: PageProbe | null = null): PageState {
+  return { id, title, starter, created_at: at, edited_at: at, rev: 0, doc: starterDoc(starter).toJSON(), maps: [], probe, run: null };
+}
+
+/** Records a run of the page's code as its latest. */
+export function applyPageRun(page: PageState, run: { rev: number; blocks: readonly { output: string; failed: boolean }[]; timed_out: boolean }, at: number): void {
+  page.run = { rev: run.rev, at, blocks: run.blocks.map((b) => ({ output: b.output, failed: b.failed })), timed_out: run.timed_out };
+}
+
+/** The text of each code block, in page order: what Run page runs. */
+export function codeBlocks(page: PageState): string[] {
+  const out: string[] = [];
+  pageDoc(page).forEach((node) => {
+    if (node.type === pageSchema.nodes.code_block) out.push(node.textContent);
+  });
+  return out;
 }
 
 const docs = new WeakMap<PageState, { rev: number; node: PMNode }>();
@@ -153,23 +186,25 @@ export interface PageLine {
   text: string;
   from: number;
   to: number;
+  /** Which block of the page the line is in, counting from 0. */
+  block: number;
 }
 
 /** The page as numbered lines: one per block, and one per line inside a code block. */
 export function pageLines(page: PageState): PageLine[] {
   const doc = pageDoc(page);
   const out: PageLine[] = [];
-  doc.forEach((node, offset) => {
+  doc.forEach((node, offset, block) => {
     const start = offset + 1;
     const kind = node.type.name === "problem" ? "problem" : node.type.name === "heading" ? "heading" : node.type.name === "code_block" ? "code" : "text";
     const text = blockText(node);
     if (kind === "code") {
       let at = 0;
       for (const line of text.split("\n")) {
-        out.push({ n: out.length + 1, kind, text: line, from: start + at, to: start + at + line.length });
+        out.push({ n: out.length + 1, kind, text: line, from: start + at, to: start + at + line.length, block });
         at += line.length + 1;
       }
-    } else out.push({ n: out.length + 1, kind, text, from: start, to: start + text.length });
+    } else out.push({ n: out.length + 1, kind, text, from: start, to: start + text.length, block });
   });
   return out;
 }
@@ -189,10 +224,27 @@ export function lineAt(page: PageState, pos: number): PageLine | undefined {
   return lines.find((l) => pos >= l.from && pos <= l.to) ?? lines.findLast((l) => l.from <= pos);
 }
 
-/** The page for the tutor: its title and numbered lines. */
+/** Output shown to the tutor per code block, in characters. */
+const OUTPUT_CHARS = 2000;
+
+/** The page for the tutor: its title and numbered lines, with the latest run's output under each code block. */
 export function pageText(page: PageState): string {
-  const lines = pageLines(page).map((l) => `${l.n}${l.kind === "text" ? "" : ` (${l.kind})`}: ${l.text}`);
-  return `Page "${page.title}" (id ${page.id}, revision ${page.rev})\n${lines.join("\n")}`;
+  const lines = pageLines(page);
+  const run = page.run ?? null;
+  const out: string[] = [];
+  let code = -1;
+  lines.forEach((l, i) => {
+    if (l.kind === "code" && lines[i - 1]?.block !== l.block) code++;
+    out.push(`${l.n}${l.kind === "text" ? "" : ` (${l.kind})`}: ${l.text}`);
+    const last = l.kind === "code" && lines[i + 1]?.block !== l.block;
+    const result = last && run ? run.blocks[code] : undefined;
+    if (!result) return;
+    let text = result.output.trimEnd();
+    if (text.length > OUTPUT_CHARS) text = `${text.slice(0, OUTPUT_CHARS)}\n… (cut)`;
+    const head = `   [output of the run at revision ${run!.rev}${result.failed ? ", which failed at this block" : ""}${text ? "" : ": nothing printed"}]`;
+    out.push(head, ...(text ? text.split("\n").map((t) => `   | ${t}`) : []));
+  });
+  return `Page "${page.title}" (id ${page.id}, revision ${page.rev})\n${out.join("\n")}`;
 }
 
 const squash = (s: string) => s.replace(/\s+/g, " ").trim().toLowerCase();

@@ -7,3 +7,4 @@ export * from "./tutor/tutor.js";
 export * from "./tutor/context.js";
 export * from "./tutor/tools.js";
 export * from "./tutor/observer.js";
+export * from "./sandbox.js";

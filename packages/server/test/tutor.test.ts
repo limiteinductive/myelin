@@ -8,7 +8,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { groupAsides, makeEvent, mapRange, pageDoc, pageSchema, passageText, uuidv7, type Anchor, type AnchoredMessage, type MyelinEvent } from "@myelin/core";
 import { Transform } from "prosemirror-transform";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FIRST_RUN_TEXT, startServer, TUTOR_DEVICE, type Draft, type RunningServer, type TutorOptions, type User } from "../src/index.js";
+import { FIRST_RUN_TEXT, SANDBOX_DEVICE, startServer, TUTOR_DEVICE, type Draft, type RunningServer, type TutorOptions, type User } from "../src/index.js";
 
 let dir: string;
 let srv: RunningServer;
@@ -658,6 +658,196 @@ describe("observer", () => {
     await a.say("ok what next");
     await until(() => a.messages().length === 8);
     expect(logs.join("\n")).toContain("no verdict");
+    expect(faux.getPendingResponseCount()).toBe(0);
+    a.stop();
+  });
+});
+
+describe("code and explaining", () => {
+  const S = pageSchema;
+  async function codePage(u: User, a: Device) {
+    const store = srv.stores.get(u.id);
+    const page_id = uuidv7();
+    await a.post(makeEvent("page.created", { page_id, title: "Means", starter: null }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+    const page = () => store.state.pages[page_id]!;
+    const append = async (...nodes: ReturnType<typeof S.node>[]) => {
+      const tr = new Transform(pageDoc(page()));
+      tr.insert(tr.doc.content.size, nodes);
+      await a.post(makeEvent("page.edited", { page_id, base_rev: page().rev, steps: tr.steps.map((st) => st.toJSON()), started_at: Date.now() - 2000, ended_at: Date.now() }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+    };
+    const run = () => fetch(`${srv.url}/api/pages/${page_id}/run`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: "{}" });
+    return { page_id, page, append, run };
+  }
+
+  it("runs a page's code top to bottom, keeps the output in the log, and shows it to the tutor", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    const { page_id, page, append, run } = await codePage(u, a);
+    await append(S.node("code_block", null, S.text("xs = [1, 2, 3]\nprint(sum(xs))")), S.node("paragraph", null, S.text("Now the mean:")), S.node("code_block", null, S.text("sum(xs) / len(xs)")));
+
+    let r = await run();
+    expect(r.status).toBe(200);
+    await until(() => a.of("page.ran").length === 1);
+    const ran = a.of("page.ran")[0]!;
+    expect(ran.device_id).toBe(SANDBOX_DEVICE);
+    expect(ran.payload).toMatchObject({ page_id, rev: page().rev, blocks: [{ output: "6\n", failed: false }, { output: "2.0\n", failed: false }], timed_out: false });
+    expect(page().run?.blocks).toHaveLength(2);
+
+    // Only the server records a run, and only the tutor opens a page for a probe.
+    const forged = makeEvent("page.ran", { page_id, rev: page().rev, blocks: [{ output: "hacked", failed: false }] }, { id: uuidv7(), device_id: a.id, ts: Date.now() });
+    r = await fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ events: [forged] }) });
+    expect(r.status).toBe(403);
+    const probed = makeEvent("page.created", { page_id: uuidv7(), title: "x", starter: null, probe: { unit_id: uuidv7(), depth: "explain" } }, { id: uuidv7(), device_id: a.id, ts: Date.now() });
+    r = await fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ events: [probed] }) });
+    expect(r.status).toBe(403);
+
+    // The tutor reads the output under each block, and can run code of its own that the learner does not see.
+    let seen = "";
+    let toolResult = "";
+    faux.setResponses([
+      fauxAssistantMessage('{"raise": false, "addressed": true}'),
+      (ctx) => {
+        seen = shown(ctx);
+        return fauxAssistantMessage(fauxToolCall("run_code", { code: "print(7 // 2, 7 / 2)" }), { stopReason: "toolUse" });
+      },
+      (ctx) => {
+        toolResult = lastToolResult(ctx);
+        return fauxAssistantMessage("`/` always gives a float in Python 3; `//` floors.");
+      },
+    ]);
+    await a.say("why 2.0 and not 2?");
+    await until(() => a.messages().length === 3);
+    expect(seen).toContain("[output of the run at revision");
+    expect(seen).toContain("| 2.0");
+    expect(toolResult).toContain("Ran in");
+    expect(toolResult).toContain("3 3.5");
+    expect(a.of("page.ran")).toHaveLength(1);
+
+    // A failing block stops the run there, and a run without an edit still reaches the tutor.
+    await append(S.node("code_block", null, S.text("print(xs[3])")), S.node("code_block", null, S.text("print('never')")));
+    await run();
+    await until(() => a.of("page.ran").length === 2);
+    expect(page().run?.blocks).toHaveLength(3);
+    expect(page().run?.blocks[2]).toMatchObject({ failed: true });
+    expect(page().run?.blocks[2]!.output).toContain("IndexError: list index out of range");
+    let prompt = "";
+    faux.setResponses([
+      fauxAssistantMessage('{"raise": false, "addressed": true}'),
+      (ctx) => {
+        prompt = lastUser(ctx as never);
+        return fauxAssistantMessage("Indexes start at 0.");
+      },
+    ]);
+    await a.say("why does the third one fail?");
+    await until(() => a.messages().length === 5);
+    expect(prompt).toContain("the open page now reads");
+    expect(prompt).toContain("which failed at this block");
+    expect(faux.getPendingResponseCount()).toBe(0);
+    a.stop();
+  });
+
+  it("an explanation written for a newcomer moves the unit's evidence to explain", async () => {
+    await srv.close();
+    await serve({ observePauseMs: 80 });
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    const store = srv.stores.get(u.id);
+
+    // A unit recalled once, so its explain ladder has started.
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("find_unit", { text: "Importance sampling reweights samples from q by p/q", kind: "idea", origin: "derived" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Good. That is one to keep."),
+    ]);
+    await a.say("so you sample from q and weight by p/q");
+    await until(() => a.messages().length === 3);
+    const unitId = a.of("unit.found")[0]!.payload.unit_id;
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("record_probe", { unit_id: unitId, depth: "recall", grade: "good", prompt: "What does importance sampling do?" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Right."),
+    ]);
+    await a.say("it reweights samples from q by p over q");
+    await until(() => a.messages().length === 5);
+    expect(store.state.units[unitId]!.ladders.explain).toMatchObject({ step: 1 });
+
+    // The explain probe needs a page, opened for it.
+    let opened = "";
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("open_page", { title: "Importance sampling, for a newcomer", starter: "Explain importance sampling to someone who knows expectations but has not met it.", unit_id: unitId, depth: "explain" }),
+        { stopReason: "toolUse" },
+      ),
+      (ctx) => {
+        opened = lastToolResult(ctx);
+        return fauxAssistantMessage("Write it on the page; I'll be the newcomer.");
+      },
+    ]);
+    await a.say("can I try explaining it?");
+    await until(() => a.messages().length === 7);
+    const created = a.of("page.created")[0]!;
+    const page_id = created.payload.page_id;
+    expect(created.payload.probe).toEqual({ unit_id: unitId, depth: "explain" });
+    expect(opened).toContain("you are the newcomer");
+    const page = () => store.state.pages[page_id]!;
+    const write = async (line: string) => {
+      const tr = new Transform(pageDoc(page()));
+      tr.insert(tr.doc.content.size, S.node("paragraph", null, S.text(line)));
+      await a.post(makeEvent("page.edited", { page_id, base_rev: page().rev, steps: tr.steps.map((st) => st.toJSON()), started_at: Date.now() - 2000, ended_at: Date.now() }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+    };
+
+    // While they write, triage stands in for the newcomer, and the tutor asks the naive question at the line.
+    const triaged: string[] = [];
+    let observed = "";
+    let seen = "";
+    faux.setResponses([
+      (ctx) => {
+        triaged.push(shown(ctx));
+        return fauxAssistantMessage('{"raise": true, "line": 2, "why": "What is q?"}');
+      },
+      (ctx) => {
+        observed = lastUser(ctx as never);
+        seen = shown(ctx);
+        return fauxAssistantMessage(fauxToolCall("open_aside", { passage: "q", line: 2, text: "Wait, what is q?" }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage(""),
+    ]);
+    await write("To estimate E_p[f], draw from q and weight each sample by p/q.");
+    await until(() => a.messages().length === 8);
+    expect(triaged[0]).toContain("stand in for that newcomer");
+    expect(triaged[0]).toContain("an explanation for a newcomer of: Importance sampling reweights samples from q by p/q");
+    expect(observed).toContain("Read it as the newcomer");
+    expect(observed).toContain("What is q?");
+    expect(seen).toContain("you are that newcomer");
+    expect(a.of("message.added")[7]!.payload).toMatchObject({ author: "tutor", text: "Wait, what is q?", anchor: { page_id } });
+
+    faux.setResponses([
+      (ctx) => {
+        triaged.push(shown(ctx));
+        return fauxAssistantMessage('{"raise": false}');
+      },
+    ]);
+    await write("Here q is any distribution you can sample from that is nonzero wherever p f is.");
+    await until(() => triaged.length === 2);
+    await sleep(100);
+
+    // When they say it is done, the tutor grades it as an explanation.
+    faux.setResponses([
+      fauxAssistantMessage('{"raise": false, "addressed": true}'),
+      fauxAssistantMessage(fauxToolCall("record_probe", { unit_id: unitId, depth: "explain", grade: "good" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("A newcomer could follow that once q was defined."),
+    ]);
+    const before = Date.now();
+    await a.say("done, does it make sense?");
+    await until(() => a.of("unit.probed").length === 2 && a.messages().length === 10);
+    const probe = a.of("unit.probed")[1]!;
+    expect(probe.payload).toMatchObject({ unit_id: unitId, depth: "explain", grade: "good", latency_ms: null });
+    expect((probe.payload as { prompt: string }).prompt).toContain('On page "Importance sampling, for a newcomer"');
+    const unit = store.state.units[unitId]!;
+    expect(unit.ladders.explain!.step).toBe(2);
+    expect(unit.ladders.explain!.due).toBeGreaterThanOrEqual(before + 7 * 86_400_000);
+    expect(unit.memory_reviews).toBe(1);
+    expect(a.messages()[9]!.cards).toEqual([{ kind: "trace", text: expect.stringMatching(/^Explained\. /) }]);
     expect(faux.getPendingResponseCount()).toBe(0);
     a.stop();
   });

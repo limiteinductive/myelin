@@ -113,7 +113,7 @@ export class EventStore {
         }
         if (e.type === "page.created") {
           if (page(e.payload.page_id)) throw new EventError(`page ${e.payload.page_id} already exists`);
-          scratch.set(e.payload.page_id, newPage(e.payload.page_id, e.payload.title, e.payload.starter, e.ts));
+          scratch.set(e.payload.page_id, newPage(e.payload.page_id, e.payload.title, e.payload.starter, e.ts, e.payload.probe));
         } else if (e.type === "page.edited") {
           const p = page(e.payload.page_id);
           if (!p) throw new EventError(`no page ${e.payload.page_id}`);
@@ -123,6 +123,8 @@ export class EventStore {
             if (!(err instanceof PageEditError)) throw err;
             throw err.stale ? new StaleError(err.message) : new EventError(`event ${e.id}: ${err.message}`);
           }
+        } else if (e.type === "page.ran") {
+          if (!page(e.payload.page_id)) throw new EventError(`no page ${e.payload.page_id}`);
         }
         const r = insert.run(e.id, e.device_id, e.ts, e.type, e.v, JSON.stringify(e.payload));
         out.push({ id: e.id, seq: Number(r.lastInsertRowid), duplicate: false });

@@ -72,7 +72,9 @@ export async function up(opts: {
   const root = webRoot();
   const dir = dataDir(opts.data);
   const tutor = opts.tutor === false ? undefined : (opts.tutor ?? (await tutorFromEnv(dir, log)));
-  const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dir, webRoot: root, tutor });
+  const timeout = Number(process.env.MYELIN_RUN_TIMEOUT_MS);
+  const sandbox = { python: process.env.MYELIN_PYTHON || undefined, timeoutMs: timeout > 0 ? timeout : undefined };
+  const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dir, webRoot: root, tutor, sandbox });
   let owner = srv.registry.users()[0];
   if (!owner) {
     owner = srv.registry.createUser(opts.name ?? "me");

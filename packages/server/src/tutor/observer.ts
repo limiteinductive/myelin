@@ -16,6 +16,8 @@ Do not raise typos, notation, style, loosely typed math, steps that are slow but
 
 If the learner also said something in the thread while working, decide whether any of it is addressed to the tutor: a question, a request, or anything that expects an answer. An answer to the tutor's last message is addressed to the tutor. Thinking aloud, such as "so I need P(+) first" or "maybe the complement is easier", is not. When unsure, call it addressed. A flaw in what they said counts like a flaw on the page.
 
+Some pages are an explanation written for a newcomer, and the prompt says so. There you also stand in for that newcomer: raise the first place a newcomer would get stuck, such as a term used before it is explained, a skipped step or a claim with no reason, and put the newcomer's naive question in "why". Raise one at a time, and nothing the writing has not reached yet.
+
 Answer with one JSON object and nothing else:
 {"raise": true or false, "line": the page line of the flaw if it is on the page, "why": "the flaw in a few words, if raising", "addressed": true or false}
 Include "addressed" only when the learner said something.`;
@@ -38,6 +40,8 @@ export interface TriageInput {
   said: readonly string[];
   /** The tutor's last message in the thread, so an answer to it is not taken for thinking aloud. */
   lastTutor?: string | null;
+  /** On a page explaining a unit for a newcomer: the unit's text. */
+  newcomer?: string | null;
 }
 
 /** The line numbers whose text is new since the last look. */
@@ -57,6 +61,7 @@ export function changedLines(page: PageState, before: readonly string[] | null):
 
 export function triagePrompt(t: TriageInput): string {
   const parts = [pageText(t.page)];
+  if (t.newcomer) parts.unshift(`This page is an explanation for a newcomer of: ${t.newcomer}`);
   const changed = changedLines(t.page, t.before);
   if (t.before) parts.push(changed.length ? `Lines new or changed since the last look: ${changed.join(", ")}.` : "No line is new since the last look.");
   else parts.push("This is the first look at this page.");
@@ -103,7 +108,15 @@ export function parseVerdict(text: string): Verdict | null {
 }
 
 /** What the tutor is told when triage raises something. */
-export function observationPrompt(page: PageState, v: Verdict, said: readonly string[]): string {
+export function observationPrompt(page: PageState, v: Verdict, said: readonly string[], newcomer = false): string {
+  if (newcomer) {
+    const where = v.line ? `at line ${v.line}` : "on the page";
+    return (
+      `[app: this is an observation, not a message. The learner is writing the explanation on page "${page.title}" (id ${page.id}) and paused. ` +
+      `A quick check thinks a newcomer would get stuck ${where}${v.why ? `: ${v.why}` : ""}. Read it as the newcomer. If you would get stuck there, call open_aside at that line with the naive question, ` +
+      `at most 40 words, with no hint. If not, or if an aside already asks it, call stay_quiet. Write nothing else.]`
+    );
+  }
   const flagged = v.line ? `line ${v.line}${v.why ? ` (${v.why})` : ""}` : v.why ? `this: ${v.why}` : "something";
   const heard = said.length ? `While working they said in the thread:\n${said.map((s) => `"${s}"`).join("\n")}\nThat was thinking aloud, not a question to you. ` : "";
   return (

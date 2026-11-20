@@ -79,9 +79,25 @@ export const payloads = {
     timing: Timing.nullable().default(null),
   }),
 
-  "page.created": z.object({ page_id: Id, title: z.string(), starter: z.string().nullable().default(null) }),
+  /** `probe` marks a page opened to test a unit there, such as an explanation for a newcomer. */
+  "page.created": z.object({
+    page_id: Id,
+    title: z.string(),
+    starter: z.string().nullable().default(null),
+    probe: z.object({ unit_id: Id, depth: Depth }).nullable().default(null),
+  }),
   "page.edited": z.looseObject({ page_id: Id, base_rev: z.number().int().nonnegative(), steps: z.array(z.unknown()) }),
-  "page.ran": z.looseObject({ page_id: Id, rev: z.number().int().nonnegative() }),
+  /**
+   * One run of every code block on the page at `rev`, top to bottom. `blocks` holds one result per
+   * block that ran; the run stops at the first that fails, so later blocks have none.
+   */
+  "page.ran": z.looseObject({
+    page_id: Id,
+    rev: z.number().int().nonnegative(),
+    blocks: z.array(z.object({ output: z.string(), failed: z.boolean().default(false) })).default([]),
+    timed_out: z.boolean().default(false),
+    duration_ms: Ms.nullable().default(null),
+  }),
 
   "unit.found": UnitSpec.extend({
     origin: Origin,

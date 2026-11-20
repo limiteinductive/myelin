@@ -43,7 +43,10 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 /* ---------- the document ---------- */
 .app-doc { outline: none; white-space: pre-wrap; overflow-wrap: break-word; min-height: 30vh; caret-color: var(--accent); }
 .app-doc[contenteditable="false"] { min-height: 0; }
-.app-doc pre { margin: 0 0 var(--space-3); padding: var(--space-3) var(--space-4); border-radius: var(--radius-card); background: var(--code-surface); font: 400 14px/1.6 var(--font-mono); white-space: pre-wrap; }
+.app-doc .myl-code { margin: 0 0 var(--space-3); }
+.app-doc .myl-code pre { white-space: pre; overflow-wrap: normal; }
+.app-doc .myl-code__output { max-height: 24em; overflow-y: auto; }
+.app-doc .myl-code__foot { white-space: normal; }
 .app-doc h2 { margin-top: var(--space-6); }
 .app-doc ::selection { background: var(--selection); }
 .app-math-hidden { display: none; }

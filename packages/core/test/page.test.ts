@@ -5,6 +5,7 @@ import {
   applyEvent,
   applyPageEdit,
   canonicalJson,
+  codeBlocks,
   emptyState,
   findPassage,
   fsrsScheduler,
@@ -184,5 +185,37 @@ describe("pages in the log", () => {
       }),
       { numRuns: 100 },
     );
+  });
+});
+
+describe("runs", () => {
+  it("keeps the last run under each code block it reached, and shows it in the page's text", () => {
+    let n = 0;
+    const meta = () => ({ id: `0190e0d0-0000-7000-8000-${String(++n).padStart(12, "0")}`, device_id: "dev", ts: T0 + n * 1000, seq: n });
+    const shadow = newPage("p1", "Means", null, T0);
+    const steps = edit(shadow, (tr) =>
+      tr.insert(tr.doc.content.size, [
+        S.node("code_block", null, S.text("xs = [1, 2]\nprint(sum(xs))")),
+        S.node("paragraph", null, S.text("then")),
+        S.node("code_block", null, S.text("xs[5]")),
+        S.node("code_block", null, S.text("print('never')")),
+      ]),
+    );
+    const log = [
+      makeEvent("page.created", { page_id: "p1", title: "Means", starter: null, probe: { unit_id: "u1", depth: "explain" } }, meta()),
+      makeEvent("page.edited", { page_id: "p1", base_rev: 0, steps, started_at: T0, ended_at: T0 + 1 }, meta()),
+      makeEvent("page.ran", { page_id: "p1", rev: 1, blocks: [{ output: "3\n" }, { output: "IndexError: list index out of range\n", failed: true }], duration_ms: 40 }, meta()),
+      makeEvent("page.ran", { page_id: "nope", rev: 0 }, meta()),
+    ];
+    const state = replay(log, s);
+    const page = state.pages.p1!;
+    expect(page.probe).toEqual({ unit_id: "u1", depth: "explain" });
+    expect(codeBlocks(page)).toEqual(["xs = [1, 2]\nprint(sum(xs))", "xs[5]", "print('never')"]);
+    expect(page.run).toEqual({ rev: 1, at: T0 + 3000, timed_out: false, blocks: [{ output: "3\n", failed: false }, { output: "IndexError: list index out of range\n", failed: true }] });
+    expect(state.anomalies.map((a) => a.reason)).toEqual(["run of unknown page nope"]);
+    const text = pageText(page);
+    expect(text).toContain("print(sum(xs))\n   [output of the run at revision 1]\n   | 3\n");
+    expect(text).toContain("xs[5]\n   [output of the run at revision 1, which failed at this block]\n   | IndexError: list index out of range");
+    expect(text).not.toMatch(/never'\)\n   \[output/);
   });
 });

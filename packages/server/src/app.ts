@@ -3,12 +3,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { EventError } from "@myelin/core";
+import { codeBlocks, EventError, makeEvent, uuidv7 } from "@myelin/core";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { streamSSE } from "hono/streaming";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
+import type { Sandbox } from "./sandbox.js";
 import { ConflictError, StaleError, type Appended } from "./store.js";
 import type { Stores } from "./stores.js";
 import type { Draft, Tutors } from "./tutor/tutor.js";
@@ -25,7 +26,12 @@ export interface AppOptions {
   webRoot?: string | undefined;
   /** The tutor. Without it the thread is the learner's alone. */
   tutors?: Tutors | undefined;
+  /** Runs the code on pages. Without it Run page is refused. */
+  sandbox?: Sandbox | undefined;
 }
+
+/** The device recorded on a page.ran event: the server ran the code. */
+export const SANDBOX_DEVICE = "server:sandbox";
 
 type Session = { user: User; device: Device };
 type Env = { Variables: { session: Session } };
@@ -39,6 +45,8 @@ export function clientMayWrite(e: { type?: unknown; payload?: unknown }): boolea
     case "unit.reworded":
       return p.by === "learner";
     case "page.created":
+      // Only the tutor opens a page for a probe.
+      return p.probe === undefined || p.probe === null;
     case "page.edited":
     case "activity.signal":
       return true;
@@ -49,7 +57,7 @@ export function clientMayWrite(e: { type?: unknown; payload?: unknown }): boolea
 
 const isHttps = (c: Context) => (c.req.header("x-forwarded-proto") ?? new URL(c.req.url).protocol.replace(":", "")) === "https";
 
-export function createApp({ registry, stores, webRoot, tutors }: AppOptions): Hono<Env> {
+export function createApp({ registry, stores, webRoot, tutors, sandbox }: AppOptions): Hono<Env> {
   const app = new Hono<Env>();
 
   app.use("*", async (c, next) => {
@@ -131,6 +139,35 @@ export function createApp({ registry, stores, webRoot, tutors }: AppOptions): Ho
       if (e instanceof EventError) return c.json({ error: e.message }, 400);
       throw e;
     }
+  });
+
+  // Run page: every code block on the page as it is now, top to bottom, in a fresh interpreter. The
+  // result is a page.ran event, so every open device shows the output.
+  const running = new Map<string, Promise<{ seq: number }>>();
+  app.post("/api/pages/:id/run", async (c) => {
+    if (!sandbox) return c.json({ error: "Code does not run on this server." }, 501);
+    const { user } = c.get("session");
+    const store = stores.get(user.id);
+    store.catchUp();
+    const page = store.state.pages[c.req.param("id")];
+    if (!page) return c.json({ error: "no such page" }, 404);
+    const key = `${user.id}:${page.id}`;
+    // Pressing Run page again while a run is in flight waits for that run.
+    let run = running.get(key);
+    if (!run) {
+      const rev = page.rev;
+      const blocks = codeBlocks(page);
+      run = sandbox
+        .run(blocks)
+        .then((r) => {
+          const ts = Date.now();
+          const e = makeEvent("page.ran", { page_id: page.id, rev, blocks: r.blocks, timed_out: r.timed_out, duration_ms: r.duration_ms }, { id: uuidv7(ts), device_id: SANDBOX_DEVICE, ts });
+          return { seq: store.append([e])[0]!.seq };
+        })
+        .finally(() => running.delete(key));
+      running.set(key, run);
+    }
+    return c.json(await run);
   });
 
   // Every event after `after` (or Last-Event-ID), then each new one as it is appended.

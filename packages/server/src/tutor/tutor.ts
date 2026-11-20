@@ -14,9 +14,10 @@ import {
   type CreateAgentSessionOptions,
 } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Sandbox } from "../sandbox.js";
 import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
-import { anchorLabel, buildSittingContext, formatAgo, openPage, tailOf, type ThreadMessage } from "./context.js";
+import { anchorLabel, buildSittingContext, formatAgo, newcomerUnit, openPage, probeNote, tailOf, type ThreadMessage } from "./context.js";
 import { changedLines, OBSERVE_PAUSE_MS, observationPrompt, parseVerdict, TRIAGE_SYSTEM, triagePrompt, WORKING_MS, type Verdict } from "./observer.js";
 import { describeProbe, offerProbe, tutorTools, type Card, type Offer, type ToolHost, type TurnInfo } from "./tools.js";
 
@@ -57,6 +58,8 @@ export interface TutorOptions {
   observePauseMs?: number;
   /** The model for the observer's triage. Defaults to the tutor's. */
   triageModel?: ModelSource;
+  /** Runs code for run_code. Without it the tool says code does not run here. */
+  sandbox?: Sandbox | undefined;
 }
 
 const APP_NOTE = `
@@ -89,7 +92,8 @@ export class Tutor {
   /** Things the app tells the tutor at the start of its next prompt, such as a learner's rewording. */
   private notes: string[] = [];
   /** The revision of each page the tutor has read in this sitting. */
-  private seenRev = new Map<string, number>();
+  /** What of each page the tutor has seen: its revision and its last run. */
+  private seenRev = new Map<string, string>();
   /** A pause timer per page the learner is editing. */
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Pages whose pause has run out and which the observer has not looked at yet. */
@@ -298,7 +302,7 @@ export class Tutor {
     this.lastTurnAt = this.now();
     // The tutor has seen the open page as it is now; the observer starts from here.
     const open = openPage(this.store.state, this.messages, now);
-    if (open && this.seenRev.get(open.id) === open.rev) this.remember(open);
+    if (open && this.seenRev.get(open.id) === seenKey(open)) this.remember(open);
     const text = draft.text.trim();
     if (text || info.cards.length > 0) this.post(draft.id, text, info.cards, anchor);
     this.emit({ id: draft.id, text, done: true, anchor });
@@ -312,7 +316,7 @@ export class Tutor {
 
     const host = this.toolHost();
     const page = openPage(this.store.state, this.messages, now);
-    if (page) this.seenRev.set(page.id, page.rev);
+    if (page) this.seenRev.set(page.id, seenKey(page));
     const context = buildSittingContext({
       name: this.nameOf(),
       now,
@@ -412,6 +416,7 @@ export class Tutor {
       pages: this.store.state.pages,
       said,
       lastTutor: this.messages.findLast((m) => m.author === "tutor" && !m.anchor)?.text ?? null,
+      newcomer: newcomerUnit(this.store.state, page)?.text ?? null,
     });
     this.remember(page);
     const level = this.opts.thinkingLevel ?? "low";
@@ -442,7 +447,7 @@ export class Tutor {
   private async observation(page: PageState, v: Verdict, said: readonly string[]): Promise<void> {
     const now = this.now();
     const session = await this.sitting(now, new Set());
-    let prompt = observationPrompt(page, v, said);
+    let prompt = observationPrompt(page, v, said, newcomerUnit(this.store.state, page) !== null);
     const notes = [...this.notes, ...this.pageNotes(now, page)];
     this.notes = [];
     if (notes.length > 0) prompt = `${notes.join("\n")}\n\n${prompt}`;
@@ -483,10 +488,11 @@ export class Tutor {
 
   /** The open page again when it changed since the tutor last read it. */
   private pageNotes(now: number, page = openPage(this.store.state, this.messages, now)): string[] {
-    if (!page || this.seenRev.get(page.id) === page.rev) return [];
+    if (!page || this.seenRev.get(page.id) === seenKey(page)) return [];
     const changed = this.seenRev.has(page.id);
-    this.seenRev.set(page.id, page.rev);
-    return [`[app: the open page ${changed ? "now reads" : "reads"}:\n${pageText(page)}]`];
+    this.seenRev.set(page.id, seenKey(page));
+    const note = changed ? null : probeNote(this.store.state, page);
+    return [`[app: the open page ${changed ? "now reads" : "reads"}:\n${pageText(page)}${note ? `\n\n${note}` : ""}]`];
   }
 
   /** An anchor carried to the page's current revision. The quote stays as first written. */
@@ -519,6 +525,7 @@ export class Tutor {
       // A tool called outside a turn has nowhere to put a card; it gets a throwaway list.
       turn: () => this.turnInfo ?? { replyId: uuidv7(this.now()), answer: null, cards: [] },
       offers: this.offers,
+      run: this.opts.sandbox ? (code: string) => this.opts.sandbox!.run([code]) : undefined,
     };
   }
 
@@ -584,4 +591,9 @@ export async function hostModel(opts: { spec: string; apiKey: string; agentDir: 
 export function keyEnvFor(provider: string): string {
   if (provider === "google") return "GEMINI_API_KEY";
   return `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
+}
+
+/** A page as the tutor last saw it: a run changes what it reads without changing its revision. */
+function seenKey(page: PageState): string {
+  return `${page.rev}:${page.run?.at ?? 0}`;
 }

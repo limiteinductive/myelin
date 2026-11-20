@@ -173,3 +173,41 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 
 54. **A look by the tutor counts as a look.** After a reply turn that showed the tutor the page, the observer starts from that revision. A flaw the tutor just discussed in the thread is not raised again as an aside.
     *Spec change:* none.
+
+## Milestone 7
+
+55. **What `page.ran` records.** `{page_id, rev, blocks: [{output, failed}], timed_out, duration_ms}`. The server appends it from device `server:sandbox` after Run page; a client may not append one. A run that stops at a failing block has fewer results than the page has blocks. The tutor sees the latest run's output under each code block in the page text, headed with the revision it ran at, so it can tell when the page has changed since.
+    *Spec change:* add the payload to "Event types".
+
+56. **How a run works.** Every code block on the page as it is now, top to bottom, in one fresh `python3` process, stopping at the first block that fails. Prints and errors go under the block that made them, and a traceback names the block (`<block 2>, line 2`). The value of a block's last expression is shown, as in a notebook. Runs queue one at a time on the server; pressing Run page again during a run waits for that run. `MYELIN_PYTHON` picks the interpreter and `MYELIN_RUN_TIMEOUT_MS` the limit (30 seconds by default).
+    *Spec change:* add to "The page".
+
+57. **What the sandbox isolates, and what it does not yet.** Each run gets a fresh process and temporary directory, an environment without the server's secrets, a wall-clock limit that kills the whole process group, CPU-time and file-size limits, and output capped at 20,000 characters per block. It does not isolate the file system or the network. That is acceptable for one person on their own machine. At milestone 9 the container must provide it: no network for the sandbox user, a read-only file system outside its temporary directory, and memory limits.
+    *Spec change:* add to "Deploy CLI and sharing".
+
+58. **Output is matched to blocks by position.** After an edit, the last run's output stays under the block in the same position until the next run. Adding a block above another moves the old output to the wrong block until then. Keeping output per block across edits would need an id on each code block. Deferred until it bothers someone.
+    *Spec change:* none.
+
+59. **The foot of a code block.** It holds the status and Run page. The status reads "Not run yet", "Running…", "Ran with the page", "Failed at this block", or why the run did not happen ("Code does not run on this server", "The page could not run while offline"). Output sits between the code and the foot, and "(nothing printed)" stands in for empty output. On a read-only page there is no Run page.
+    *Spec change:* none.
+
+60. **CodeMirror inside code blocks is deferred.** The spec and CLAUDE.md name it. For now a code block is a plain ProseMirror block in the mono font: Tab and Shift-Tab indent by four spaces, Enter keeps the indent and adds four after a colon, and the down arrow on the last line leaves the block. Typing ``` starts a block. CodeMirror would add syntax colours and bracket matching. It is worth adding when pages hold longer code, since it brings its own selection model to reconcile with anchored asides.
+    *Spec change:* "ProseMirror, with KaTeX for math and plain code blocks; CodeMirror later". Needs your say, since it touches a settled decision.
+
+61. **`run_code` posts nothing.** The tutor's own checks run in the same sandbox and only the tutor sees the output. Neither the thread nor the page shows them.
+    *Spec change:* none.
+
+62. **A probe page records its probe.** `open_page` takes an optional `unit_id` and `depth`, which must come together. The `page.created` event then carries `probe: {unit_id, depth}`. Only the tutor can create a probe page. When the learner says they are done, `record_probe` on that unit and depth uses the page's title and starter as the prompt and the page as the answer.
+    *Spec change:* add `unit_id, depth` to `open_page` in "Tutor tools" and `probe` to `page.created`.
+
+63. **The newcomer is the tutor plus triage.** On an explain page, triage is told the page is an explanation for a newcomer of the unit, and raises the first place a newcomer would get stuck, with the newcomer's naive question as the reason. The observation turn asks the tutor to read as the newcomer and, if it would get stuck too, ask the naive question as an aside: one at a time, no hint, at most 40 words. Every turn while the page is open reminds the tutor that it is the newcomer and how to grade when the learner is done.
+    *Spec change:* add to "Explaining".
+
+64. **Explain and use latency is null for now.** Active time on a page is not measured until milestone 8, so a probe answered on a page records `latency_ms: null`. A probe asked and answered in the thread still records the latency of its answer.
+    *Spec change:* none; milestone 8 fills it in.
+
+65. **Explain may come before recall.** A first explain success with no ladder yet starts the explain ladder at step 2, with the next probe 7 days on. It does not start the use ladder or the memory model. Only recall and rebuild do that.
+    *Spec change:* add to "The evidence ladder".
+
+66. **A run does not start a look.** The observer waits for edits, not runs, so a failing run alone gets no aside. The tutor sees the run's output in its next turn. Whether a failed run should count as a pause can be tuned by use.
+    *Spec change:* none.

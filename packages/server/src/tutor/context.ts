@@ -1,6 +1,6 @@
 // What the tutor is told at the start of a sitting. The thread is endless, so the tutor gets a
 // summary built from the store, never the whole transcript.
-import { isRebuildable, lineAt, mapRange, pageText, type Anchor, type PageState, type Scheduler, type State, type Unit } from "@myelin/core";
+import { isRebuildable, lineAt, mapRange, pageText, resolveUnit, type Anchor, type PageState, type Scheduler, type State, type Unit } from "@myelin/core";
 
 export interface ThreadMessage {
   id: string;
@@ -74,6 +74,28 @@ export function openPage(state: State, messages: readonly ThreadMessage[], now: 
     }
   }
   return best && now - at < OPEN_PAGE_MS ? best : null;
+}
+
+/** The unit a page probes, if it is an explanation for a newcomer. */
+export function newcomerUnit(state: State, page: PageState): Unit | null {
+  if (page.probe?.depth !== "explain") return null;
+  return resolveUnit(state, page.probe.unit_id) ?? null;
+}
+
+/** What the tutor is told about a page opened for a probe: its part while they work and how to grade it. */
+export function probeNote(state: State, page: PageState): string | null {
+  if (!page.probe) return null;
+  const u = resolveUnit(state, page.probe.unit_id);
+  const which = u ? `unit ${u.id} ("${u.text}")` : `unit ${page.probe.unit_id}`;
+  if (page.probe.depth !== "explain") {
+    return `This page probes ${which} at depth ${page.probe.depth}. When they say it is done, grade it with record_probe at that depth.`;
+  }
+  return (
+    `This page is an explanation of ${which} for a newcomer. While they write, you are that newcomer: someone who knows what it rests on but not the idea itself. ` +
+    `Where the writing would lose you, such as a term used before it is explained, a skipped step or a claim with no reason, ask the naive question in an aside: one at a time, never a hint or the answer. ` +
+    `When they say it is done, grade it with record_probe at depth explain: easy if you could follow it without asking anything, good if you could follow it once your questions were answered on the page, ` +
+    `hard if it took several fixes, again if the core idea is missing or wrong. A gap that is an idea of its own becomes a unit through find_unit.`
+  );
 }
 
 /** Where an anchored message sits now, for the tutor: the page, the line and the passage. */
@@ -166,6 +188,8 @@ export function buildSittingContext({ name, now, state, tail, timeZone, schedule
   }
   if (page) {
     lines.push("", "## The open page", "The learner wrote this; you cannot edit it. Line numbers are for open_aside only. The learner does not see them, so never mention them; quote the words instead.", "", pageText(page));
+    const note = probeNote(state, page);
+    if (note) lines.push("", note);
   }
   lines.push("", "Messages from the learner follow. Use search_memory for anything older than this tail.");
   return lines.join("\n");

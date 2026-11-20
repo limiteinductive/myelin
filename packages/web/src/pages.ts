@@ -1,13 +1,13 @@
 // The pages, folded from their events with the same code the server uses, so both agree on every
 // document, revision and passage. A refused edit never reaches the log, so one that fails here is a
 // bug: it is skipped and logged, as the server's reducer records it as an anomaly.
-import { applyPageEdit, newPage, pageLines, type MyelinEvent, type PageState } from "@myelin/core";
+import { applyPageEdit, applyPageRun, newPage, pageLines, type MyelinEvent, type PageState } from "@myelin/core";
 
 export function foldPages(events: readonly MyelinEvent[], into: Record<string, PageState> = {}): Record<string, PageState> {
   for (const e of events) {
     if (e.type === "page.created") {
       const p = e.payload;
-      into[p.page_id] ??= newPage(p.page_id, p.title, p.starter ?? null, e.ts);
+      into[p.page_id] ??= newPage(p.page_id, p.title, p.starter ?? null, e.ts, p.probe ?? null);
     } else if (e.type === "page.edited") {
       const page = into[e.payload.page_id];
       if (!page) continue;
@@ -16,6 +16,9 @@ export function foldPages(events: readonly MyelinEvent[], into: Record<string, P
       } catch (err) {
         console.warn(`page edit ${e.id} skipped: ${(err as Error).message}`);
       }
+    } else if (e.type === "page.ran") {
+      const page = into[e.payload.page_id];
+      if (page) applyPageRun(page, { rev: e.payload.rev, blocks: e.payload.blocks ?? [], timed_out: e.payload.timed_out ?? false }, e.ts);
     }
   }
   return into;
