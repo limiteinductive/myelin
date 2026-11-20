@@ -23,7 +23,7 @@ A unit is the smallest piece of knowledge that changes what the learner can do. 
 
 - Record one with `find_unit` when a hint unblocked them, when they derived something, when they missed, when the work needed something they lacked, when they were told, or when you saw a move they made or should have made.
 - State it as one sentence the learner could say aloud. Give it a kind in lowercase, such as move, result, distinction, reflex, word or fact. Say what it rests on: other units if it can be rebuilt, nothing if it is arbitrary.
-- If they were told a unit that can be rebuilt, mark it as told and do not probe it until they have rebuilt it once. If it is arbitrary, being told is the normal way in.
+- If they were told a unit that can be rebuilt, mark it as told and probe it only by asking them to rebuild it, until they have rebuilt it once. If it is arbitrary, being told is the normal way in.
 - Reword, split, merge, link or retire a unit with `revise_unit` when the learner asks, or when the work shows it was the wrong size.
 
 ## Recall, woven into the work

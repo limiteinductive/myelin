@@ -106,7 +106,7 @@ Arbitrary units are memorized as they are, and plain spaced recall is the right 
 
 Kind is a free label the tutor assigns and can change. It does not drive behaviour. The two properties above do.
 
-A reflex is a unit about how the learner works. It cannot be tested by asking. Its evidence is whether the move appears unprompted on a new problem, and how quickly.
+A reflex is a unit about how the learner works. It cannot be tested by asking. Its evidence is whether the move appears unprompted on a new problem, and how quickly. It is found with `observe_only` set, which is what keeps it from being probed; its kind is only a label.
 
 ### How units are found
 
@@ -114,7 +114,7 @@ A reflex is a unit about how the learner works. It cannot be tested by asking. I
 - **The learner derives or explains something.** The result is a unit, resting on what was used.
 - **An error or a failed probe.** The miss often reveals a unit of its own, such as a distinction between two things that were confused.
 - **The learner needs something and lacks it**, for example a word while trying to say a sentence.
-- **The learner is told something.** An arbitrary unit can be kept straight away. A rebuildable one waits until it has been rebuilt once, unless the learner chooses to memorize it anyway.
+- **The learner is told something.** An arbitrary unit can be kept straight away. A rebuildable one is probed only by rebuilding until it has been rebuilt once, unless the learner chooses to memorize it anyway.
 - **The tutor watches the work.** A habit seen on a page or in a timed run, present or missing, becomes a reflex unit. A naive question during an explanation can expose one too.
 
 A subject outline or a word-frequency list can suggest where to go next. It is a guess that evidence overrides, never the list of units.
@@ -249,6 +249,8 @@ All state is one append-only `events` table per user, held on the server. Everyt
 
 The unit, the depth tested (recall, rebuild, explain or use), the slot it arrived in, the prompt as phrased, the answering message, the inferred grade, any correction by the learner, hints used, active latency in milliseconds, the scheduler name and its predicted recall at that moment.
 
+A correction in the same turn is stored on the probe as `corrected_grade`. A later one ("that was lucky") is a new `unit.probed` event with `corrects` set to the id of the probe it corrects. The unit's memory is then recomputed from its evidence.
+
 ### Derived tables
 
 `thread`, `pages`, `asides`, `units`, `unit_links`, `unit_memory`, `evidence`, `runs` and `time_accounting`.
@@ -263,7 +265,7 @@ An aside's anchor stores the page, the page revision, a position range and the q
 - A page has one writer at a time. Each edit names the revision it was made against. A stale edit is rejected and the page reloads.
 - The tutor's tools append events. Nothing else writes derived tables.
 - Files such as images and source PDFs are stored by content hash.
-- The existing study-mode `memory.jsonl` imports as events, keeping its event ids.
+- The existing study-mode `memory.jsonl` imports as events. Its entries have no ids, so each event's id is derived from the entry's time and content, and re-importing a file is a no-op.
 
 ## Tutor agent
 
@@ -325,7 +327,7 @@ Tools only append events. The tutor has no tool that edits a page.
 
 - **Default stance.** Make the learner produce: feedback, one idea in at most 100 words, exactly one question, and hints before any reveal.
 - **Steering.** There are no modes. Asked for a nudge, give the smallest hint that could unblock. Asked for the answer, give it in full with no question back. Asked to work differently, hold that for the sitting, and record it only if the learner says it should last. Return to the default at the next new idea.
-- **Told answers.** If a told unit can be rebuilt from others, mark it as told and do not probe it yet. If it is arbitrary, being told is the normal way in.
+- **Told answers.** If a told unit can be rebuilt from others, mark it as told and probe it only by asking for a rebuild until it has been rebuilt once. If it is arbitrary, being told is the normal way in.
 - **While the learner builds on a page.** Stay quiet. Raise one aside at a real flaw, as a question at the line, in at most 100 words. Never supply the fix unasked.
 - **Thinking aloud.** Do not answer each thought.
 - **Probes.** Follow the slot rules. Never interrupt mid-thought. Accept "not now" without comment.
@@ -369,7 +371,7 @@ interface Scheduler {
   name: string;
   init(): UnitMemory;
   update(memory: UnitMemory, review: Review): UnitMemory;
-  recall(memory: UnitMemory, at: Date): number;
+  recall(memory: UnitMemory, at: number): number; // at: ms, like event ts
 }
 
 interface Slot {
@@ -378,8 +380,10 @@ interface Slot {
   context: UnitId[];
 }
 
-function nextProbe(slot: Slot, now: Date): Probe | null;
+function nextProbe(state: State, slot: Slot, now: number, opts: { scheduler: Scheduler }): Probe | null;
 ```
+
+`nextProbe` is a pure function in core. The server's `next_probe(slot)` tool supplies the current state, the clock and the scheduler.
 
 `nextProbe` ranks in this order:
 
@@ -388,6 +392,15 @@ function nextProbe(slot: Slot, now: Date): Probe | null;
 3. Units the goal needs before its date.
 
 It skips anything too large for the slot and returns nothing when no probe is worth the interruption. A notification, if added later, is only a new slot kind.
+
+Defaults, tunable without a spec change:
+
+- A unit is not probed in its first 8 hours unless the current work touches it.
+- A unit is not probed again within 10 minutes.
+- In context, a unit is probed only when its predicted recall is below 0.97. Elsewhere, below the 0.9 target.
+- A retired unit comes back when its predicted recall falls below 0.7, or after a missed probe.
+- The explain and use ladder starts 3 days after the first successful recall or rebuild. Explain applies only to rebuildable units.
+- A timed run offers only use probes, on units with predicted recall of at least 0.8.
 
 ### Metrics
 
@@ -508,7 +521,7 @@ A unit is the smallest piece of knowledge that changes what the learner can do. 
 
 - Record one with `find_unit` when a hint unblocked them, when they derived something, when they missed, when the work needed something they lacked, when they were told, or when you saw a move they made or should have made.
 - State it as one sentence the learner could say aloud. Give it a kind in lowercase, such as move, result, distinction, reflex, word or fact. Say what it rests on: other units if it can be rebuilt, nothing if it is arbitrary.
-- If they were told a unit that can be rebuilt, mark it as told and do not probe it until they have rebuilt it once. If it is arbitrary, being told is the normal way in.
+- If they were told a unit that can be rebuilt, mark it as told and probe it only by asking them to rebuild it, until they have rebuilt it once. If it is arbitrary, being told is the normal way in.
 - Reword, split, merge, link or retire a unit with `revise_unit` when the learner asks, or when the work shows it was the wrong size.
 
 ### Recall, woven into the work
