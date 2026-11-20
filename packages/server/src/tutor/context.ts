@@ -1,6 +1,6 @@
 // What the tutor is told at the start of a sitting. The thread is endless, so the tutor gets a
 // summary built from the store, never the whole transcript.
-import type { State, Unit } from "@myelin/core";
+import { isRebuildable, type Scheduler, type State, type Unit } from "@myelin/core";
 
 export interface ThreadMessage {
   id: string;
@@ -8,6 +8,8 @@ export interface ThreadMessage {
   ts: number;
   author: "learner" | "tutor";
   text: string;
+  /** When the learner saw the tutor's last message, started typing, and sent. Learner messages only. */
+  timing?: { shown_at: number | null; input_started_at: number | null; sent_at: number | null } | null;
 }
 
 export interface SittingInput {
@@ -17,6 +19,7 @@ export interface SittingInput {
   /** Messages before this sitting's first prompt, oldest first. */
   tail: ThreadMessage[];
   timeZone?: string | undefined;
+  scheduler?: Scheduler | undefined;
 }
 
 const TAIL_MESSAGES = 30;
@@ -60,12 +63,13 @@ export function tailOf(messages: ThreadMessage[], maxMessages = TAIL_MESSAGES, m
   return out.reverse();
 }
 
-function unitLine(u: Unit, state: State): string {
+export function unitLine(u: Unit, state: State, now?: number, scheduler?: Scheduler): string {
   const rests = u.rests_on.map((id) => state.units[id]?.text ?? id);
   const bits = [u.kind, `id ${u.id}`];
   bits.push(rests.length ? `rests on: ${rests.join("; ")}` : "arbitrary");
-  if (u.told && !u.rebuilt_once) bits.push("told, not yet rebuilt");
+  if (u.told && !u.rebuilt_once && isRebuildable(u)) bits.push("told, not yet rebuilt");
   if (u.observe_only) bits.push("observed only");
+  else if (scheduler && now !== undefined && u.memory_reviews > 0) bits.push(`predicted recall now ${Math.round(scheduler.recall(u.memory, now) * 100)}%`);
   const ev = u.evidence.length;
   bits.push(ev ? `${ev} pieces of evidence, last ${u.last_probed_at ? formatDate(u.last_probed_at) : "by observation"}` : "no evidence yet");
   return `- ${u.text} (${bits.join(", ")})`;
@@ -85,7 +89,7 @@ export function relevantUnits(state: State, limit = UNITS): Unit[] {
     .slice(0, limit);
 }
 
-export function buildSittingContext({ name, now, state, tail, timeZone }: SittingInput): string {
+export function buildSittingContext({ name, now, state, tail, timeZone, scheduler }: SittingInput): string {
   const lines: string[] = ["# This sitting", ""];
   lines.push(`It is ${formatWhen(now, timeZone)}. The learner is ${name}.`);
   const last = tail.at(-1);
@@ -115,7 +119,7 @@ export function buildSittingContext({ name, now, state, tail, timeZone }: Sittin
   const total = Object.values(state.units).filter((u) => u.status === "active").length;
   lines.push("", `## Units (${units.length} of ${total})`);
   if (units.length === 0) lines.push("None yet.");
-  for (const u of units) lines.push(unitLine(u, state));
+  for (const u of units) lines.push(unitLine(u, state, now, scheduler));
 
   lines.push("", "## The thread so far (oldest first)");
   if (tail.length === 0) lines.push("Nothing yet.");

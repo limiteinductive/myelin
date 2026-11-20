@@ -50,3 +50,35 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 
 15. **Pi's SDK docs link.** The SDK page is now under `docs.pi.dev/latest`. The two links in the spec point at the old path.
     *Spec change:* update both links.
+
+## Milestone 4
+
+16. **Cards ride on the tutor's message.** A unit card is `{kind: "unit", unit_id, how, note}` in the `cards` of the tutor message where the unit was found. The device shows the unit's current wording from the unit events, so a reword updates every card that shows it. The trace is a `{kind: "trace", text}` card on the reply that closed the probe, shown as the grey line inside that message.
+    *Spec change:* in "The thread", say that a message carries its cards and its trace.
+
+17. **The card's sub-line is composed by the server.** The tutor gives a short lead note ("The nudge that unblocked you."), and the server adds what it rests on: "It rests on nothing, so it is one to memorize.", "It rests on X." or, for a told unit that can be rebuilt, "It can be rebuilt, so I will not test it until you have rebuilt it once." The label is "Found", "Found by this miss" (origin error) or "Noted" (told and rebuildable).
+    *Spec change:* none; the UnitCard README already describes this.
+
+18. **Reflexes get no card mid-work.** A unit found with `observe_only` (a reflex) is recorded without a card, so the tutor does not interrupt work to announce it. It is raised in a debrief.
+    *Spec change:* add to "Units": "A reflex is announced in the debrief, not mid-work."
+
+19. **Answer time until milestone 8.** `latency_ms` is `sent_at − shown_at` from the learner's answer. `shown_at` is when the tutor's message was first on screen with the app visible, and `input_started_at` is the first keystroke since the last send. Activity signals in milestone 8 can refine it.
+    *Spec change:* none yet.
+
+20. **The tutor says the consequence; the app says the time.** Following "Say the consequence in one short line" in the prompt, the tutor writes "Rebuilt. Back in about nine days.", and the grey trace says "Recalled in 9 seconds." When the time is unknown, the trace carries the consequence and the tutor does not repeat it. The PhoneThread preview shows the consequence as the trace instead; the two should agree.
+    *Spec change:* make the PhoneThread preview's trace a time ("Recalled in 9 seconds."), or drop the line from the prompt. I recommend the first.
+
+21. **A learner's reword reaches the tutor as an app line.** When the learner rewords a unit, the next turn starts with `[app: the learner reworded unit … to "…". Their wording stands.]`.
+    *Spec change:* none.
+
+22. **Reword is one control with two states.** Reword makes the statement editable in place, and while editing the same button reads "Done". Enter or leaving the field saves, and Escape restores the old wording. A noted card has no Reword, as in the UnitCard preview.
+    *Spec change:* none, unless you count "Done" as a new control.
+
+23. **Probe offers live in memory.** The probe offered by the greeting or a seam is held in memory for six hours so `record_probe` can stamp its slot and predicted recall. After a restart, a probe defaults to the `in_context` slot.
+    *Spec change:* none.
+
+24. **Cards survive a model error.** This amends proposal 11: if the model fails after a tool already wrote a unit or a grade, the server posts the cards on an empty tutor message so the record and the thread agree. The empty message shows only its cards.
+    *Spec change:* amend proposal 11 to "A model error writes no text."
+
+25. **Math in the thread renders with milestone 5.** The tutor writes TeX such as `$\nabla p$`. The thread shows it as typed until KaTeX arrives with the page, and it will render math in thread messages too.
+    *Spec change:* none.

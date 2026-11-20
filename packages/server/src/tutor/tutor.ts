@@ -17,7 +17,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
 import { buildSittingContext, formatAgo, tailOf, type ThreadMessage } from "./context.js";
-import { tutorTools, type ToolHost } from "./tools.js";
+import { describeProbe, offerProbe, tutorTools, type Card, type Offer, type ToolHost, type TurnInfo } from "./tools.js";
 
 /** The device id on everything the tutor writes. */
 export const TUTOR_DEVICE = "server:tutor";
@@ -75,6 +75,12 @@ export class Tutor {
   private unsubscribe: () => void;
   private closed = false;
   private firstRunSent = false;
+  /** The turn in progress, for the tools. */
+  private turnInfo: TurnInfo | null = null;
+  /** Probes offered and not yet recorded, by unit id. */
+  private offers = new Map<string, Offer>();
+  /** Things the app tells the tutor at the start of its next prompt, such as a learner's rewording. */
+  private notes: string[] = [];
   private readonly gap: number;
   private readonly now: () => number;
 
@@ -134,7 +140,7 @@ export class Tutor {
   private index(e: MyelinEvent & { seq?: number }): ThreadMessage | null {
     if (e.type !== "message.added" || e.seq === undefined) return null;
     const p = e.payload;
-    const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text };
+    const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, timing: p.timing ?? null };
     this.messages.push(m);
     if (e.device_id === STUDY_MODE_DEVICE) this.imported.add(e.id);
     return m;
@@ -142,6 +148,10 @@ export class Tutor {
 
   private onAppended(fresh: Appended[]): void {
     for (const e of fresh) {
+      if (e.type === "unit.reworded" && e.payload.by === "learner") {
+        const p = e.payload;
+        this.notes.push(`[app: the learner reworded unit ${p.unit_id}${p.text ? ` to "${p.text}"` : ""}${p.kind ? ` (kind ${p.kind})` : ""}. Their wording stands.]`);
+      }
       const m = this.index(e);
       if (m?.author === "learner" && !this.imported.has(m.id)) this.kick("message");
     }
@@ -183,15 +193,24 @@ export class Tutor {
       prompt = asked.map((m) => m.text).join("\n\n");
     } else if (triggers.has("greeting")) {
       const last = this.messages.at(-1);
-      prompt =
-        `[app: the learner just opened the app${last ? `; the last message was ${formatAgo(now - last.ts)}` : ""}. ` +
-        "Greet them in one short line, then ask what they want to work on now, toward their goal if they have one. One question.]";
+      const opened = `[app: the learner just opened the app${last ? `; the last message was ${formatAgo(now - last.ts)}` : ""}. `;
+      const probe = offerProbe(this.toolHost(), { kind: "greeting", seconds: 30, context: [] }, now);
+      prompt = probe
+        ? `${opened}Greet them in a few words, then open with one short probe before anything else. ${describeProbe(probe, this.store.state)} ` +
+          "Once it is graded, ask what they want to work on now, toward their goal if they have one.]"
+        : `${opened}Greet them in one short line, then ask what they want to work on now, toward their goal if they have one. One question.]`;
     } else {
       return;
+    }
+    if (this.notes.length > 0) {
+      prompt = `${this.notes.join("\n")}\n\n${prompt}`;
+      this.notes = [];
     }
 
     const session = await this.sitting(now, new Set(asked.map((m) => m.id)));
     const draft: Draft = { id: uuidv7(now), text: "", done: false };
+    const info: TurnInfo = { replyId: draft.id, answer: asked[0] ?? null, cards: [] };
+    this.turnInfo = info;
     this.current = draft;
     this.emit(draft);
 
@@ -218,6 +237,7 @@ export class Tutor {
       error = e instanceof Error ? e.message : String(e);
     } finally {
       off();
+      this.turnInfo = null;
     }
     const last = session.messages.findLast((m) => m.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
     if (!error && (last?.stopReason === "error" || last?.stopReason === "aborted")) error = last.errorMessage ?? last.stopReason;
@@ -226,13 +246,15 @@ export class Tutor {
     if (error) {
       this.log(`tutor could not answer ${this.userId}: ${error}`);
       this.endSitting();
+      // Units already recorded in this turn still get their cards.
+      if (info.cards.length > 0) this.post(draft.id, "", info.cards);
       this.emit({ id: draft.id, text: "", done: true, error: "The tutor could not answer just now. Your message is kept, and it will answer when you next send." });
       return;
     }
     if (asked.length > 0) this.answeredThrough = Math.max(this.answeredThrough, ...asked.map((m) => m.seq));
     this.lastTurnAt = this.now();
     const text = draft.text.trim();
-    if (text) this.post(draft.id, text);
+    if (text || info.cards.length > 0) this.post(draft.id, text, info.cards);
     this.emit({ id: draft.id, text, done: true });
   }
 
@@ -249,6 +271,7 @@ export class Tutor {
       state: this.store.state,
       tail: tailOf(this.messages.filter((m) => !exclude.has(m.id))),
       timeZone: this.opts.timeZone,
+      scheduler: this.store.scheduler,
     });
     mkdirSync(this.opts.agentDir, { recursive: true });
     const loader = new DefaultResourceLoader({
@@ -294,12 +317,19 @@ export class Tutor {
   }
 
   private toolHost(): ToolHost {
+    const store = this.store;
     return {
-      state: this.store.state,
+      get state() {
+        return store.state;
+      },
+      scheduler: store.scheduler,
       messages: () => this.messages,
       append: (type, payload) => this.write(type, payload) as never,
       now: this.now,
       timeZone: this.opts.timeZone,
+      // A tool called outside a turn has nowhere to put a card; it gets a throwaway list.
+      turn: () => this.turnInfo ?? { replyId: uuidv7(this.now()), answer: null, cards: [] },
+      offers: this.offers,
     };
   }
 
@@ -309,8 +339,8 @@ export class Tutor {
     return e as MyelinEvent;
   }
 
-  private post(id: string, text: string): void {
-    this.write("message.added", { author: "tutor", text, cards: [], anchor: null, timing: null }, id);
+  private post(id: string, text: string, cards: Card[] = []): void {
+    this.write("message.added", { author: "tutor", text, cards, anchor: null, timing: null }, id);
   }
 
   private emit(d: Draft): void {

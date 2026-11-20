@@ -1,7 +1,8 @@
 // The whole app: the sign-in screen, or the thread with its composer. Nothing else.
-import { createMemo, createSignal, createStore, For, Match, onSettled, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createSignal, createStore, For, Match, onSettled, Show, Switch } from "solid-js";
 import { draft, login, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
 import { Body } from "./text.js";
+import { current, foldUnits, type UnitView } from "./units.js";
 
 export type Screen = { kind: "loading" } | { kind: "signin"; error?: string } | { kind: "thread"; session: Me };
 
@@ -77,7 +78,10 @@ function SignIn(props: { error?: string | undefined; go: (s: Screen) => void }) 
   );
 }
 
-type Line = { id: string; author: "learner" | "tutor"; text: string; ts: number };
+type UnitCard = { kind: "unit"; unit_id: string; how: string; note: string | null };
+type Line = { id: string; author: "learner" | "tutor"; text: string; ts: number; trace: string | null; units: UnitCard[] };
+
+const isUnitCard = (c: { kind: string }): c is UnitCard => c.kind === "unit" && typeof (c as UnitCard).unit_id === "string";
 
 const dayLabel = (ts: number, now = Date.now()) => {
   const d = new Date(ts);
@@ -103,10 +107,35 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     view.events
       .filter((e) => e.type === "message.added")
       .map((e) => {
-        const p = e.payload as { author: "learner" | "tutor"; text: string };
-        return { id: e.id, author: p.author, text: p.text, ts: e.ts };
+        const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[] };
+        const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
+        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard) };
       }),
   );
+  // Folded once per new event, not per render.
+  const unitMap = new Map<string, UnitView>();
+  let folded = 0;
+  const units = createMemo(() => {
+    const evs = view.events;
+    if (evs.length < folded) {
+      unitMap.clear();
+      folded = 0;
+    }
+    foldUnits(evs.slice(folded) as Ev[], unitMap);
+    folded = evs.length;
+    return { map: unitMap, n: folded };
+  });
+
+  // When the newest tutor message was first on screen: the start of the learner's answer time.
+  let shownId: string | null = null;
+  let shownAt: number | null = null;
+  const markShown = () => {
+    const last = lines().at(-1);
+    if (!last || last.author !== "tutor" || last.id === shownId) return;
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    shownId = last.id;
+    shownAt = Date.now();
+  };
 
   const toBottom = () => {
     scroller.scrollTop = scroller.scrollHeight;
@@ -131,8 +160,11 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
       // After the DOM has the new text, keep the newest line in view.
       requestAnimationFrame(() => {
         if (stick) toBottom();
+        markShown();
       });
     };
+    const visible = () => markShown();
+    document.addEventListener("visibilitychange", visible);
     const off = s.subscribe(pull);
     s.start();
     const resize = new ResizeObserver(() => {
@@ -141,16 +173,35 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     resize.observe(scroller);
     return () => {
       off();
+      document.removeEventListener("visibilitychange", visible);
       resize.disconnect();
       s.stop();
     };
   });
 
-  const send = async (text: string): Promise<boolean> => {
+  const send = async (text: string, startedAt: number | null): Promise<boolean> => {
     if (!sync) return false;
     stick = true;
+    const answering = lines().at(-1)?.id === shownId;
     try {
-      await sync.append("message.added", { author: "learner", text, cards: [], anchor: null, timing: { shown_at: null, input_started_at: null, sent_at: Date.now() } });
+      await sync.append("message.added", {
+        author: "learner",
+        text,
+        cards: [],
+        anchor: null,
+        timing: { shown_at: answering ? shownAt : null, input_started_at: startedAt, sent_at: Date.now() },
+      });
+      return true;
+    } catch (e) {
+      if (e instanceof SendError) console.warn(e.message);
+      return false;
+    }
+  };
+
+  const reword = async (unit_id: string, text: string): Promise<boolean> => {
+    if (!sync) return false;
+    try {
+      await sync.append("unit.reworded", { unit_id, text, by: "learner" });
       return true;
     } catch (e) {
       if (e instanceof SendError) console.warn(e.message);
@@ -174,15 +225,25 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                 <Show when={i() === 0 || dayLabel(lines()[i() - 1]!.ts) !== dayLabel(line.ts)}>
                   <div class="myl-day">{dayLabel(line.ts)}</div>
                 </Show>
-                <article
-                  class={{
-                    "myl-message": true,
-                    "myl-message--learner": line.author === "learner",
-                    "myl-turn": i() > 0 && lines()[i() - 1]!.author !== line.author,
-                  }}
-                >
-                  <Body text={line.text} />
-                </article>
+                <Show when={line.text.trim() || line.trace}>
+                  <article
+                    class={{
+                      "myl-message": true,
+                      "myl-message--learner": line.author === "learner",
+                      "myl-turn": i() > 0 && lines()[i() - 1]!.author !== line.author,
+                    }}
+                  >
+                    <Body text={line.text} />
+                    <Show when={line.trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
+                  </article>
+                </Show>
+                <For each={line.units}>
+                  {(card) => (
+                    <Show when={current(units().map, card.unit_id)}>
+                      <Unit card={card} unit={() => (units().n, current(units().map, card.unit_id)!)} reword={reword} />
+                    </Show>
+                  )}
+                </For>
               </>
             )}
           </For>
@@ -205,9 +266,11 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
   );
 }
 
-function Composer(props: { connected: boolean; lost: boolean; send: (text: string) => Promise<boolean> }) {
+function Composer(props: { connected: boolean; lost: boolean; send: (text: string, startedAt: number | null) => Promise<boolean> }) {
   const [empty, setEmpty] = createSignal(draft.get().trim() === "");
   const [sending, setSending] = createSignal(false);
+  // The first keystroke since the last send. A restored draft has no start time.
+  let startedAt: number | null = null;
   let field!: HTMLTextAreaElement;
   let form!: HTMLFormElement;
 
@@ -226,7 +289,8 @@ function Composer(props: { connected: boolean; lost: boolean; send: (text: strin
     const text = field.value.trim();
     if (!text || !props.connected || sending()) return;
     setSending(true);
-    if (await props.send(text)) {
+    if (await props.send(text, startedAt)) {
+      startedAt = null;
       field.value = "";
       draft.set("");
       setEmpty(true);
@@ -250,6 +314,7 @@ function Composer(props: { connected: boolean; lost: boolean; send: (text: strin
           aria-label="Message"
           placeholder="Say anything"
           onInput={(e) => {
+            startedAt ??= Date.now();
             draft.set(e.currentTarget.value);
             setEmpty(e.currentTarget.value.trim() === "");
             grow();
@@ -266,5 +331,84 @@ function Composer(props: { connected: boolean; lost: boolean; send: (text: strin
         </button>
       </div>
     </form>
+  );
+}
+
+/**
+ * A unit announced in the thread. Reword makes the statement editable in place; Enter or leaving the
+ * field keeps the learner's wording, Escape puts the old one back.
+ */
+function Unit(props: { card: UnitCard; unit: () => UnitView; reword: (id: string, text: string) => Promise<boolean> }) {
+  const [editing, setEditing] = createSignal(false);
+  let statement!: HTMLSpanElement;
+  const noted = () => props.card.how === "Noted";
+  const label = () => `${props.card.how} · ${props.unit().kind}${noted() ? ", told" : ""}`;
+  // The statement is set by hand, not rendered, so the browser's editing never fights the renderer.
+  // A saved wording shows until the event carrying it arrives.
+  let pending: string | null = null;
+  let seen: string | null = null;
+  createEffect(
+    () => [props.unit().text, editing()] as const,
+    ([text, busy]) => {
+      if (text !== seen) [seen, pending] = [text, null];
+      const shown = pending ?? text;
+      if (!busy && statement.textContent !== shown) statement.textContent = shown;
+    },
+  );
+
+  const start = () => {
+    setEditing(true);
+    requestAnimationFrame(() => {
+      statement.focus();
+      const range = document.createRange();
+      range.selectNodeContents(statement);
+      const sel = getSelection();
+      sel?.removeAllRanges();
+      sel?.addRange(range);
+    });
+  };
+  const finish = async (keep: boolean) => {
+    if (!editing()) return;
+    const text = statement.textContent?.replace(/\s+/g, " ").trim() ?? "";
+    const u = props.unit();
+    const save = keep && text !== "" && text !== u.text;
+    pending = save ? text : null;
+    setEditing(false);
+    if (save && !(await props.reword(u.id, text))) {
+      pending = null;
+      statement.textContent = props.unit().text;
+    }
+  };
+
+  return (
+    <aside class={{ "myl-unit": true, "myl-unit--noted": noted() }} aria-label={noted() ? "Unit noted" : "Unit found"}>
+      <div class="myl-unit__body">
+        <span class="myl-unit__label">{label()}</span>
+        <span
+          ref={statement}
+          class={{ "myl-unit__statement": true, "app-editing": editing() }}
+          contenteditable={editing() ? "plaintext-only" : "false"}
+          role={editing() ? "textbox" : undefined}
+          aria-label={editing() ? "Your wording" : undefined}
+          onKeyDown={(e) => {
+            if (!editing()) return;
+            if (e.key === "Enter" && !e.isComposing) {
+              e.preventDefault();
+              void finish(true);
+            } else if (e.key === "Escape") {
+              e.preventDefault();
+              void finish(false);
+            }
+          }}
+          onBlur={() => void finish(true)}
+        />
+        <Show when={props.card.note}>{(n) => <span class="myl-unit__note">{n()}</span>}</Show>
+      </div>
+      <Show when={!noted()}>
+        <button type="button" class="myl-text-button" onMouseDown={(e) => editing() && e.preventDefault()} onClick={() => (editing() ? void finish(true) : start())}>
+          {editing() ? "Done" : "Reword"}
+        </button>
+      </Show>
+    </aside>
   );
 }

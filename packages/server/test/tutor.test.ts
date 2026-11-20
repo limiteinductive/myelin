@@ -13,10 +13,13 @@ let dir: string;
 let srv: RunningServer;
 let faux: ReturnType<typeof registerFauxProvider>;
 let logs: string[];
+/** The tutor's clock. Null means real time. */
+let clock: number | null;
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "myelin-tutor-"));
   logs = [];
+  clock = null;
   faux = registerFauxProvider({ tokensPerSecond: 400 });
   const agentDir = join(dir, "pi");
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -31,7 +34,7 @@ beforeEach(async () => {
   srv = await startServer({
     port: 0,
     dataDir: dir,
-    tutor: { systemPrompt: "You are a test tutor.", model: async () => ({ runtime, model }), agentDir, retry: false, thinkingLevel: "off", log: (m) => logs.push(m) },
+    tutor: { systemPrompt: "You are a test tutor.", model: async () => ({ runtime, model }), agentDir, retry: false, thinkingLevel: "off", log: (m) => logs.push(m), now: () => clock ?? Date.now() },
   });
 });
 afterEach(async () => {
@@ -57,8 +60,14 @@ class Device {
     this.id = ((await r.json()) as { device_id: string }).device_id;
   }
 
-  async say(text: string): Promise<void> {
-    const e = makeEvent("message.added", { author: "learner", text }, { id: uuidv7(), device_id: this.id, ts: Date.now() });
+  async say(text: string, timing?: { shown_at: number; input_started_at: number; sent_at: number }): Promise<string> {
+    const ts = timing?.sent_at ?? Date.now();
+    const e = makeEvent("message.added", { author: "learner", text, ...(timing ? { timing } : {}) }, { id: uuidv7(ts), device_id: this.id, ts });
+    await this.post(e);
+    return e.id;
+  }
+
+  async post(e: MyelinEvent): Promise<void> {
     const r = await fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: this.cookie }, body: JSON.stringify({ events: [e] }) });
     expect(r.status).toBe(200);
   }
@@ -90,8 +99,12 @@ class Device {
     })();
   }
 
-  messages(): { author: string; text: string; id: string; device_id: string }[] {
-    return this.seen.filter((e) => e.type === "message.added").map((e) => ({ ...(e.payload as { author: string; text: string }), id: e.id, device_id: e.device_id }));
+  messages(): { author: string; text: string; id: string; device_id: string; cards: { kind: string; [k: string]: unknown }[] }[] {
+    return this.seen.filter((e) => e.type === "message.added").map((e) => ({ ...(e.payload as { author: string; text: string; cards: { kind: string; [k: string]: unknown }[] }), id: e.id, device_id: e.device_id }));
+  }
+
+  of<T extends MyelinEvent["type"]>(type: T): (Seen & { type: T })[] {
+    return this.seen.filter((e): e is Seen & { type: T } => e.type === type);
   }
 
   stop(): void {
@@ -250,6 +263,146 @@ describe("tutor", () => {
     await until(() => a.drafts.some((d) => d.done));
     await new Promise((r) => setTimeout(r, 50));
     expect(a.messages()).toHaveLength(2);
+    a.stop();
+  });
+
+  it("asks on Tuesday for a unit found on Monday, with no queue involved", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+
+    // Monday: a hint unblocks the learner, and the tutor records the unit.
+    clock = Date.now();
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("find_unit", { text: "Multiply and divide by the density", kind: "move", origin: "hint", note: "The nudge that unblocked you" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("That is the move. Carry on with the next line."),
+    ]);
+    await a.say("oh, multiply and divide by p(x)!");
+    await until(() => a.messages().length === 3);
+    const found = a.of("unit.found")[0]!;
+    const unitId = found.payload.unit_id;
+    const monday = a.messages()[2]!;
+    expect(found.payload).toMatchObject({ text: "Multiply and divide by the density", kind: "move", origin: "hint", told: false, rests_on: [], message_id: monday.id });
+    expect(monday.cards).toEqual([{ kind: "unit", unit_id: unitId, how: "Found", note: "The nudge that unblocked you. It rests on nothing, so it is one to memorize." }]);
+    a.stop();
+
+    // Tuesday: the learner opens the app. The greeting carries the probe; nothing else asks for it.
+    clock += 26 * 3_600_000;
+    let greeting = "";
+    faux.setResponses([
+      (ctx) => {
+        greeting = lastUser(ctx as never);
+        return fauxAssistantMessage("Morning. Quick one first: how do you turn the gradient of an expectation into something you can sample?");
+      },
+      fauxAssistantMessage(fauxToolCall("record_probe", { unit_id: unitId, depth: "recall", grade: "good" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Yes. What do you want to work on now?"),
+    ]);
+    const b = new Device();
+    await b.login(u);
+    await b.listen();
+    await until(() => b.messages().length === 4);
+    expect(greeting).toContain("the learner just opened the app");
+    expect(greeting).toContain(`Probe unit ${unitId} at depth recall`);
+    expect(greeting).toContain("Multiply and divide by the density");
+
+    const shownAt = clock + 1_000;
+    clock = shownAt + 5_000;
+    const answerId = await b.say("multiply and divide by the density", { shown_at: shownAt, input_started_at: shownAt + 1_500, sent_at: shownAt + 4_000 });
+    await until(() => b.messages().length === 6);
+
+    const probe = b.of("unit.probed")[0]!;
+    expect(probe.device_id).toBe(TUTOR_DEVICE);
+    expect(probe.payload).toMatchObject({
+      unit_id: unitId,
+      depth: "recall",
+      slot: "greeting",
+      grade: "good",
+      latency_ms: 4_000,
+      answer_message_id: answerId,
+      scheduler: "fsrs-6",
+      prompt: b.messages()[3]!.text,
+    });
+    expect(b.messages()[5]!.cards).toEqual([{ kind: "trace", text: "Recalled in 4 seconds." }]);
+    const unit = srv.stores.get(u.id).state.units[unitId]!;
+    expect(unit.memory_reviews).toBe(1);
+    expect(unit.last_probed_at).toBe(probe.ts);
+    b.stop();
+  });
+
+  it("offers a seam probe, takes a later correction, and hears about a learner's rewording", async () => {
+    const [u, a] = await learner();
+    const store = srv.stores.get(u.id);
+    const day = 86_400_000;
+    const old = Date.now() - 3 * day;
+    const unitId = uuidv7(old);
+    store.append([
+      makeEvent("message.added", { author: "tutor", text: FIRST_RUN_TEXT }, { id: uuidv7(old - 1000), device_id: TUTOR_DEVICE, ts: old - 1000 }),
+      makeEvent("unit.found", { unit_id: unitId, text: "madrugar: to get up early", kind: "word", origin: "need" }, { id: uuidv7(old), device_id: TUTOR_DEVICE, ts: old }),
+    ]);
+    await a.listen();
+    await until(() => a.ready);
+
+    let seamResult = "";
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("next_probe", { slot: "seam" }), { stopReason: "toolUse" }),
+      (ctx) => {
+        seamResult = shown(ctx);
+        return fauxAssistantMessage("Before the next one: how do you say 'to get up early'?");
+      },
+      fauxAssistantMessage(fauxToolCall("record_probe", { unit_id: unitId, depth: "recall", grade: "easy" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Instant. On we go."),
+    ]);
+    await a.say("next");
+    await until(() => a.messages().length === 3);
+    expect(seamResult).toContain(`Probe unit ${unitId} at depth recall`);
+    await a.say("madrugar");
+    await until(() => a.messages().length === 5);
+    const first = a.of("unit.probed")[0]!;
+    expect(first.payload).toMatchObject({ unit_id: unitId, slot: "seam", grade: "easy", latency_ms: null });
+    expect(a.messages()[4]!.cards).toEqual([{ kind: "trace", text: expect.stringMatching(/^Recalled\. Back in about \d+ days\.$/) }]);
+
+    // The learner rewords the unit from its card, then says the last answer was a guess.
+    await a.post(makeEvent("unit.reworded", { unit_id: unitId, text: "madrugar: to get up at dawn", by: "learner" }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+    let prompt = "";
+    faux.setResponses([
+      (ctx) => {
+        prompt = lastUser(ctx as never);
+        return fauxAssistantMessage(fauxToolCall("record_probe", { unit_id: unitId, depth: "recall", grade: "again", corrects: first.id, note: "a guess" }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("Noted, it counts as a miss."),
+    ]);
+    await a.say("honestly that was a guess");
+    await until(() => a.messages().length === 7);
+    expect(prompt).toContain(`the learner reworded unit ${unitId} to \\"madrugar: to get up at dawn\\"`);
+    expect(a.of("unit.probed")[1]!.payload).toMatchObject({ unit_id: unitId, corrects: first.id, grade: "again" });
+    expect(store.state.evidence[first.id]!.grade).toBe("again");
+    expect(store.state.units[unitId]!.text).toBe("madrugar: to get up at dawn");
+    expect(a.messages()[6]!.cards).toEqual([]);
+    a.stop();
+  });
+
+  it("refuses a duplicate unit and a device writing tutor events", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    let second = "";
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("find_unit", { text: "A baseline must not depend on the sample", kind: "distinction", origin: "error" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(fauxToolCall("find_unit", { text: "a baseline must not depend on the sample.", kind: "distinction", origin: "error" }), { stopReason: "toolUse" }),
+      (ctx) => {
+        second = shown(ctx);
+        return fauxAssistantMessage("That miss was useful.");
+      },
+    ]);
+    await a.say("I subtracted a baseline that used the sample");
+    await until(() => a.messages().length === 3);
+    expect(a.of("unit.found")).toHaveLength(1);
+    expect(second).toContain("That is already unit");
+    expect(a.messages()[2]!.cards).toEqual([expect.objectContaining({ kind: "unit", how: "Found by this miss" })]);
+    const forged = makeEvent("unit.found", { unit_id: uuidv7(), text: "x", kind: "y", origin: "told" }, { id: uuidv7(), device_id: a.id, ts: Date.now() });
+    const r = await fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ events: [forged] }) });
+    expect(r.status).toBe(403);
+    expect(Object.keys(srv.stores.get(u.id).state.units)).toHaveLength(1);
     a.stop();
   });
 });
