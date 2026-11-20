@@ -12,7 +12,9 @@ const HELP = `myelin <command>
                                  Import a study-mode memory.jsonl
 
 The data directory defaults to $MYELIN_DATA or ~/.myelin/data. The tutor needs a model key:
-GEMINI_API_KEY for the default model, MYELIN_MODEL (provider/model) for another. Both may go in .env.`;
+GEMINI_API_KEY for the default model, MYELIN_MODEL (provider/model) for another. Both may go in .env.
+MYELIN_TRIAGE_MODEL picks a cheaper model for the page observer, and MYELIN_OBSERVE_PAUSE_MS how long
+a pause in editing (15000 by default) comes before it looks.`;
 
 async function main(argv: string[]): Promise<number> {
   loadEnv();

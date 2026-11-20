@@ -39,7 +39,21 @@ export async function tutorFromEnv(dir: string, log: (s: string) => void): Promi
   const agentDir = join(dir, "pi");
   const model = await hostModel({ spec, apiKey, agentDir });
   log(`The tutor is ${spec}.`);
-  return { systemPrompt: readFileSync(promptPath(), "utf8"), model, agentDir, timeZone: process.env.TZ || undefined };
+  const opts: TutorOptions = { systemPrompt: readFileSync(promptPath(), "utf8"), model, agentDir, timeZone: process.env.TZ || undefined };
+  const pause = Number(process.env.MYELIN_OBSERVE_PAUSE_MS);
+  if (pause > 0) opts.observePauseMs = pause;
+  // The observer's triage may use a cheaper model.
+  const triage = process.env.MYELIN_TRIAGE_MODEL;
+  if (triage && triage !== spec) {
+    const triageKeyName = keyEnvFor(triage.split("/")[0] ?? "");
+    const triageKey = process.env[triageKeyName];
+    if (!triageKey) log(`${triageKeyName} is not set, so triage uses ${spec}.`);
+    else {
+      opts.triageModel = await hostModel({ spec: triage, apiKey: triageKey, agentDir });
+      log(`Triage is ${triage}.`);
+    }
+  }
+  return opts;
 }
 
 const linkFor = (base: string, token: string) => `${base.replace(/\/$/, "")}/login/${token}`;

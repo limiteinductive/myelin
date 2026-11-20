@@ -8,7 +8,7 @@ import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { groupAsides, makeEvent, mapRange, pageDoc, pageSchema, passageText, uuidv7, type Anchor, type AnchoredMessage, type MyelinEvent } from "@myelin/core";
 import { Transform } from "prosemirror-transform";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { FIRST_RUN_TEXT, startServer, TUTOR_DEVICE, type Draft, type RunningServer, type User } from "../src/index.js";
+import { FIRST_RUN_TEXT, startServer, TUTOR_DEVICE, type Draft, type RunningServer, type TutorOptions, type User } from "../src/index.js";
 
 let dir: string;
 let srv: RunningServer;
@@ -16,6 +16,8 @@ let faux: ReturnType<typeof registerFauxProvider>;
 let logs: string[];
 /** The tutor's clock. Null means real time. */
 let clock: number | null;
+/** Starts the server, with tutor options on top of the test defaults. */
+let serve: (extra?: Partial<TutorOptions>) => Promise<void>;
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "myelin-tutor-"));
@@ -32,11 +34,24 @@ beforeEach(async () => {
     models: [{ type: "chat", id: fm.id, name: fm.name, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
   } as never);
   const model = runtime.getModel(fm.provider, fm.id) as Model<Api>;
-  srv = await startServer({
-    port: 0,
-    dataDir: dir,
-    tutor: { systemPrompt: "You are a test tutor.", model: async () => ({ runtime, model }), agentDir, retry: false, thinkingLevel: "off", log: (m) => logs.push(m), now: () => clock ?? Date.now() },
-  });
+  serve = async (extra = {}) => {
+    srv = await startServer({
+      port: 0,
+      dataDir: dir,
+      tutor: {
+        systemPrompt: "You are a test tutor.",
+        model: async () => ({ runtime, model }),
+        agentDir,
+        retry: false,
+        thinkingLevel: "off",
+        log: (m) => logs.push(m),
+        now: () => clock ?? Date.now(),
+        observePauseMs: 60_000,
+        ...extra,
+      },
+    });
+  };
+  await serve();
 });
 afterEach(async () => {
   await srv.close();
@@ -112,6 +127,8 @@ class Device {
     this.abort.abort();
   }
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function until(f: () => boolean, ms = 5000): Promise<void> {
   const end = Date.now() + ms;
@@ -452,6 +469,8 @@ describe("pages", () => {
     let context = "";
     let retry = "";
     faux.setResponses([
+      // While a page is being worked on, a thread message goes through triage first.
+      fauxAssistantMessage('{"raise": false, "addressed": true}'),
       (ctx) => {
         context = shown(ctx);
         return fauxAssistantMessage(fauxToolCall("open_aside", { passage: "0.99 · 0.01", line: 3, text: Array(101).fill("word").join(" ") }), { stopReason: "toolUse" });
@@ -502,6 +521,144 @@ describe("pages", () => {
     const asides = groupAsides(anchored, store.state.pages);
     expect(asides).toHaveLength(1);
     expect(asides[0]!.messages.map((m) => m.author)).toEqual(["tutor", "learner", "tutor"]);
+    a.stop();
+  });
+});
+
+describe("observer", () => {
+  /** A page the learner made, and a way to write lines on it. */
+  async function workPage(u: User, a: Device) {
+    const store = srv.stores.get(u.id);
+    const page_id = uuidv7();
+    await a.post(makeEvent("page.created", { page_id, title: "Bayes", starter: "A test is 99% accurate and 1% have the disease. Find P(sick | +)." }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+    const page = () => store.state.pages[page_id]!;
+    const S = pageSchema;
+    const write = async (...lines: string[]) => {
+      const tr = new Transform(pageDoc(page()));
+      for (const l of lines) {
+        const last = tr.doc.lastChild!;
+        if (last.type.name === "paragraph" && last.content.size === 0) tr.insert(tr.doc.content.size - 1, S.text(l));
+        else tr.insert(tr.doc.content.size, S.node("paragraph", null, S.text(l)));
+      }
+      const steps = tr.steps.map((st) => st.toJSON());
+      await a.post(makeEvent("page.edited", { page_id, base_rev: page().rev, steps, started_at: Date.now() - 2000, ended_at: Date.now() }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+    };
+    return { page_id, page, write };
+  }
+
+  it("stays silent through correct work and speaks at a planted error", async () => {
+    await srv.close();
+    await serve({ observePauseMs: 80 });
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    const { page_id, write } = await workPage(u, a);
+    const triaged: string[] = [];
+    const triage = (verdict: object) => (ctx: unknown) => {
+      triaged.push(shown(ctx));
+      return fauxAssistantMessage(JSON.stringify(verdict));
+    };
+
+    // Correct work in two quick batches: one look after the pause, and silence.
+    faux.setResponses([triage({ raise: false })]);
+    await write("P(sick | +) = P(+ | sick) P(sick) / P(+)");
+    await write("P(+ | sick) P(sick) = 0.99 · 0.01 = 0.0099");
+    await until(() => triaged.length === 1);
+    await sleep(200);
+    expect(triaged).toHaveLength(1);
+    expect(triaged[0]).toContain("first look");
+    expect(triaged[0]).toContain("3: P(+ | sick) P(sick) = 0.99 · 0.01 = 0.0099");
+    expect(a.messages()).toHaveLength(1);
+
+    // A planted error: triage flags it, and the tutor asks at the line. No draft, nothing in the thread.
+    let observed = "";
+    let seen = "";
+    faux.setResponses([
+      triage({ raise: true, line: 4, why: "P(+) leaves out the false positives" }),
+      (ctx) => {
+        observed = lastUser(ctx as never);
+        seen = shown(ctx);
+        return fauxAssistantMessage(fauxToolCall("open_aside", { passage: "P(+) = 0.0099", line: 4, text: "Who else tests positive, besides the sick?" }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("I asked about the false positives."),
+    ]);
+    await write("P(+) = 0.0099, so P(sick | +) = 1");
+    await until(() => a.messages().length === 2);
+    await sleep(100);
+    expect(triaged[1]).toContain("Lines new or changed since the last look: 4.");
+    expect(observed).toContain("this is an observation");
+    expect(observed).toContain("line 4 (P(+) leaves out the false positives)");
+    expect(seen).toContain("4: P(+) = 0.0099, so P(sick | +) = 1");
+    expect(a.messages()[1]).toMatchObject({ author: "tutor", text: "Who else tests positive, besides the sick?" });
+    expect(a.of("message.added")[1]!.payload.anchor).toMatchObject({ page_id, quote: "P(+) = 0.0099" });
+    expect(a.drafts).toHaveLength(0);
+    expect(logs.join("\n")).toContain("observation text not posted");
+
+    // The next look knows about the aside, so the same flaw is not raised twice.
+    faux.setResponses([triage({ raise: false })]);
+    await write("hmm");
+    await until(() => triaged.length === 3);
+    await sleep(100);
+    expect(triaged[2]).toContain('the tutor wrote \\"Who else tests positive, besides the sick?\\"; the learner has not answered yet');
+    expect(a.messages()).toHaveLength(2);
+    expect(faux.getPendingResponseCount()).toBe(0);
+    a.stop();
+  });
+
+  it("hears thinking aloud without answering it, and answers what is addressed to it", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    const { write } = await workPage(u, a);
+    await write("P(sick | +) = P(+ | sick) P(sick) / P(+)");
+
+    // Narration: no reply, no draft.
+    let triaged = "";
+    faux.setResponses([
+      (ctx) => {
+        triaged = shown(ctx);
+        return fauxAssistantMessage('{"raise": false, "addressed": false}');
+      },
+    ]);
+    await a.say("so first I need P(+)");
+    await until(() => triaged !== "");
+    await sleep(100);
+    expect(triaged).toContain("so first I need P(+)");
+    expect(triaged).toContain("The tutor's last message in the thread");
+    expect(a.messages()).toHaveLength(2);
+    expect(a.drafts).toHaveLength(0);
+
+    // A question is answered, and the tutor hears what was said aloud before it.
+    let prompt = "";
+    faux.setResponses([
+      fauxAssistantMessage('```json\n{"raise": false, "addressed": true}\n```'),
+      (ctx) => {
+        prompt = lastUser(ctx as never);
+        return fauxAssistantMessage("Yes: both groups test positive.");
+      },
+    ]);
+    await a.say("does P(+) include the healthy people too?");
+    await until(() => a.messages().length === 4);
+    expect(prompt).toContain("thought aloud");
+    expect(prompt).toContain("so first I need P(+)");
+    expect(prompt).toContain("does P(+) include the healthy people too?");
+
+    // A slip said aloud gets an aside at the line it touches.
+    faux.setResponses([
+      fauxAssistantMessage('{"raise": true, "line": 2, "why": "P(+) is not P(+ | sick)", "addressed": false}'),
+      fauxAssistantMessage(fauxToolCall("open_aside", { passage: "P(+)", line: 2, text: "Is P(+) the same as P(+ | sick)?" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage(""),
+    ]);
+    await a.say("P(+) is just 0.99 then");
+    await until(() => a.messages().length === 6);
+    expect(a.of("message.added")[5]!.payload).toMatchObject({ author: "tutor", text: "Is P(+) the same as P(+ | sick)?", anchor: { quote: "P(+)" } });
+
+    // When triage fails, the message is answered as usual.
+    faux.setResponses([fauxAssistantMessage("not json"), fauxAssistantMessage("Sure.")]);
+    await a.say("ok what next");
+    await until(() => a.messages().length === 8);
+    expect(logs.join("\n")).toContain("no verdict");
+    expect(faux.getPendingResponseCount()).toBe(0);
     a.stop();
   });
 });

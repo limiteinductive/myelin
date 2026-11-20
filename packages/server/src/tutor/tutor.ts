@@ -3,7 +3,7 @@
 // The reply becomes a message.added event when the turn ends; the draft itself is never stored.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { makeEvent, mapRange, pageText, STUDY_MODE_DEVICE, uuidv7, type Anchor, type EventType, type MyelinEvent } from "@myelin/core";
+import { makeEvent, mapRange, pageLines, pageText, STUDY_MODE_DEVICE, uuidv7, type Anchor, type EventType, type MyelinEvent, type PageState } from "@myelin/core";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -17,6 +17,7 @@ import type { Api, Model } from "@earendil-works/pi-ai";
 import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
 import { anchorLabel, buildSittingContext, formatAgo, openPage, tailOf, type ThreadMessage } from "./context.js";
+import { changedLines, OBSERVE_PAUSE_MS, observationPrompt, parseVerdict, TRIAGE_SYSTEM, triagePrompt, WORKING_MS, type Verdict } from "./observer.js";
 import { describeProbe, offerProbe, tutorTools, type Card, type Offer, type ToolHost, type TurnInfo } from "./tools.js";
 
 /** The device id on everything the tutor writes. */
@@ -52,6 +53,10 @@ export interface TutorOptions {
   now?: () => number;
   timeZone?: string | undefined;
   log?: (msg: string) => void;
+  /** How long the learner pauses after a page edit before the observer looks. */
+  observePauseMs?: number;
+  /** The model for the observer's triage. Defaults to the tutor's. */
+  triageModel?: ModelSource;
 }
 
 const APP_NOTE = `
@@ -60,7 +65,7 @@ const APP_NOTE = `
 
 Text in square brackets that starts with "app:" comes from the app, not from the learner. Everything else in a user turn is what the learner wrote. Your reply is posted to the thread as one message when you finish. If nothing needs saying, call stay_quiet and write nothing.`;
 
-type Trigger = "message" | "greeting";
+type Trigger = "message" | "greeting" | "observation";
 
 export class Tutor {
   private messages: ThreadMessage[] = [];
@@ -85,6 +90,12 @@ export class Tutor {
   private notes: string[] = [];
   /** The revision of each page the tutor has read in this sitting. */
   private seenRev = new Map<string, number>();
+  /** A pause timer per page the learner is editing. */
+  private timers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Pages whose pause has run out and which the observer has not looked at yet. */
+  private due = new Set<string>();
+  /** Each page as the observer or the tutor last looked at it. */
+  private looked = new Map<string, { rev: number; lines: string[] }>();
   private readonly gap: number;
   private readonly now: () => number;
 
@@ -135,6 +146,8 @@ export class Tutor {
 
   close(): void {
     this.closed = true;
+    for (const t of this.timers.values()) clearTimeout(t);
+    this.timers.clear();
     this.unsubscribe();
     this.endSitting();
   }
@@ -156,6 +169,7 @@ export class Tutor {
         const p = e.payload;
         this.notes.push(`[app: the learner reworded unit ${p.unit_id}${p.text ? ` to "${p.text}"` : ""}${p.kind ? ` (kind ${p.kind})` : ""}. Their wording stands.]`);
       }
+      if (e.type === "page.edited" && e.device_id !== TUTOR_DEVICE && e.device_id !== STUDY_MODE_DEVICE) this.paused(e.payload.page_id);
       const m = this.index(e);
       if (m?.author === "learner" && !this.imported.has(m.id)) this.kick("message");
     }
@@ -163,6 +177,19 @@ export class Tutor {
 
   private unanswered(): ThreadMessage[] {
     return this.messages.filter((m) => m.author === "learner" && m.seq > this.answeredThrough && !this.imported.has(m.id));
+  }
+
+  /** Restarts a page's pause timer. When the learner stops editing for long enough, the observer looks. */
+  private paused(pageId: string): void {
+    if (this.closed) return;
+    clearTimeout(this.timers.get(pageId));
+    const t = setTimeout(() => {
+      this.timers.delete(pageId);
+      this.due.add(pageId);
+      this.kick("observation");
+    }, this.opts.observePauseMs ?? OBSERVE_PAUSE_MS);
+    t.unref?.();
+    this.timers.set(pageId, t);
   }
 
   private kick(t: Trigger): void {
@@ -190,9 +217,19 @@ export class Tutor {
   }
 
   private async turn(triggers: Set<Trigger>): Promise<void> {
+    if (triggers.has("message") || triggers.has("greeting")) await this.reply(triggers);
+    if (this.due.size > 0) await this.observe();
+  }
+
+  private async reply(triggers: Set<Trigger>): Promise<void> {
     const now = this.now();
     const asked = this.unanswered();
     if (asked.length === 0 && !triggers.has("greeting")) return;
+    // While a page is being worked on, a message in the thread may be the learner thinking aloud.
+    if (asked.length > 0 && !triggers.has("greeting") && asked.every((m) => !m.anchor)) {
+      const page = this.workingPage(now);
+      if (page && (await this.thinkingAloud(page, asked))) return;
+    }
     const session = await this.sitting(now, new Set(asked.map((m) => m.id)));
     const state = this.store.state;
     let prompt: string;
@@ -259,6 +296,9 @@ export class Tutor {
     }
     if (asked.length > 0) this.answeredThrough = Math.max(this.answeredThrough, ...asked.map((m) => m.seq));
     this.lastTurnAt = this.now();
+    // The tutor has seen the open page as it is now; the observer starts from here.
+    const open = openPage(this.store.state, this.messages, now);
+    if (open && this.seenRev.get(open.id) === open.rev) this.remember(open);
     const text = draft.text.trim();
     if (text || info.cards.length > 0) this.post(draft.id, text, info.cards, anchor);
     this.emit({ id: draft.id, text, done: true, anchor });
@@ -317,9 +357,132 @@ export class Tutor {
     return session;
   }
 
-  /** The open page again when it changed since the tutor last read it. */
-  private pageNotes(now: number): string[] {
+  // --- The quiet observer --------------------------------------------------------------------
+
+  /** The page the learner is writing on now, if any: the open page, edited by the learner recently. */
+  private workingPage(now: number): PageState | null {
     const page = openPage(this.store.state, this.messages, now);
+    return page && page.rev > 0 && now - page.edited_at < WORKING_MS ? page : null;
+  }
+
+  /**
+   * Messages sent in the thread while a page is being worked on. If triage finds none of them
+   * addressed to the tutor, they are thinking aloud: no reply, unless they show a real flaw.
+   * Returns false when they should be answered as usual, which is also the answer when triage fails.
+   */
+  private async thinkingAloud(page: PageState, asked: ThreadMessage[]): Promise<boolean> {
+    const said = asked.map((m) => m.text);
+    const v = await this.triage(page, said);
+    if (!v || v.addressed !== false) return false;
+    this.answeredThrough = Math.max(this.answeredThrough, ...asked.map((m) => m.seq));
+    if (v.raise) await this.observation(page, v, said);
+    else this.notes.push(`[app: while working on the page, the learner thought aloud in the thread:\n${said.map((s) => `"${s}"`).join("\n")}\nNo reply was needed.]`);
+    return true;
+  }
+
+  /** Looks at each page whose pause ran out, if it changed since the last look. */
+  private async observe(): Promise<void> {
+    const ids = [...this.due];
+    this.due.clear();
+    for (const id of ids) {
+      const page = this.store.state.pages[id];
+      // Edited again since: the next pause will bring it back.
+      if (!page || this.timers.has(id)) continue;
+      const seen = this.looked.get(id);
+      if (seen?.rev === page.rev) continue;
+      if (changedLines(page, seen?.lines ?? null).length === 0) {
+        this.remember(page);
+        continue;
+      }
+      const v = await this.triage(page, []);
+      if (v?.raise) await this.observation(page, v, []);
+    }
+  }
+
+  private remember(page: PageState): void {
+    this.looked.set(page.id, { rev: page.rev, lines: pageLines(page).map((l) => l.text) });
+  }
+
+  /** One cheap call: is anything on the page, or in what the learner said, worth interrupting for? Null if it failed. */
+  private async triage(page: PageState, said: readonly string[]): Promise<Verdict | null> {
+    const prompt = triagePrompt({
+      page,
+      before: this.looked.get(page.id)?.lines ?? null,
+      messages: this.messages,
+      pages: this.store.state.pages,
+      said,
+      lastTutor: this.messages.findLast((m) => m.author === "tutor" && !m.anchor)?.text ?? null,
+    });
+    this.remember(page);
+    const level = this.opts.thinkingLevel ?? "low";
+    try {
+      const { runtime, model } = await (this.opts.triageModel ?? this.opts.model)(this.userId);
+      const res = await runtime.completeSimple(
+        model,
+        { systemPrompt: TRIAGE_SYSTEM, messages: [{ role: "user", content: prompt, timestamp: this.now() }] },
+        level === "off" ? {} : { reasoning: level as never },
+      );
+      if (res.stopReason === "error" || res.stopReason === "aborted") throw new Error(res.errorMessage ?? res.stopReason);
+      const text = res.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+      const v = parseVerdict(text);
+      if (!v) throw new Error(`no verdict in ${JSON.stringify(text.slice(0, 200))}`);
+      this.log(`observer: page ${page.id} rev ${page.rev}${said.length ? `, ${said.length} said` : ""}: ${JSON.stringify(v)}`);
+      return v;
+    } catch (e) {
+      this.log(`observer triage failed for ${this.userId}: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    }
+  }
+
+  /**
+   * A tutor turn nobody asked for. It shows no draft, and its text is not posted: it speaks through
+   * open_aside or not at all. The one exception is a flaw only in what the learner said aloud, which
+   * gets a short question in the thread.
+   */
+  private async observation(page: PageState, v: Verdict, said: readonly string[]): Promise<void> {
+    const now = this.now();
+    const session = await this.sitting(now, new Set());
+    let prompt = observationPrompt(page, v, said);
+    const notes = [...this.notes, ...this.pageNotes(now, page)];
+    this.notes = [];
+    if (notes.length > 0) prompt = `${notes.join("\n")}\n\n${prompt}`;
+
+    const info: TurnInfo = { replyId: uuidv7(now), answer: null, cards: [] };
+    this.turnInfo = info;
+    const before = this.messages.length;
+    let text = "";
+    const off = session.subscribe((ev) => {
+      if (ev.type === "message_update" && ev.assistantMessageEvent.type === "text_delta") text += ev.assistantMessageEvent.delta;
+    });
+    let error: string | null = null;
+    try {
+      await session.prompt(prompt);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      off();
+      this.turnInfo = null;
+    }
+    const last = session.messages.findLast((m) => m.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
+    if (!error && (last?.stopReason === "error" || last?.stopReason === "aborted")) error = last.errorMessage ?? last.stopReason;
+    if (error) {
+      this.log(`observation failed for ${this.userId}: ${error}`);
+      this.endSitting();
+      return;
+    }
+    this.lastTurnAt = this.now();
+    this.remember(this.store.state.pages[page.id] ?? page);
+    const aside = this.messages.slice(before).some((m) => m.author === "tutor" && m.anchor);
+    text = text.trim();
+    if (text && said.length > 0 && !aside) this.post(info.replyId, text, info.cards);
+    else {
+      if (text) this.log(`observation text not posted: ${JSON.stringify(text.slice(0, 200))}`);
+      if (info.cards.length > 0) this.post(info.replyId, "", info.cards);
+    }
+  }
+
+  /** The open page again when it changed since the tutor last read it. */
+  private pageNotes(now: number, page = openPage(this.store.state, this.messages, now)): string[] {
     if (!page || this.seenRev.get(page.id) === page.rev) return [];
     const changed = this.seenRev.has(page.id);
     this.seenRev.set(page.id, page.rev);

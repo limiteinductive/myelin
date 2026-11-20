@@ -153,3 +153,23 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 
 48. **A link to an existing page waits for `show_card`.** For now the only page link is the one `open_page` posts. Pointing back to an older page needs `show_card(page link)`, which arrives with milestone 9.
     *Spec change:* none.
+
+## Milestone 6
+
+49. **When a pause counts.** The observer looks at a page 15 seconds after the learner's last edit batch reaches the server. Edits from the tutor or from an import never start the timer. A look happens only if the page changed since the last look, and only if a line was added or changed, not just deleted. `MYELIN_OBSERVE_PAUSE_MS` sets the pause.
+    *Spec change:* add the default to "Three triggers".
+
+50. **Triage is one call that answers in JSON.** It gets the numbered page, the lines new since the last look, the asides already on the page with whether they are waiting for an answer, and anything said aloud. It returns `{raise, line, why, addressed}`. If triage fails or returns no verdict, nothing is raised. Triage uses the tutor's model unless `MYELIN_TRIAGE_MODEL` names a cheaper one.
+    *Spec change:* add to "Three triggers"; close the "Cost of observing" question with this.
+
+51. **When triage raises, the tutor still decides.** The tutor gets an observation turn that names the flagged line and the reason. It may call `open_aside` or `stay_quiet`. An observation turn shows no draft, and any text it writes is not posted, so it can only speak through an aside.
+    *Spec change:* add to "Three triggers".
+
+52. **Thinking aloud is told apart by triage, not by a mode.** Thread messages sent while a page is being worked on (the learner edited it in the last 10 minutes) go through triage first. Messages addressed to the tutor get a reply as usual. That includes questions, requests, answers to the tutor's last message, and anything triage is unsure about or fails on. Anything else is thinking aloud. It gets no reply, the tutor is told about it in its next turn, and a real flaw in it gets an aside at the line. If the flaw is not on the page, it gets one short question in the thread. A message in an aside always gets a reply.
+    *Spec change:* add to "Thinking aloud".
+
+53. **No cue that the tutor heard.** Thinking aloud gets nothing back, not even a mark or "listening" line, since one would be a new element on screen. The learner sees the tutor is listening because it answers when asked.
+    *Spec change:* none.
+
+54. **A look by the tutor counts as a look.** After a reply turn that showed the tutor the page, the observer starts from that revision. A flaw the tutor just discussed in the thread is not raised again as an aside.
+    *Spec change:* none.
