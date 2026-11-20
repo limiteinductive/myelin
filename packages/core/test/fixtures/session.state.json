@@ -1,0 +1,756 @@
+{
+  "anomalies": [
+    {
+      "event_id": "01a10b4b-9468-7480-b8f9-5c4f0b9089cd",
+      "reason": "unit u-cond already exists",
+      "seq": 10
+    },
+    {
+      "event_id": "01a11597-5650-7316-be31-0f41b9120965",
+      "reason": "probe of unknown unit u-nope",
+      "seq": 17
+    },
+    {
+      "event_id": "01a11597-5a38-7540-a59f-0ded895b7c60",
+      "reason": "correction of unknown probe 0190e0d0-0000-7000-8000-000000000000",
+      "seq": 18
+    },
+    {
+      "event_id": "01a11fe4-1df0-7fd2-ac11-7329dc1943a4",
+      "reason": "cannot retire unit u-mult",
+      "seq": 28
+    }
+  ],
+  "budget": {
+    "note": "half an hour a day",
+    "seconds": 1800,
+    "set_at": 1791190802000
+  },
+  "evidence": {
+    "01a11070-f280-7eea-af9f-b72a183f9b56": {
+      "answer_message_id": null,
+      "at": 1791277200000,
+      "corrected_by": "01a11597-4e80-79ba-bc52-8abddcba8069",
+      "depth": "recall",
+      "event_id": "01a11070-f280-7eea-af9f-b72a183f9b56",
+      "grade": "hard",
+      "hints": 0,
+      "inferred_grade": "good",
+      "latency_ms": 4200,
+      "note": null,
+      "predicted_recall": 0,
+      "present": null,
+      "prompt": "What is P(A|B)?",
+      "scheduler": "fsrs-6",
+      "seq": 11,
+      "slot": "greeting",
+      "source": "probe",
+      "unit_id": "u-cond"
+    },
+    "01a1107a-1a40-7fd4-a4fb-f213fe5782e1": {
+      "answer_message_id": null,
+      "at": 1791277800000,
+      "corrected_by": null,
+      "depth": "rebuild",
+      "event_id": "01a1107a-1a40-7fd4-a4fb-f213fe5782e1",
+      "grade": "good",
+      "hints": 1,
+      "inferred_grade": "hard",
+      "latency_ms": 31000,
+      "note": null,
+      "predicted_recall": 0,
+      "present": null,
+      "prompt": "Derive P(A∩B).",
+      "scheduler": "fsrs-6",
+      "seq": 12,
+      "slot": "seam",
+      "source": "probe",
+      "unit_id": "u-mult"
+    },
+    "01a1107b-a0e0-7b7a-9051-4ea77fda530f": {
+      "answer_message_id": null,
+      "at": 1791277900000,
+      "corrected_by": null,
+      "depth": null,
+      "event_id": "01a1107b-a0e0-7b7a-9051-4ea77fda530f",
+      "grade": null,
+      "hints": 0,
+      "inferred_grade": null,
+      "latency_ms": 40000,
+      "note": null,
+      "predicted_recall": null,
+      "present": true,
+      "prompt": null,
+      "scheduler": null,
+      "seq": 13,
+      "slot": null,
+      "source": "observation",
+      "unit_id": "u-check"
+    },
+    "01a11597-5268-7901-9c8a-d8f5d6c6861a": {
+      "answer_message_id": null,
+      "at": 1791363601000,
+      "corrected_by": null,
+      "depth": "rebuild",
+      "event_id": "01a11597-5268-7901-9c8a-d8f5d6c6861a",
+      "grade": "good",
+      "hints": 0,
+      "inferred_grade": "good",
+      "latency_ms": 52000,
+      "note": null,
+      "predicted_recall": 0,
+      "present": null,
+      "prompt": "Rebuild Bayes from the product rule.",
+      "scheduler": "fsrs-6",
+      "seq": 16,
+      "slot": "greeting",
+      "source": "probe",
+      "unit_id": "u-bayes"
+    },
+    "01a11abd-b250-745b-ba82-17a088362fad": {
+      "answer_message_id": null,
+      "at": 1791450002000,
+      "corrected_by": null,
+      "depth": "rebuild",
+      "event_id": "01a11abd-b250-745b-ba82-17a088362fad",
+      "grade": "again",
+      "hints": 2,
+      "inferred_grade": "again",
+      "latency_ms": null,
+      "note": null,
+      "predicted_recall": 0,
+      "present": null,
+      "prompt": "We need the shortcut here.",
+      "scheduler": "fsrs-6",
+      "seq": 21,
+      "slot": "in_context",
+      "source": "probe",
+      "unit_id": "u-var-short"
+    },
+    "01a11fe4-1238-7501-8967-7149aa370061": {
+      "answer_message_id": null,
+      "at": 1791536403000,
+      "corrected_by": null,
+      "depth": "explain",
+      "event_id": "01a11fe4-1238-7501-8967-7149aa370061",
+      "grade": "good",
+      "hints": 0,
+      "inferred_grade": "good",
+      "latency_ms": null,
+      "note": null,
+      "predicted_recall": 0.95,
+      "present": null,
+      "prompt": "Explain Bayes to a newcomer.",
+      "scheduler": "fsrs-6",
+      "seq": 25,
+      "slot": "seam",
+      "source": "probe",
+      "unit_id": "u-bayes"
+    },
+    "01a11fe4-1620-7c53-9a2e-9374334669bf": {
+      "answer_message_id": null,
+      "at": 1791536404000,
+      "corrected_by": null,
+      "depth": "use",
+      "event_id": "01a11fe4-1620-7c53-9a2e-9374334669bf",
+      "grade": "good",
+      "hints": 0,
+      "inferred_grade": "good",
+      "latency_ms": null,
+      "note": null,
+      "predicted_recall": null,
+      "present": null,
+      "prompt": "Three cards in a row…",
+      "scheduler": "fsrs-6",
+      "seq": 26,
+      "slot": "seam",
+      "source": "probe",
+      "unit_id": "u-mult"
+    },
+    "01a139a3-d668-78c0-a0ad-817d7ab0621d": {
+      "answer_message_id": null,
+      "at": 1791968401000,
+      "corrected_by": null,
+      "depth": "use",
+      "event_id": "01a139a3-d668-78c0-a0ad-817d7ab0621d",
+      "grade": "again",
+      "hints": 0,
+      "inferred_grade": "again",
+      "latency_ms": 140000,
+      "note": null,
+      "predicted_recall": 0.81,
+      "present": null,
+      "prompt": "Two dice…",
+      "scheduler": "fsrs-6",
+      "seq": 30,
+      "slot": "timed_run",
+      "source": "probe",
+      "unit_id": "u-mult"
+    },
+    "01a139a3-da50-79a6-9c4c-eb1ff0a016e7": {
+      "answer_message_id": null,
+      "at": 1791968402000,
+      "corrected_by": null,
+      "depth": "recall",
+      "event_id": "01a139a3-da50-79a6-9c4c-eb1ff0a016e7",
+      "grade": "again",
+      "hints": 0,
+      "inferred_grade": "again",
+      "latency_ms": null,
+      "note": null,
+      "predicted_recall": 0.81,
+      "present": null,
+      "prompt": "State the product rule.",
+      "scheduler": "fsrs-6",
+      "seq": 31,
+      "slot": "timed_run",
+      "source": "probe",
+      "unit_id": "u-mult"
+    },
+    "01a139a3-de38-7cc2-9aa2-2a6b2a51f271": {
+      "answer_message_id": null,
+      "at": 1791968403000,
+      "corrected_by": null,
+      "depth": null,
+      "event_id": "01a139a3-de38-7cc2-9aa2-2a6b2a51f271",
+      "grade": null,
+      "hints": 0,
+      "inferred_grade": null,
+      "latency_ms": null,
+      "note": null,
+      "predicted_recall": null,
+      "present": false,
+      "prompt": null,
+      "scheduler": null,
+      "seq": 32,
+      "slot": null,
+      "source": "observation",
+      "unit_id": "u-check"
+    }
+  },
+  "goals": {
+    "g-exam": {
+      "active": true,
+      "due": 1792486800000,
+      "id": "g-exam",
+      "set_at": 1791190801000,
+      "text": "Probability exam",
+      "topic": "probability",
+      "unit_ids": [
+        "u-bayes"
+      ]
+    }
+  },
+  "preferences": {
+    "hints": {
+      "event_id": "01a139b7-0c60-7e1c-80df-42f264db71be",
+      "lasting": true,
+      "set_at": 1791969660000,
+      "value": {
+        "max": 2,
+        "style": "small steps"
+      }
+    }
+  },
+  "scheduler": "fsrs-6",
+  "seq": 35,
+  "units": {
+    "u-bayes": {
+      "evidence": [
+        "01a11597-5268-7901-9c8a-d8f5d6c6861a",
+        "01a11fe4-1238-7501-8967-7149aa370061"
+      ],
+      "first_success_at": 1791363601000,
+      "found_at": 1791190862000,
+      "found_event": "01a10b4b-88b0-756d-80fa-01fe62e59a33",
+      "id": "u-bayes",
+      "kind": "rule",
+      "ladders": {
+        "explain": {
+          "due": 1792141203000,
+          "step": 2
+        },
+        "use": {
+          "due": 1791622801000,
+          "step": 1
+        }
+      },
+      "last_probed_at": 1791536403000,
+      "memory": {
+        "difficulty": 2.11810397,
+        "due": 1791622801000,
+        "lapses": 0,
+        "last_review": 1791363601000,
+        "learning_steps": 0,
+        "reps": 1,
+        "scheduled_days": 3,
+        "stability": 2.3065,
+        "state": 2
+      },
+      "memory_reviews": 1,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "told",
+      "predecessors": [],
+      "rebuilt_once": true,
+      "rests_on": [
+        "u-mult"
+      ],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "Bayes' rule",
+      "told": true,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791190862000,
+          "by": "found",
+          "text": "Bayes' rule"
+        }
+      ]
+    },
+    "u-chain": {
+      "evidence": [],
+      "first_success_at": null,
+      "found_at": 1791536400000,
+      "found_event": "01a11fe4-0680-7ae1-aeb4-005293e22273",
+      "id": "u-chain",
+      "kind": "rule",
+      "ladders": {
+        "explain": null,
+        "use": null
+      },
+      "last_probed_at": null,
+      "memory": {
+        "difficulty": 0,
+        "due": 0,
+        "lapses": 0,
+        "last_review": null,
+        "learning_steps": 0,
+        "reps": 0,
+        "scheduled_days": 0,
+        "stability": 0,
+        "state": 0
+      },
+      "memory_reviews": 0,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "hint",
+      "predecessors": [],
+      "rebuilt_once": false,
+      "rests_on": [
+        "u-cond"
+      ],
+      "retired_at": null,
+      "status": "merged",
+      "successors": [
+        "u-mult"
+      ],
+      "text": "Chain rule of probability",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791536400000,
+          "by": "found",
+          "text": "Chain rule of probability"
+        }
+      ]
+    },
+    "u-chebyshev": {
+      "evidence": [],
+      "first_success_at": null,
+      "found_at": 1791450000000,
+      "found_event": "01a11abd-aa80-73b8-be51-dd7cb09ae9ab",
+      "id": "u-chebyshev",
+      "kind": "theorem",
+      "ladders": {
+        "explain": null,
+        "use": null
+      },
+      "last_probed_at": null,
+      "memory": {
+        "difficulty": 0,
+        "due": 0,
+        "lapses": 0,
+        "last_review": null,
+        "learning_steps": 0,
+        "reps": 0,
+        "scheduled_days": 0,
+        "stability": 0,
+        "state": 0
+      },
+      "memory_reviews": 0,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "derived",
+      "predecessors": [],
+      "rebuilt_once": false,
+      "rests_on": [
+        "u-var-def",
+        "u-var-short"
+      ],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "Chebyshev's inequality",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791450000000,
+          "by": "found",
+          "text": "Chebyshev's inequality"
+        }
+      ]
+    },
+    "u-check": {
+      "evidence": [
+        "01a1107b-a0e0-7b7a-9051-4ea77fda530f",
+        "01a139a3-de38-7cc2-9aa2-2a6b2a51f271"
+      ],
+      "first_success_at": null,
+      "found_at": 1791190864000,
+      "found_event": "01a10b4b-9080-7097-8fe0-84de95e5fc38",
+      "id": "u-check",
+      "kind": "reflex",
+      "ladders": {
+        "explain": null,
+        "use": null
+      },
+      "last_probed_at": null,
+      "memory": {
+        "difficulty": 0,
+        "due": 0,
+        "lapses": 0,
+        "last_review": null,
+        "learning_steps": 0,
+        "reps": 0,
+        "scheduled_days": 0,
+        "stability": 0,
+        "state": 0
+      },
+      "memory_reviews": 0,
+      "observations": {
+        "last_at": 1791968403000,
+        "missing": 1,
+        "present": 1
+      },
+      "observe_only": true,
+      "origin": "observed",
+      "predecessors": [],
+      "rebuilt_once": false,
+      "rests_on": [],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "Check that probabilities sum to one",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791190864000,
+          "by": "found",
+          "text": "Check that probabilities sum to one"
+        }
+      ]
+    },
+    "u-cond": {
+      "evidence": [
+        "01a11070-f280-7eea-af9f-b72a183f9b56"
+      ],
+      "first_success_at": 1791277200000,
+      "found_at": 1791190860000,
+      "found_event": "01a10b4b-80e0-7bdf-bf22-b1e3b2201414",
+      "id": "u-cond",
+      "kind": "definition",
+      "ladders": {
+        "explain": {
+          "due": 1791536400000,
+          "step": 1
+        },
+        "use": {
+          "due": 1791536400000,
+          "step": 1
+        }
+      },
+      "last_probed_at": 1791277200000,
+      "memory": {
+        "difficulty": 5.11217071,
+        "due": 1791450000000,
+        "lapses": 0,
+        "last_review": 1791277200000,
+        "learning_steps": 0,
+        "reps": 1,
+        "scheduled_days": 2,
+        "stability": 1.2931,
+        "state": 2
+      },
+      "memory_reviews": 1,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "told",
+      "predecessors": [],
+      "rebuilt_once": false,
+      "rests_on": [],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "P(A|B) is the share of B where A also holds",
+      "told": true,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791190860000,
+          "by": "found",
+          "text": "P(A|B) = P(A∩B)/P(B)"
+        },
+        {
+          "at": 1791278000000,
+          "by": "learner",
+          "text": "P(A|B) is the share of B where A also holds"
+        }
+      ]
+    },
+    "u-mult": {
+      "evidence": [
+        "01a1107a-1a40-7fd4-a4fb-f213fe5782e1",
+        "01a11fe4-1620-7c53-9a2e-9374334669bf",
+        "01a139a3-d668-78c0-a0ad-817d7ab0621d",
+        "01a139a3-da50-79a6-9c4c-eb1ff0a016e7"
+      ],
+      "first_success_at": 1791277800000,
+      "found_at": 1791190861000,
+      "found_event": "01a10b4b-84c8-7fce-847c-b0e69b52fe86",
+      "id": "u-mult",
+      "kind": "rule",
+      "ladders": {
+        "explain": {
+          "due": 1791537000000,
+          "step": 1
+        },
+        "use": {
+          "due": 1792227601000,
+          "step": 1
+        }
+      },
+      "last_probed_at": 1791968402000,
+      "memory": {
+        "difficulty": 7.39450274,
+        "due": 1792054802000,
+        "lapses": 1,
+        "last_review": 1791968402000,
+        "learning_steps": 0,
+        "reps": 2,
+        "scheduled_days": 1,
+        "stability": 0.73287234,
+        "state": 2
+      },
+      "memory_reviews": 2,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "derived",
+      "predecessors": [
+        "u-chain"
+      ],
+      "rebuilt_once": true,
+      "rests_on": [
+        "u-cond"
+      ],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "P(A∩B) = P(A|B)P(B), chained",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791190861000,
+          "by": "found",
+          "text": "P(A∩B) = P(A|B)P(B)"
+        },
+        {
+          "at": 1791536402000,
+          "by": "tutor",
+          "text": "P(A∩B) = P(A|B)P(B), chained"
+        }
+      ]
+    },
+    "u-var": {
+      "evidence": [],
+      "first_success_at": null,
+      "found_at": 1791190863000,
+      "found_event": "01a10b4b-8c98-7738-a732-f642d39a7517",
+      "id": "u-var",
+      "kind": "identity",
+      "ladders": {
+        "explain": null,
+        "use": null
+      },
+      "last_probed_at": null,
+      "memory": {
+        "difficulty": 0,
+        "due": 0,
+        "lapses": 0,
+        "last_review": null,
+        "learning_steps": 0,
+        "reps": 0,
+        "scheduled_days": 0,
+        "stability": 0,
+        "state": 0
+      },
+      "memory_reviews": 0,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "need",
+      "predecessors": [],
+      "rebuilt_once": false,
+      "rests_on": [],
+      "retired_at": null,
+      "status": "split",
+      "successors": [
+        "u-var-def",
+        "u-var-short"
+      ],
+      "text": "Var(X) = E[X²] − E[X]²",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791190863000,
+          "by": "found",
+          "text": "Var(X) = E[X²] − E[X]²"
+        }
+      ]
+    },
+    "u-var-def": {
+      "evidence": [],
+      "first_success_at": null,
+      "found_at": 1791450001000,
+      "found_event": "01a11abd-ae68-7549-8ae8-7b5a1b94d5a7",
+      "id": "u-var-def",
+      "kind": "definition",
+      "ladders": {
+        "explain": null,
+        "use": null
+      },
+      "last_probed_at": null,
+      "memory": {
+        "difficulty": 0,
+        "due": 0,
+        "lapses": 0,
+        "last_review": null,
+        "learning_steps": 0,
+        "reps": 0,
+        "scheduled_days": 0,
+        "stability": 0,
+        "state": 0
+      },
+      "memory_reviews": 0,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "need",
+      "predecessors": [
+        "u-var"
+      ],
+      "rebuilt_once": false,
+      "rests_on": [],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "Var(X) = E[(X − μ)²]",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791450001000,
+          "by": "found",
+          "text": "Var(X) = E[(X − μ)²]"
+        }
+      ]
+    },
+    "u-var-short": {
+      "evidence": [
+        "01a11abd-b250-745b-ba82-17a088362fad"
+      ],
+      "first_success_at": null,
+      "found_at": 1791450001000,
+      "found_event": "01a11abd-ae68-7549-8ae8-7b5a1b94d5a7",
+      "id": "u-var-short",
+      "kind": "identity",
+      "ladders": {
+        "explain": null,
+        "use": null
+      },
+      "last_probed_at": 1791450002000,
+      "memory": {
+        "difficulty": 6.4133,
+        "due": 1791536402000,
+        "lapses": 0,
+        "last_review": 1791450002000,
+        "learning_steps": 0,
+        "reps": 1,
+        "scheduled_days": 1,
+        "stability": 0.212,
+        "state": 2
+      },
+      "memory_reviews": 1,
+      "observations": {
+        "last_at": null,
+        "missing": 0,
+        "present": 0
+      },
+      "observe_only": false,
+      "origin": "need",
+      "predecessors": [
+        "u-var"
+      ],
+      "rebuilt_once": false,
+      "rests_on": [
+        "u-var-def"
+      ],
+      "retired_at": null,
+      "status": "active",
+      "successors": [],
+      "text": "Var(X) = E[X²] − μ²",
+      "told": false,
+      "topic": "probability",
+      "wordings": [
+        {
+          "at": 1791450001000,
+          "by": "found",
+          "text": "Var(X) = E[X²] − μ²"
+        }
+      ]
+    }
+  }
+}

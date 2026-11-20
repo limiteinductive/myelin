@@ -1,0 +1,35 @@
+<!-- @dsCard group="Page" height=440 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../bundle.css">
+<style>
+body { margin: 0; padding: 24px; }
+.demo { max-width: var(--reading-width); margin: 0 auto; display: flex; flex-direction: column; gap: var(--space-4); }
+</style>
+</head>
+<body class="myl-root">
+<div class="demo">
+<div class="myl-code">
+<pre>theta = 0.0
+baseline = 0.0
+for step in range(2000):
+    p = 1 / (1 + np.exp(-theta))
+    a = rng.random() &lt; p
+    r = (11.0 if a else 10.0) + rng.normal()
+    theta += 0.05 * (r - baseline) * (a - p)
+    baseline += 0.01 * (r - baseline)
+print(round(1 / (1 + np.exp(-theta)), 3))</pre>
+<pre class="myl-code__output">0.987</pre>
+<div class="myl-code__foot"><span>Ran with the page</span><button type="button" class="myl-text-button">Run page</button></div>
+</div>
+<div class="myl-code">
+<pre>print(g.var(), g_b.var())</pre>
+<pre class="myl-code__output">NameError: name 'g_b' is not defined</pre>
+<div class="myl-code__foot"><span class="myl-code__status--failed">Failed at this block</span><button type="button" class="myl-text-button">Run page</button></div>
+</div>
+</div>
+</body>
+</html>

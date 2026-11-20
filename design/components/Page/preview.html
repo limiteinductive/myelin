@@ -1,0 +1,30 @@
+<!-- @dsCard group="Page" height=600 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="../../tokens.css">
+<link rel="stylesheet" href="../bundle.css">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:ital,opsz,wght@0,7..72,400..600;1,7..72,400..600&display=swap">
+<style>body { margin: 0; background-image: url(../../assets/Texture/paper-grain.svg); }</style>
+</head>
+<body class="myl-root">
+<article class="myl-page">
+<div class="myl-page__bar"><a class="myl-text-button" href="#">Thread</a></div>
+<h1>Why a baseline keeps the estimator unbiased</h1>
+<p>Claim: <span class="myl-math">E[<i>b</i> ∇<sub>θ</sub> log <i>p</i><sub>θ</sub>(<i>x</i>)] = 0</span> when <i>b</i> does not depend on <i>x</i>.</p>
+<h2>Constant case first</h2>
+<div class="myl-steps">
+<div><span class="myl-steps__n">(1)</span>E[<i>b</i> ∇ log <i>p</i>] = <i>b</i> E[∇ log <i>p</i>]</div>
+<div><span class="myl-steps__n">(2)</span>E[∇ log <i>p</i>] = ∫ <i>p</i> ∇ log <i>p</i> d<i>x</i> = ∫ ∇<i>p</i> d<i>x</i></div>
+<div><span class="myl-steps__n">(3)</span><span class="myl-highlight myl-highlight--selection">= ∇ ∫ <i>p</i> d<i>x</i></span> = ∇ 1 = 0</div>
+</div>
+<p>So subtracting <i>b</i> changes nothing in the mean.</p>
+<h2>A baseline that depends on the sample</h2>
+<div class="myl-steps">
+<div><span class="myl-steps__n">(4)</span>E[<i>b</i>(<i>x</i>) ∇ log <i>p</i>] <span class="myl-highlight myl-highlight--asked">= <i>b</i>(<i>x</i>) E[∇ log <i>p</i>]</span> = 0 ??</div>
+</div>
+<p class="myl-page__note">that can't be right, the problem on Monday said it breaks</p>
+</article>
+</body>
+</html>
