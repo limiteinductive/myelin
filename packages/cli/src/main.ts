@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { DEFAULT_PORT, importStudyModeFile, invite, loadEnv, up } from "./commands.js";
+import { DEFAULT_PORT, importStudyModeFile, invite, loadEnv, metricsReport, up } from "./commands.js";
 
 const HELP = `myelin <command>
 
@@ -10,6 +10,8 @@ const HELP = `myelin <command>
                                  Make a user, or a new device link for one, and print a one-time link
   import study-mode <path> [--user NAME] [--data DIR]
                                  Import a study-mode memory.jsonl
+  metrics [name] [--data DIR]    Use after a week, predicted against actual recall, and active time
+                                 per week, for one learner. For the person running the server.
 
 The data directory defaults to $MYELIN_DATA or ~/.myelin/data. The tutor needs a model key:
 GEMINI_API_KEY for the default model, MYELIN_MODEL (provider/model) for another. Both may go in .env.
@@ -59,6 +61,11 @@ async function main(argv: string[]): Promise<number> {
       if (kind !== "study-mode" || !path) throw new Error("usage: myelin import study-mode <path>");
       const r = importStudyModeFile(path, { data: values.data, user: values.user });
       console.log(`Imported into ${r.user.name}'s record: ${r.added} new events, ${r.skipped} already there.`);
+      return 0;
+    }
+    case "metrics": {
+      const r = metricsReport({ data: values.data, user: rest.join(" ") || values.user });
+      console.log(r.text);
       return 0;
     }
     default:

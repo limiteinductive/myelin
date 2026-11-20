@@ -5,6 +5,7 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 .app-phone > .myl-phone__scroll > .myl-thread { padding-bottom: var(--space-4); }
 .app-clockbar { display: flex; justify-content: flex-end; box-sizing: border-box; width: 100%; max-width: calc(var(--reading-width) + 2 * var(--space-4)); margin-inline: auto; padding: var(--space-3) var(--space-4) 0; }
 .app-timeline { margin-block: var(--space-2); }
+.app-units { margin-block: var(--space-2); }
 .app-foot { padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom)); }
 .app-foot > .myl-composer { box-sizing: border-box; width: 100%; max-width: var(--reading-width); margin-inline: auto; }
 .app-foot .myl-composer__field { overflow-y: auto; }

@@ -30,10 +30,11 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import type { RunResult } from "../sandbox.js";
 import { formatDate, openPage, type ThreadMessage } from "./context.js";
+import { unitsTable, type UnitsCard } from "./cards.js";
 import { LONG_QUIET_MS, quietStretches, runClock, runReport, timeline, type TimelineCard } from "./runs.js";
 
 /** A card carried on the tutor's reply. The client draws a unit card or the grey trace line. */
-export type Card = { kind: "unit"; unit_id: string; how: string; note: string | null } | { kind: "trace"; text: string } | { kind: "page"; page_id: string } | TimelineCard;
+export type Card = { kind: "unit"; unit_id: string; how: string; note: string | null } | { kind: "trace"; text: string } | { kind: "page"; page_id: string } | TimelineCard | UnitsCard;
 
 /** What the tools know about the turn in progress. */
 export interface TurnInfo {
@@ -76,9 +77,9 @@ const SLOT_SECONDS: Record<"in_context" | "greeting" | "seam", number> = { in_co
 
 /** What the tutor does when a run ends, after its report. */
 export const DEBRIEF =
-  "Debrief now. First call show_card with kind timeline: name the steps of the run in order, each with the time on the run's clock it ended (until, m:ss), " +
+  "Debrief now. Open with one short line, then a blank line: the card goes after your first paragraph. Call show_card with kind timeline: name the steps of the run in order, each with the time on the run's clock it ended (until, m:ss), " +
   "and mark as costly the one step that cost the most avoidable time, if one did. A quiet stretch of a few minutes or more, or time away, is a step of its own, " +
-  "named for what it was, not folded into the work around it. The app adds any unused time. Then, in a few short lines after the card: " +
+  "named for what it was, not folded into the work around it. The app adds any unused time. Then, in a few short lines after that first one: " +
   "the one move that would have saved the most time, which units cost the most (against their own earlier speed if get_profile shows it), " +
   "and any reflex that was missing (record each with observe_unit). Record use probes with record_probe for the units the run tested. End with one question.";
 
@@ -748,35 +749,51 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     name: "show_card",
     label: "Show card",
     description:
-      "Posts a card with your reply. kind timeline: the debrief of the last timed run, as named steps in order, each ending at a time on the run's clock. " +
+      "Posts a card in your reply, after its first paragraph: write one sentence, a blank line, then the rest, so the card has a sentence above and below it. " +
+      "kind units: a table of units with what each rests on and the depths shown, not yet shown or missed, only when the learner asks where they stand; " +
+      "pass the unit_ids that answer the question (from get_profile), or a topic. At most 20 rows. " +
+      "kind timeline: the debrief of the last timed run, as named steps in order, each ending at a time on the run's clock. " +
       "The bar shows each step's share; durations are worked out by the app, which adds unused time.",
     parameters: Type.Object({
-      kind: StringEnum(["timeline"] as const, { description: "The card" }),
-      steps: Type.Array(
-        Type.Object({
-          name: Type.String({ description: "What the step was, in a few words, such as 'Sign of the update, three variants tried'" }),
-          until: Type.Optional(Type.String({ description: "When the step ended on the run's clock, m:ss. The last step may leave it out" })),
-        }),
-        { description: "The steps of the run in order" },
+      kind: StringEnum(["units", "timeline"] as const, { description: "The card" }),
+      unit_ids: Type.Optional(Type.Array(Type.String(), { description: "units: the units to show, in the order to show them" })),
+      topic: Type.Optional(Type.String({ description: "units: a topic label or word, instead of unit_ids" })),
+      steps: Type.Optional(
+        Type.Array(
+          Type.Object({
+            name: Type.String({ description: "What the step was, in a few words, such as 'Sign of the update, three variants tried'" }),
+            until: Type.Optional(Type.String({ description: "When the step ended on the run's clock, m:ss. The last step may leave it out" })),
+          }),
+          { description: "timeline: the steps of the run in order" },
+        ),
       ),
-      costly: Type.Optional(Type.Number({ description: "The number (from 1) of the one step that cost the most avoidable time, if one did" })),
-      run_id: Type.Optional(Type.String({ description: "The run. Defaults to the last one" })),
+      costly: Type.Optional(Type.Number({ description: "timeline: the number (from 1) of the one step that cost the most avoidable time, if one did" })),
+      run_id: Type.Optional(Type.String({ description: "timeline: the run. Defaults to the last one" })),
     }),
     async execute(_id, p) {
       const s = host.state;
+      const turn = host.turn();
+      const place = (card: Card) => {
+        const i = turn.cards.findIndex((c) => c.kind === card.kind);
+        if (i >= 0) turn.cards.splice(i, 1, card);
+        else turn.cards.push(card);
+      };
+      if (p.kind === "units") {
+        const card = unitsTable(s, { unit_ids: p.unit_ids, topic: p.topic }, host.now(), host.timeZone);
+        if (typeof card === "string") return ok(card);
+        place(card);
+        return ok(`Units table shown after your first paragraph, ${card.rows.length} row${card.rows.length === 1 ? "" : "s"}. Do not list the units again; say in one sentence what the table means for them.`);
+      }
       const r = p.run_id ? s.runs[p.run_id] : Object.values(s.runs).findLast(() => true);
       if (!r) return ok(p.run_id ? `No run with id ${p.run_id}.` : "There has been no timed run.");
       const events = host.events();
       const clock = runClock(r, events);
       const quiet = quietStretches(r, events, host.now(), LONG_QUIET_MS).map(([a, b]): [number, number] => [clock(a), clock(b)]);
-      const card = timeline(r, runElapsed(r, host.now()), p.steps, p.costly, quiet);
+      const card = timeline(r, runElapsed(r, host.now()), p.steps ?? [], p.costly, quiet);
       if (typeof card === "string") return ok(card);
-      const turn = host.turn();
-      const i = turn.cards.findIndex((c) => c.kind === "timeline");
-      if (i >= 0) turn.cards.splice(i, 1, card);
-      else turn.cards.push(card);
+      place(card);
       const rows = card.segments.map((g) => `${g.name} ${clockText(g.ms)}${g.costly ? " (costly)" : ""}`).join("; ");
-      return ok(`Timeline shown under your reply: ${rows}. Do not repeat the times; say what they mean.`);
+      return ok(`Timeline shown after your first paragraph: ${rows}. Do not repeat the times; say what they mean.`);
     },
   });
 

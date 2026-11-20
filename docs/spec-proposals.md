@@ -230,6 +230,7 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
     *Spec change:* describe the timeline's data in "Tutor tools".
 
 72. **The timeline card sits under the tutor's reply.** Cards follow a message's text, as unit cards do, so the sentence about the costly step comes before the card, not after it as `design/components/Timeline/README.md` says. Putting it after would mean splitting the reply in two.
+    *Withdrawn by proposal 83.*
     *Spec change:* in the Timeline README, "The tutor's sentence about the costly step comes with the card". Needs your say, since it touches the design.
 
 73. **The speed trend is in words for now.** The spec's debrief shows "the speed trend on the units involved". The card shows only the timeline. The tutor can speak to speed from the probes it records, which carry latency. A trend on the card waits for the metrics in milestone 9.
@@ -257,3 +258,19 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
     *Spec change:* none.
 
 81. **Quiet stretches are steps of their own.** In the first live run the tutor folded 17 minutes with nothing on the page into the last step of work, so the bar said the proof took most of the run. `show_card` now refuses a step that holds a quiet stretch of 3 minutes or more along with more than a minute (or a fifth of the stretch) of other time, and says which stretch to split out. The report also says once that the learner left the app, and when they came back, instead of a line per blur and away signal.
+    *Spec change:* none.
+
+## Milestone 9
+
+82. **The units table is a snapshot, posted with `show_card` kind `units`.** It takes `unit_ids` (in the order given) or a `topic` word, and refuses more than 20 rows, an unknown id, or nothing matching. Each row gives the statement and kind, a found note in the last 7 days such as "found Monday, by a miss", what it rests on ("nothing, memorized" when nothing), and a chip per depth that applies: recall and use for a memorized unit, all four for one that rests on something, use alone for a move that is only observed, plus any depth it was tested at. A chip is shown or missed by the last attempt at that depth, and not yet with none. An observation counts as use. A told unit not yet rebuilt reads "Told, not rebuilt". The evidence is as it was when asked. The statement and kind follow later rewordings.
+    *Spec change:* add to "Cards": "The units table is a snapshot of the evidence when it was asked for."
+
+83. **Tables and timelines go after the reply's first paragraph.** The tutor writes one short line, a blank line, then the rest. The app shows the first paragraph, the card, then the rest, so the card has a sentence above it and one below it as `design/components/UnitsTable/README.md` and `design/components/Timeline/README.md` say. A reply with no second paragraph shows the card at the end. Unit and page cards still follow the whole reply. Proposal 72 is withdrawn.
+    *Spec change:* none.
+
+84. **The metrics are read with `myelin metrics [name]`, not in the thread.** Time is shown only in timed runs and debriefs, and the measures are for the person running the server. The report gives use probes 7 days or more after the unit was found (succeeded out of made, across how many units), predicted against actual recall (mean of each, the Brier score, and by band of prediction), and a row per week starting Monday in `TZ`: active time in the thread, on pages and in timed runs, units gained, and use probes. A stretch of active time counts toward what ended it: a message in the thread, a page edit or an aside on a page. Time inside a run counts as the run. Imported units are not gains, and imported probes are not use probes. Proposal 73's speed trend still waits: the per-unit latency is there, but no card shows it.
+    *Spec change:* add to "Metrics": "Read with `myelin metrics`, never in the thread."
+
+85. **Calibration counts only recall and rebuild probes made after a review.** Only those feed the memory model, so only they test its prediction. A unit's first such probe has none to test: the scheduler gives 0 for a unit it has no reviews of, which puts it first in line rather than predicting anything. Imported probes carry study mode's predictions, so they count as reviews but are not scored.
+    *Spec change:* add to "Metrics": "Predicted recall is scored on recall and rebuild probes after the first."
+

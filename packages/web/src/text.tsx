@@ -23,6 +23,20 @@ export function blocks(text: string): Block[] {
   return out;
 }
 
+/**
+ * A reply's first paragraph and the rest, so a card can sit between them with a sentence above and
+ * below. Null when there is no second paragraph, or the first is code.
+ */
+export function splitLead(text: string): [string, string] | null {
+  const t = text.trim();
+  const m = /\n{2,}/.exec(t);
+  if (!m) return null;
+  const lead = t.slice(0, m.index);
+  if (lead.includes("```")) return null;
+  const rest = t.slice(m.index).trim();
+  return rest ? [lead, rest] : null;
+}
+
 const INLINE = /(`[^`\n]+`|\$\$[^$\n]+?\$\$|\$(?=[^\s$])[^$\n]*?[^\s$\\]\$(?!\d)|\*\*[^*\n]+\*\*|(?<![\w*])\*[^*\s][^*\n]*?\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*?_(?![\w_]))/g;
 
 export function inline(text: string): JSX.Element[] {

@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { importStudyMode } from "@myelin/core";
+import { ACTIVITIES, importStudyMode, metrics, type Metrics } from "@myelin/core";
 import { hostModel, keyEnvFor, Registry, Stores, startServer, type RunningServer, type TutorOptions, type User } from "@myelin/server";
 
 export const DEFAULT_PORT = 4317;
@@ -119,4 +119,58 @@ export function importStudyModeFile(path: string, opts: { data?: string; user?: 
     stores.close();
     registry.close();
   }
+}
+
+/**
+ * The measures of whether Myelin works for one learner, as plain text for the person running the
+ * server. Never shown in the thread.
+ */
+export function metricsReport(opts: { data?: string; user?: string; now?: number; timeZone?: string }): { user: User; metrics: Metrics; text: string } {
+  const dir = dataDir(opts.data);
+  const registry = new Registry(dir);
+  const stores = new Stores(dir);
+  try {
+    const users = registry.users();
+    const user = opts.user ? registry.userByName(opts.user) : users.length === 1 ? users[0] : undefined;
+    if (!user) throw new Error(opts.user ? `no user named ${opts.user}` : `say which user (${users.map((u) => u.name).join(", ") || "none yet"})`);
+    const store = stores.get(user.id);
+    const events = store.read(0, -1);
+    const now = opts.now ?? Date.now();
+    const m = metrics(events, store.state, now, opts.timeZone ?? (process.env.TZ || undefined));
+    return { user, metrics: m, text: formatMetrics(user.name, m) };
+  } finally {
+    stores.close();
+    registry.close();
+  }
+}
+
+const pct = (a: number, b: number) => (b ? `${Math.round((100 * a) / b)}%` : "-");
+const dec = (x: number | null) => (x === null ? "-" : x.toFixed(2));
+function dur(ms: number): string {
+  const min = Math.round(ms / 60_000);
+  return min >= 60 ? `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m` : `${min}m`;
+}
+
+export function formatMetrics(name: string, m: Metrics): string {
+  const out: string[] = [`Metrics for ${name}`, ""];
+  out.push(
+    m.use.probes
+      ? `Use, a week or more after finding: ${m.use.succeeded} of ${m.use.probes} probes succeeded (${pct(m.use.succeeded, m.use.probes)}), across ${m.use.units} units.`
+      : "Use, a week or more after finding: no probes yet.",
+  );
+  const c = m.calibration;
+  if (c.probes) {
+    out.push(`Recall, predicted against actual: ${c.probes} probes, ${dec(c.predicted)} predicted, ${dec(c.actual)} recalled, Brier score ${dec(c.brier)}.`);
+    for (const b of c.bins) out.push(`  predicted ${b.from.toFixed(2)}-${b.to.toFixed(2)}: ${b.probes} probes, ${dec(b.predicted)} predicted, ${dec(b.actual)} recalled`);
+  } else out.push("Recall, predicted against actual: no graded probes with a prediction yet.");
+  out.push("");
+  if (!m.weeks.length) {
+    out.push("No active time yet.");
+    return out.join("\n");
+  }
+  const head = ["Week of", ...ACTIVITIES.map((a) => a[0]!.toUpperCase() + a.slice(1)), "Units gained", "Use probes"];
+  const rows = m.weeks.map((w) => [w.week, ...ACTIVITIES.map((a) => dur(w.active_ms[a])), String(w.units_found), w.use.probes ? `${w.use.succeeded}/${w.use.probes}` : "-"]);
+  const width = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i]!.length)));
+  for (const r of [head, ...rows]) out.push(r.map((c, i) => (i === 0 ? c.padEnd(width[i]!) : c.padStart(width[i]!))).join("  "));
+  return out.join("\n");
 }

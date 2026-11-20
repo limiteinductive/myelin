@@ -5,7 +5,7 @@ import { createEffect, createMemo, createSignal, createStore, For, Match, onSett
 import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResult } from "./editor.js";
 import { foldPages, pageFacts, pageStatus } from "./pages.js";
 import { draft, login, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
-import { Body, inline } from "./text.js";
+import { Body, inline, splitLead } from "./text.js";
 import { current, foldUnits, type UnitView } from "./units.js";
 import type { JSX } from "@solidjs/web";
 
@@ -86,6 +86,9 @@ function SignIn(props: { error?: string | undefined; go: (s: Screen) => void }) 
 type UnitCard = { kind: "unit"; unit_id: string; how: string; note: string | null };
 type PageCard = { kind: "page"; page_id: string };
 type TimelineCard = { kind: "timeline"; run_id: string; duration_ms: number; segments: { name: string; ms: number; costly?: boolean; unused?: boolean }[] };
+type ChipState = "shown" | "not_yet" | "missed";
+type UnitsRow = { unit_id: string; text: string; kind: string; found: string | null; rests_on: string; told: boolean; depths: { depth: string; state: ChipState }[] };
+type UnitsTableCard = { kind: "units"; rows: UnitsRow[] };
 type Line = {
   id: string;
   author: "learner" | "tutor";
@@ -95,6 +98,7 @@ type Line = {
   units: UnitCard[];
   pages: PageCard[];
   timelines: TimelineCard[];
+  tables: UnitsTableCard[];
   anchor: Anchor | null;
 };
 /** A message on its own, or a run of messages in one aside, shown as its passage and then the messages. */
@@ -104,6 +108,8 @@ const isUnitCard = (c: { kind: string }): c is UnitCard => c.kind === "unit" && 
 const isPageCard = (c: { kind: string }): c is PageCard => c.kind === "page" && typeof (c as PageCard).page_id === "string";
 const isTimelineCard = (c: { kind: string }): c is TimelineCard =>
   c.kind === "timeline" && Array.isArray((c as TimelineCard).segments) && (c as TimelineCard).duration_ms > 0;
+
+const isUnitsTableCard = (c: { kind: string }): c is UnitsTableCard => c.kind === "units" && Array.isArray((c as UnitsTableCard).rows);
 
 const dayLabel = (ts: number, now = Date.now()) => {
   const d = new Date(ts);
@@ -208,7 +214,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null };
         const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
         const anchor = p.anchor ? { ...p.anchor } : null;
-        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), anchor };
+        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor };
       }),
   );
   /** The lines with the tutor's reply in progress at the end, in the thread or in its aside. */
@@ -217,7 +223,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     const ls = lines();
     if (!r || !r.text) return ls;
     const anchor = r.anchor ? { ...r.anchor } : null;
-    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], anchor }];
+    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor }];
   });
   const asides = createMemo<Aside[]>(() => {
     pageTick();
@@ -464,8 +470,22 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     );
   };
 
-  const Extras = (p: { line: Line }) => {
+  /** A message's cards. Tables and timelines go between the reply's first paragraph and the rest when it has one ("inline"); units and page links after it. */
+  const Extras = (p: { line: Line; part?: "inline" | "after" }) => {
+    const inlineCards = () => (
+      <>
+        <For each={p.line.tables}>{(card) => <UnitsTable card={card} unit={(id) => (units().n, current(units().map, id))} />}</For>
+        <For each={p.line.timelines}>{(card) => <Timeline card={card} />}</For>
+      </>
+    );
     return (
+      <>
+        <Show when={p.part !== "after"}>{inlineCards()}</Show>
+        <Show when={p.part !== "inline"}>{afterCards()}</Show>
+      </>
+    );
+    function afterCards() {
+      return (
       <>
         <For each={p.line.units}>
           {(card) => (
@@ -488,9 +508,9 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
             </Show>
           )}
         </For>
-        <For each={p.line.timelines}>{(card) => <Timeline card={card} />}</For>
       </>
-    );
+      );
+    }
   };
 
   const Who = (p: { author: "learner" | "tutor" }) => (
@@ -557,17 +577,39 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                     </Show>
                     <Switch>
                       <Match when={item().kind === "line" ? (item() as Item & { kind: "line" }).line : null}>
-                        {(line) => (
-                          <>
-                            <Show when={line().text.trim() || line().trace}>
-                              <article class={{ "myl-message": true, "myl-message--learner": line().author === "learner", "myl-turn": turn() }}>
-                                <Body text={line().text} />
-                                <Show when={line().trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
-                              </article>
+                        {(line) => {
+                          const split = () => (line().tables.length || line().timelines.length ? splitLead(line().text) : null);
+                          return (
+                            <Show
+                              when={split()}
+                              fallback={
+                                <>
+                                  <Show when={line().text.trim() || line().trace}>
+                                    <article class={{ "myl-message": true, "myl-message--learner": line().author === "learner", "myl-turn": turn() }}>
+                                      <Body text={line().text} />
+                                      <Show when={line().trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
+                                    </article>
+                                  </Show>
+                                  <Extras line={line()} />
+                                </>
+                              }
+                            >
+                              {(parts) => (
+                                <>
+                                  <article class={{ "myl-message": true, "myl-turn": turn() }}>
+                                    <Body text={parts()[0]} />
+                                  </article>
+                                  <Extras line={line()} part="inline" />
+                                  <article class="myl-message">
+                                    <Body text={parts()[1]} />
+                                    <Show when={line().trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
+                                  </article>
+                                  <Extras line={line()} part="after" />
+                                </>
+                              )}
                             </Show>
-                            <Extras line={line()} />
-                          </>
-                        )}
+                          );
+                        }}
                       </Match>
                       <Match when={item().kind === "aside" ? (item() as Item & { kind: "aside" }) : null}>
                         {(chunk) => (
@@ -757,6 +799,63 @@ function Timeline(props: { card: TimelineCard }) {
           }}
         </For>
       </dl>
+    </div>
+  );
+}
+
+const DEPTH_LABEL: Record<string, string> = { recall: "Recall", rebuild: "Rebuild", explain: "Explain", use: "Use" };
+const CHIP_SAYS: Record<ChipState, string> = { shown: "shown", not_yet: "not yet", missed: "missed" };
+
+/** Where the learner stands on some units: what each rests on and the depths shown. Statements follow later rewordings. */
+function UnitsTable(props: { card: UnitsTableCard; unit: (id: string) => UnitView | undefined }) {
+  return (
+    <div class="myl-card app-units">
+      <div class="myl-table-scroll">
+        <table class="myl-table">
+          <thead>
+            <tr>
+              <th scope="col">Unit</th>
+              <th scope="col">Rests on</th>
+              <th scope="col">Evidence</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={props.card.rows}>
+              {(row) => {
+                const u = () => props.unit(row.unit_id);
+                return (
+                  <tr>
+                    <td>
+                      <span class="myl-table__unit">{inline(u()?.text ?? row.text)}</span>
+                      <span class={{ "myl-table__kind": true, "myl-table__kind--found": !!row.found }}>{[u()?.kind ?? row.kind, row.found].filter(Boolean).join(" · ")}</span>
+                    </td>
+                    <td class="myl-table__rests">{inline(row.rests_on)}</td>
+                    <td>
+                      <Show when={!row.told} fallback={<span class="myl-trace">Told, not rebuilt</span>}>
+                        <div class="myl-chips">
+                          <For each={row.depths}>
+                            {(d) => {
+                              const label = DEPTH_LABEL[d.depth] ?? d.depth;
+                              return (
+                                <span class={{ "myl-chip": true, "myl-chip--shown": d.state === "shown", "myl-chip--not-yet": d.state === "not_yet", "myl-chip--missed": d.state === "missed" }}>
+                                  {d.state === "missed" ? `${label}, missed` : label}
+                                  <Show when={d.state !== "missed"}>
+                                    <span class="myl-visually-hidden">, {CHIP_SAYS[d.state]}</span>
+                                  </Show>
+                                </span>
+                              );
+                            }}
+                          </For>
+                        </div>
+                      </Show>
+                    </td>
+                  </tr>
+                );
+              }}
+            </For>
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

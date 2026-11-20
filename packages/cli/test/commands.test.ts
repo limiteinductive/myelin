@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, it } from "vitest";
-import { importStudyModeFile, invite, up } from "../src/commands.js";
+import { importStudyModeFile, invite, metricsReport, up } from "../src/commands.js";
 
 let dir: string;
 beforeEach(() => {
@@ -50,4 +50,17 @@ it("imports study-mode once", () => {
   writeFileSync(path, entry + "\n");
   expect(importStudyModeFile(path, { data: dir })).toMatchObject({ added: 2, skipped: 0 });
   expect(importStudyModeFile(path, { data: dir })).toMatchObject({ added: 0, skipped: 2 });
+});
+
+it("reports metrics for one learner, leaving imported history out of the gains", () => {
+  invite("me", { data: dir });
+  const path = join(dir, "memory.jsonl");
+  writeFileSync(path, entry + "\n");
+  importStudyModeFile(path, { data: dir });
+  const r = metricsReport({ data: dir, timeZone: "UTC" });
+  expect(r.metrics.use.probes).toBe(0);
+  expect(r.metrics.weeks.every((w) => w.units_found === 0)).toBe(true);
+  expect(r.text).toContain("Metrics for me");
+  invite("Bo", { data: dir });
+  expect(() => metricsReport({ data: dir })).toThrow(/say which user \(me, Bo\)/);
 });
