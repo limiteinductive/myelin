@@ -1,17 +1,23 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
 import { DEFAULT_PORT, importStudyModeFile, invite, loadEnv, metricsReport, up } from "./commands.js";
+import { deploy, onHost } from "./deploy.js";
 
 const HELP = `myelin <command>
 
   up [--port ${DEFAULT_PORT}] [--host 127.0.0.1] [--data DIR] [--name me]
                                  Run the server and web app locally
+  deploy <ssh-host> [--domain D] [--name me]
+                                 Build and start Myelin on a host with Docker, served over HTTPS at
+                                 the domain (by default the host's name), which must point at it
   invite <name> [--url URL] [--data DIR]
                                  Make a user, or a new device link for one, and print a one-time link
   import study-mode <path> [--user NAME] [--data DIR]
                                  Import a study-mode memory.jsonl
   metrics [name] [--data DIR]    Use after a week, predicted against actual recall, and active time
                                  per week, for one learner. For the person running the server.
+
+invite and metrics take --on <ssh-host> to run on a deployed server.
 
 The data directory defaults to $MYELIN_DATA or ~/.myelin/data. The tutor needs a model key:
 GEMINI_API_KEY for the default model, MYELIN_MODEL (provider/model) for another. Both may go in .env.
@@ -31,6 +37,8 @@ async function main(argv: string[]): Promise<number> {
       name: { type: "string" },
       url: { type: "string" },
       user: { type: "string" },
+      domain: { type: "string" },
+      on: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -39,7 +47,19 @@ async function main(argv: string[]): Promise<number> {
     console.log(HELP);
     return command || values.help ? 0 : 1;
   }
+  if (values.on) {
+    if (command !== "invite" && command !== "metrics") throw new Error("--on works with invite and metrics");
+    return onHost(values.on, withoutOn(argv));
+  }
   switch (command) {
+    case "deploy": {
+      const [host] = rest;
+      if (!host) throw new Error("usage: myelin deploy <ssh-host> [--domain D]");
+      const r = await deploy({ host, domain: values.domain, name: values.name });
+      if (r.link) console.log(`Sign in on this device (the link works once): ${r.link}`);
+      console.log(`Invite a friend: myelin invite <name> --on ${host}`);
+      return r.served ? 0 : 1;
+    }
     case "up": {
       const port = values.port ? Number(values.port) : undefined;
       const srv = await up({ port, host: values.host, data: values.data, name: values.name });
@@ -73,6 +93,16 @@ async function main(argv: string[]): Promise<number> {
       console.error(`unknown command ${command}\n\n${HELP}`);
       return 1;
   }
+}
+
+/** The arguments with --on and its value taken out, for the copy of myelin on the host. */
+function withoutOn(argv: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--on") i++;
+    else if (!argv[i]!.startsWith("--on=")) out.push(argv[i]!);
+  }
+  return out;
 }
 
 main(process.argv.slice(2)).then(

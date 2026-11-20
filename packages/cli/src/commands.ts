@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACTIVITIES, importStudyMode, metrics, type Metrics } from "@myelin/core";
-import { keyEnvFor, ModelKeys, providerName, Registry, Stores, startServer, type RunningServer, type TutorOptions, type User } from "@myelin/server";
+import { keyEnvFor, ModelKeys, providerName, Registry, Stores, startServer, type RunningServer, type SandboxOptions, type TutorOptions, type User } from "@myelin/server";
 
 export const DEFAULT_PORT = 4317;
 
@@ -27,8 +27,8 @@ export function promptPath(): string {
   return process.env.MYELIN_PROMPT ?? fileURLToPath(new URL("../../../prompts/tutor.md", import.meta.url));
 }
 
-const modelSpec = () => process.env.MYELIN_MODEL || "google/gemini-4-neon";
-const providerOf = (spec: string) => spec.split("/")[0] ?? "";
+export const modelSpec = (env: NodeJS.ProcessEnv = process.env) => env.MYELIN_MODEL || "google/gemini-4-neon";
+export const providerOf = (spec: string) => spec.split("/")[0] ?? "";
 
 /**
  * The tutor and whose key it runs on. The first user runs on the host's key, if it is set; everyone
@@ -57,6 +57,18 @@ export async function tutorFromEnv(dir: string, registry: Registry, log: (s: str
   return { tutor, keys };
 }
 
+/** The sandbox as the environment sets it. In the container, runs go to a user of their own. */
+export function sandboxFromEnv(env: NodeJS.ProcessEnv = process.env): SandboxOptions {
+  const num = (v: string | undefined) => (v && Number(v) > 0 ? Number(v) : undefined);
+  const uid = num(env.MYELIN_SANDBOX_UID);
+  return {
+    python: env.MYELIN_PYTHON || undefined,
+    timeoutMs: num(env.MYELIN_RUN_TIMEOUT_MS),
+    memoryMb: num(env.MYELIN_RUN_MEMORY_MB),
+    user: uid === undefined ? undefined : { uid, gid: num(env.MYELIN_SANDBOX_GID) ?? uid },
+  };
+}
+
 const linkFor = (base: string, token: string) => `${base.replace(/\/$/, "")}/login/${token}`;
 
 /** Runs the server. On a fresh data directory it makes the first user. Prints a sign-in link for the first user. */
@@ -81,15 +93,14 @@ export async function up(opts: {
     registry.close();
     throw e;
   }
-  const timeout = Number(process.env.MYELIN_RUN_TIMEOUT_MS);
-  const sandbox = { python: process.env.MYELIN_PYTHON || undefined, timeoutMs: timeout > 0 ? timeout : undefined };
+  const sandbox = sandboxFromEnv();
   const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dir, webRoot: root, tutor, keys, registry, sandbox });
   let owner = srv.registry.users()[0];
   if (!owner) {
     owner = srv.registry.createUser(opts.name ?? "me");
     log(`Made the first user, ${owner.name}.`);
   }
-  const link = linkFor(srv.url, srv.registry.issueLink(owner.id));
+  const link = linkFor(process.env.MYELIN_URL || srv.url, srv.registry.issueLink(owner.id));
   if (!root) log("The web app is not built (npm run build -w @myelin/web). Serving the API only.");
   log(`Myelin is running at ${srv.url}`);
   log(`Sign in on this device (the link works once): ${link}`);

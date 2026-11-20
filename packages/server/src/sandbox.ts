@@ -4,10 +4,12 @@
 //
 // What this isolates: a fresh process and working directory per run, an environment with none of the
 // server's secrets, a wall-clock timeout that kills the whole process group, a CPU-time and file-size
-// limit, and capped output. It does not isolate the file system or the network; in a deployment the
-// container provides that (see docs/spec-proposals.md).
+// limit, and capped output. It does not isolate the file system or the network by itself. In the
+// container (deploy/) runs go to a user of their own, which the container cuts off from the network
+// and the learners' files; then a run also gets a memory and process limit, and anything it leaves
+// running is killed when it ends.
 import { spawn } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chown, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +20,13 @@ export interface SandboxOptions {
   timeoutMs?: number | undefined;
   /** Output kept per block, in characters. Default 20,000. */
   maxOutput?: number | undefined;
+  /**
+   * Runs as this user and group, which needs the server to be root. Nothing else may run as this
+   * user: every process it owns is killed after each run.
+   */
+  user?: { uid: number; gid: number } | undefined;
+  /** The memory a run may allocate, in megabytes. Unlimited by default. */
+  memoryMb?: number | undefined;
 }
 
 export interface BlockResult {
@@ -34,12 +43,30 @@ export interface RunResult {
 
 const DRIVER = String.raw`
 import ast, contextlib, io, json, linecache, os, sys, traceback
+import resource
+
+
+def limit(which, soft, hard=None):
+    try:
+        resource.setrlimit(which, (soft, soft if hard is None else hard))
+    except Exception:
+        pass
+
+
+cpu = int(os.environ.get("MYELIN_CPU_S", "0"))
+if cpu > 0:
+    limit(resource.RLIMIT_CPU, cpu, cpu + 1)
+limit(resource.RLIMIT_FSIZE, 64 << 20)
+mem = int(os.environ.get("MYELIN_MEM_MB", "0"))
+if mem > 0:
+    limit(resource.RLIMIT_DATA, mem << 20)
+nproc = int(os.environ.get("MYELIN_NPROC", "0"))
+if nproc > 0:
+    limit(resource.RLIMIT_NPROC, nproc)
 try:
-    import resource
-    cpu = int(os.environ.get("MYELIN_CPU_S", "0"))
-    if cpu > 0:
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
-    resource.setrlimit(resource.RLIMIT_FSIZE, (64 << 20, 64 << 20))
+    # If memory runs short, the run goes first, not the server.
+    with open("/proc/self/oom_score_adj", "w") as f:
+        f.write("1000")
 except Exception:
     pass
 
@@ -97,10 +124,22 @@ for i, code in enumerate(blocks):
         break
 `;
 
+/** Run as the sandbox's own user: kills every process that user owns, except itself. */
+const SWEEP = `import os, signal
+try:
+    os.kill(-1, signal.SIGKILL)
+except ProcessLookupError:
+    pass`;
+
+/** Processes and threads a run may have at once, when it has a user of its own. PyTorch starts a thread per core. */
+const MAX_PROCS = 256;
+
 export class Sandbox {
   readonly python: string;
   readonly timeoutMs: number;
   readonly maxOutput: number;
+  readonly user: { uid: number; gid: number } | undefined;
+  readonly memoryMb: number | undefined;
   /** Runs wait their turn, so one learner cannot start many at once. */
   private queue: Promise<unknown> = Promise.resolve();
 
@@ -108,6 +147,8 @@ export class Sandbox {
     this.python = opts.python ?? "python3";
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.maxOutput = opts.maxOutput ?? 20_000;
+    this.user = opts.user;
+    this.memoryMb = opts.memoryMb;
   }
 
   /** Runs the blocks in order in one interpreter. Never throws for a failure in the code. */
@@ -124,14 +165,26 @@ export class Sandbox {
     try {
       const driver = join(dir, ".driver.py");
       await writeFile(driver, DRIVER);
+      if (this.user) await chown(dir, this.user.uid, this.user.gid);
       return await this.spawn(driver, dir, blocks, started);
     } finally {
+      if (this.user) await this.sweep();
       await rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   }
 
+  /** Kills whatever a run left behind, even outside its process group. Runs are one at a time, so nothing else is cut short. */
+  private sweep(): Promise<void> {
+    return new Promise((resolve) => {
+      const child = spawn(this.python, ["-c", SWEEP], { ...this.user, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" }, stdio: "ignore", timeout: 10_000 });
+      child.on("error", () => resolve());
+      child.on("close", () => resolve());
+    });
+  }
+
   private spawn(driver: string, dir: string, blocks: readonly string[], started: number): Promise<RunResult> {
-    // Only what Python needs. HOME stays so packages installed for the user (PyTorch) are found.
+    // Only what Python needs. HOME stays so packages installed for the user (PyTorch) are found,
+    // unless the run has a user of its own: then the packages are installed for everyone.
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "/usr/bin:/bin",
       LANG: "C.UTF-8",
@@ -141,10 +194,14 @@ export class Sandbox {
       MYELIN_CPU_S: String(Math.ceil(this.timeoutMs / 1000) + 5),
       MYELIN_MAX_OUTPUT: String(this.maxOutput),
     };
-    if (process.env.HOME) env.HOME = process.env.HOME;
+    if (this.user) {
+      env.HOME = dir;
+      env.MYELIN_NPROC = String(MAX_PROCS);
+    } else if (process.env.HOME) env.HOME = process.env.HOME;
+    if (this.memoryMb) env.MYELIN_MEM_MB = String(this.memoryMb);
 
     return new Promise((resolve) => {
-      const child = spawn(this.python, ["-u", "-B", driver], { cwd: dir, env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true });
+      const child = spawn(this.python, ["-u", "-B", driver], { cwd: dir, env, stdio: ["pipe", "pipe", "pipe", "pipe"], detached: true, ...this.user });
       const results: BlockResult[] = [];
       let pending = "";
       let stray = "";

@@ -1,0 +1,9 @@
+# HTTPS in front of the server. The certificate is kept in the volume, at /data/caddy.
+{
+	admin off
+}
+
+{$MYELIN_DOMAIN} {
+	header Strict-Transport-Security "max-age=31536000"
+	reverse_proxy 127.0.0.1:4317
+}
