@@ -21,3 +21,32 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 
 6. **Where a friend's own model key lives (for milestone 9).** You chose that friends bring their own key. The spec says the key is a server environment variable. A friend's key cannot be typed into the thread, because messages are permanent events, and there is no settings panel. Proposal: the host sets it with `myelin invite <name> --key-from <file>` (or `--key-env VAR`), it is stored encrypted in the registry under a server secret, and it is never sent to clients. If you would rather friends enter it themselves, that needs a control the product rules do not allow yet.
    *Spec change:* in "Deploy CLI and sharing", "Each friend's model API key is stored on the server for their user, set by the host with `myelin invite`, and never sent to clients." Mark the open question settled.
+
+## Milestone 3
+
+7. **The Pi session lives in memory and is rebuilt per sitting.** Each learner has one in-memory Pi session. A sitting ends after 30 minutes with no events; the next turn starts a fresh session whose context is built from the record (goals, preferences, thread tail), as "Context, not a transcript" asks. Nothing of Pi's is written to disk except an empty `auth.json`.
+   *Spec change:* add to "Setup": "The Pi session is in memory. A sitting ends after 30 idle minutes, and the next starts a new session from the record."
+
+8. **The first-run message is fixed text, written by the server.** On an empty thread the server posts "What do you want to learn, and is there a date you are working toward?" once, without calling the model. The learner's answer goes to the model, which sets the goal with `set_goal`.
+   *Spec change:* add to "First run": "The first message is fixed text and costs no model call."
+
+9. **The opening slot fires when the stream opens after a gap.** When a device connects and the newest message is older than 30 minutes, the tutor gets an `[app: …]` line saying the learner just opened the app, and greets them in one line with one question. Until milestone 4 there are no probes, so this is a plain greeting. Lines in `[app: …]` brackets come from the app, never from the learner, and the system prompt says so.
+   *Spec change:* none yet; milestone 4 adds the greeting probe to this slot.
+
+10. **Drafts are transient, the reply is one event.** While the tutor writes, the server sends `event: tutor` lines on the stream (`{id, text, done, error?}`). They are not stored. When the reply is complete the server appends one `message.added` with the draft's id, so a device swaps the draft for the stored message without a jump. A device that connects mid-reply gets the current draft.
+    *Spec change:* add to "Rules": "Streaming text is not an event. Only the finished reply is stored."
+
+11. **A model error writes nothing.** If the model call fails, no event is written. Devices show one grey line ("The tutor could not answer just now. Your message is kept, and it will answer when you next send.") and the unanswered messages are carried into the next turn. A message sent while the tutor is replying is answered in the next turn, not dropped.
+    *Spec change:* add to "Behaviour": "On a failed call nothing is stored, and the learner's unanswered messages go into the next turn."
+
+12. **The plus button waits for milestone 7.** It has nothing to attach until code blocks and pages exist, so the composer has only the field and Send for now.
+    *Spec change:* none; noted so its absence is not read as a decision.
+
+13. **Day dividers in the thread.** A small "Today", "Yesterday" or dated label (`myl-day`) sits between days. It is text, not a control.
+    *Spec change:* add to "The thread": "Days are separated by a dated label."
+
+14. **The CLI reads `.env`.** `myelin up` loads `.env` from the working directory and the repo root. The model is `MYELIN_MODEL` (default `google/gemini-flash-latest`) and the key is the provider's usual variable (`GEMINI_API_KEY`). With no key, the server runs and says the tutor is off.
+    *Spec change:* in "Deploy CLI and sharing", name `MYELIN_MODEL` and the provider key variable.
+
+15. **Pi's SDK docs link.** The SDK page is now under `docs.pi.dev/latest`. The two links in the spec point at the old path.
+    *Spec change:* update both links.

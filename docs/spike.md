@@ -11,7 +11,7 @@ Run on 2026-11-21 before milestone 3. Both assumptions hold.
 - Keys: `ModelRuntime.create({ authPath, modelsPath: null, refreshOnCreate: false })` then `setRuntimeApiKey("google", key)`. Runtime keys are not written to disk; the runtime does write an empty `auth.json` at `authPath`, so it points into the server's data directory. One runtime per user carries that user's own key (milestone 9).
 - Gemini: provider `google`, key `GEMINI_API_KEY`. Default model `gemini-flash-latest`, set with `MYELIN_MODEL` (for example `google/gemini-pro-latest`).
 - Tests: `registerFauxProvider()` from `@earendil-works/pi-ai/compat` scripts replies and tool calls. The faux provider must also be registered on the runtime (`modelRuntime.registerProvider(provider, { apiKey, api, baseUrl, models })`) or the session refuses to prompt for lack of a key.
-- No live Gemini call yet: `GEMINI_API_KEY` is not set in `.env`.
+- Live Gemini check (milestone 3): `google/gemini-flash-latest` answered through the app, called `set_goal` with the right date, streamed its reply, and on the second turn opened with feedback on a wrong answer and ended on one question. A turn with a tool call takes about 6 seconds (two model calls).
 
 ## Solid 2.0 (`solid-js` 2.0.3, `@solidjs/web` 2.0.3, `@solidjs/vite-plugin` 3.0.1)
 

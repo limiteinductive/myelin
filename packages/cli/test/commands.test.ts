@@ -25,7 +25,7 @@ const entry = JSON.stringify({
 
 it("up makes the first user and prints a link that signs in", async () => {
   const lines: string[] = [];
-  const srv = await up({ port: 0, data: dir, log: (s) => lines.push(s) });
+  const srv = await up({ port: 0, data: dir, log: (s) => lines.push(s), tutor: false });
   try {
     expect(lines.join("\n")).toContain("Made the first user, me.");
     const r = await fetch(`${srv.url}/api/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: srv.link }) });

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { importStudyMode } from "@myelin/core";
-import { Registry, Stores, startServer, type RunningServer, type User } from "@myelin/server";
+import { hostModel, keyEnvFor, Registry, Stores, startServer, type RunningServer, type TutorOptions, type User } from "@myelin/server";
 
 export const DEFAULT_PORT = 4317;
 
@@ -17,13 +17,48 @@ export function webRoot(): string | undefined {
   return candidates.find((p) => p !== undefined && existsSync(join(p, "index.html")));
 }
 
+/** Reads .env from the working directory and the repository root. Variables already set win. */
+export function loadEnv(): void {
+  const paths = [join(process.cwd(), ".env"), fileURLToPath(new URL("../../../.env", import.meta.url))];
+  for (const p of new Set(paths)) if (existsSync(p)) process.loadEnvFile(p);
+}
+
+export function promptPath(): string {
+  return process.env.MYELIN_PROMPT ?? fileURLToPath(new URL("../../../prompts/tutor.md", import.meta.url));
+}
+
+/** The tutor, if the host has a key for the model in MYELIN_MODEL. Never logs the key. */
+export async function tutorFromEnv(dir: string, log: (s: string) => void): Promise<TutorOptions | undefined> {
+  const spec = process.env.MYELIN_MODEL || "google/gemini-flash-latest";
+  const keyName = keyEnvFor(spec.split("/")[0] ?? "");
+  const apiKey = process.env[keyName];
+  if (!apiKey) {
+    log(`${keyName} is not set, so the tutor is off.`);
+    return undefined;
+  }
+  const agentDir = join(dir, "pi");
+  const model = await hostModel({ spec, apiKey, agentDir });
+  log(`The tutor is ${spec}.`);
+  return { systemPrompt: readFileSync(promptPath(), "utf8"), model, agentDir, timeZone: process.env.TZ || undefined };
+}
+
 const linkFor = (base: string, token: string) => `${base.replace(/\/$/, "")}/login/${token}`;
 
 /** Runs the server. On a fresh data directory it makes the first user. Prints a sign-in link for the first user. */
-export async function up(opts: { port?: number; host?: string; data?: string; name?: string; log?: (s: string) => void }): Promise<RunningServer & { link: string }> {
+export async function up(opts: {
+  port?: number;
+  host?: string;
+  data?: string;
+  name?: string;
+  log?: (s: string) => void;
+  /** false turns the tutor off; by default it is on when the host has a model key. */
+  tutor?: TutorOptions | false;
+}): Promise<RunningServer & { link: string }> {
   const log = opts.log ?? console.log;
   const root = webRoot();
-  const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dataDir(opts.data), webRoot: root });
+  const dir = dataDir(opts.data);
+  const tutor = opts.tutor === false ? undefined : (opts.tutor ?? (await tutorFromEnv(dir, log)));
+  const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dir, webRoot: root, tutor });
   let owner = srv.registry.users()[0];
   if (!owner) {
     owner = srv.registry.createUser(opts.name ?? "me");

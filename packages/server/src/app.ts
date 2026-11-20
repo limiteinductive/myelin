@@ -11,6 +11,7 @@ import { streamSSE } from "hono/streaming";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
 import { ConflictError, type Appended } from "./store.js";
 import type { Stores } from "./stores.js";
+import type { Draft, Tutors } from "./tutor/tutor.js";
 
 export const COOKIE = "myelin_device";
 const COOKIE_MAX_AGE = 400 * 24 * 3600; // the longest browsers allow
@@ -22,6 +23,8 @@ export interface AppOptions {
   stores: Stores;
   /** The built web app. Without it the server answers the API only. */
   webRoot?: string | undefined;
+  /** The tutor. Without it the thread is the learner's alone. */
+  tutors?: Tutors | undefined;
 }
 
 type Session = { user: User; device: Device };
@@ -46,7 +49,7 @@ export function clientMayWrite(e: { type?: unknown; payload?: unknown }): boolea
 
 const isHttps = (c: Context) => (c.req.header("x-forwarded-proto") ?? new URL(c.req.url).protocol.replace(":", "")) === "https";
 
-export function createApp({ registry, stores, webRoot }: AppOptions): Hono<Env> {
+export function createApp({ registry, stores, webRoot, tutors }: AppOptions): Hono<Env> {
   const app = new Hono<Env>();
 
   app.use("*", async (c, next) => {
@@ -137,8 +140,12 @@ export function createApp({ registry, stores, webRoot }: AppOptions): Hono<Env> 
     const after = Math.max(0, Number(c.req.header("last-event-id") ?? c.req.query("after") ?? 0) || 0);
     c.header("Cache-Control", "no-cache, no-transform");
     c.header("X-Accel-Buffering", "no");
+    const tutor = tutors?.get(user.id);
     return streamSSE(c, async (stream) => {
-      const queue: Appended[] = [];
+      // Stored events, and the tutor's reply while it is being written. A draft is never stored;
+      // the finished reply arrives as an ordinary message.added with the draft's id.
+      type Item = { kind: "event"; e: Appended } | { kind: "draft"; d: Draft };
+      const queue: Item[] = [];
       let wake: (() => void) | null = null;
       const nudge = () => {
         wake?.();
@@ -147,11 +154,13 @@ export function createApp({ registry, stores, webRoot }: AppOptions): Hono<Env> 
       // Subscribe and read the backlog in the same tick, so nothing appended in between is missed.
       store.catchUp();
       const unsubscribe = store.subscribe((fresh) => {
-        queue.push(...fresh);
+        for (const e of fresh) queue.push({ kind: "event", e });
         nudge();
       });
+      let undraft = () => {};
       stream.onAbort(() => {
         unsubscribe();
+        undraft();
         nudge();
       });
       let last = after;
@@ -164,10 +173,27 @@ export function createApp({ registry, stores, webRoot }: AppOptions): Hono<Env> 
         backlog = backlog.length === PAGE ? store.read(last, PAGE) : [];
       }
       await stream.writeSSE({ event: "ready", data: JSON.stringify({ head: last }) });
+      if (tutor && !stream.aborted) {
+        const pushDraft = (d: Draft) => {
+          // A slow reader gets the latest text, not every delta.
+          const prev = queue.at(-1);
+          if (prev?.kind === "draft" && prev.d.id === d.id && !prev.d.done) queue[queue.length - 1] = { kind: "draft", d };
+          else queue.push({ kind: "draft", d });
+          nudge();
+        };
+        undraft = tutor.onDraft(pushDraft);
+        if (tutor.draft) pushDraft({ ...tutor.draft });
+        tutor.opened();
+      }
       try {
         while (!stream.aborted) {
           while (queue.length > 0 && !stream.aborted) {
-            const e = queue.shift()!;
+            const item = queue.shift()!;
+            if (item.kind === "draft") {
+              await stream.writeSSE({ event: "tutor", data: JSON.stringify(item.d) });
+              continue;
+            }
+            const e = item.e;
             if (e.seq <= last) continue;
             await stream.writeSSE({ id: String(e.seq), event: "event", data: JSON.stringify(e) });
             last = e.seq;
@@ -184,6 +210,7 @@ export function createApp({ registry, stores, webRoot }: AppOptions): Hono<Env> 
         }
       } finally {
         unsubscribe();
+        undraft();
       }
     });
   });

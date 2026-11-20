@@ -1,7 +1,11 @@
 /* Layout only. Every colour, space and font comes from the tokens. */
-html, body { margin: 0; min-height: 100%; background: var(--paper); }
-.app-shell { box-sizing: border-box; min-height: 100dvh; display: flex; flex-direction: column; padding: var(--space-6) var(--space-4) 0; }
-.app-shell > .myl-thread { flex: 1; padding-bottom: var(--space-6); }
-.app-composer { position: sticky; bottom: 0; box-sizing: border-box; width: 100%; max-width: var(--reading-width); margin: 0 auto var(--space-4); }
-.app-composer .myl-composer__field { max-height: 40dvh; }
+html, body, #app { margin: 0; height: 100%; background: var(--paper); }
+.app-phone { height: 100dvh; }
+.app-phone > .myl-phone__scroll { overscroll-behavior: contain; padding-top: var(--space-6); }
+.app-phone > .myl-phone__scroll > .myl-thread { padding-bottom: var(--space-4); }
+.app-foot { padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom)); }
+.app-foot > .myl-composer { box-sizing: border-box; width: 100%; max-width: var(--reading-width); margin-inline: auto; }
+.app-foot .myl-composer__field { overflow-y: auto; }
 .app-warning { color: var(--warning); }
+.app-code { padding: 0.1em 0.3em; border-radius: var(--radius-control); background: var(--code-surface); font: 400 0.88em/1 var(--font-mono); }
+.myl-message .myl-code pre { white-space: pre-wrap; overflow-wrap: anywhere; }

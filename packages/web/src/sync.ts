@@ -10,6 +10,14 @@ export interface Me {
   head?: number;
 }
 
+/** The tutor's reply while it is being written. It is never stored; the finished reply arrives as a message with the same id. */
+export interface Draft {
+  id: string;
+  text: string;
+  done: boolean;
+  error?: string;
+}
+
 export class SignInError extends Error {}
 export class SendError extends Error {}
 
@@ -39,7 +47,13 @@ export class Sync {
   /** True once the backlog has arrived. */
   ready = false;
   connected = false;
+  /** True after the connection dropped, until it is back. */
+  lost = false;
   signedOut = false;
+  /** The tutor's reply in progress. */
+  reply: Draft | null = null;
+  /** A one-off line from the tutor's side, such as a failed reply. It is not part of the record. */
+  notice: string | null = null;
   private source: EventSource | null = null;
   private listeners = new Set<Listener>();
   private ids = new Set<string>();
@@ -66,6 +80,7 @@ export class Sync {
     this.source = es;
     es.addEventListener("open", () => {
       this.connected = true;
+      this.lost = false;
       this.changed();
     });
     es.addEventListener("event", (m) => {
@@ -73,6 +88,19 @@ export class Sync {
       if (e.seq <= this.head || this.ids.has(e.id)) return;
       this.ids.add(e.id);
       this.events.push(e);
+      if (this.reply?.id === e.id) this.reply = null;
+      if (e.type === "message.added") this.notice = null;
+      this.changed();
+    });
+    es.addEventListener("tutor", (m) => {
+      const d = JSON.parse((m as MessageEvent<string>).data) as Draft;
+      if (d.done) {
+        if (this.reply?.id === d.id || !this.reply) this.reply = null;
+        if (d.error) this.notice = d.error;
+      } else if (!this.ids.has(d.id)) {
+        this.reply = d;
+        this.notice = null;
+      }
       this.changed();
     });
     es.addEventListener("ready", () => {
@@ -81,6 +109,9 @@ export class Sync {
     });
     es.addEventListener("error", () => {
       this.connected = false;
+      this.lost = true;
+      // The server sends the reply in progress again on reconnect.
+      this.reply = null;
       this.changed();
       // A closed source will not retry: the cookie is gone, or the server refused the stream.
       if (es.readyState === EventSource.CLOSED) void this.recover();

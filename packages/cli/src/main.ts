@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { DEFAULT_PORT, importStudyModeFile, invite, up } from "./commands.js";
+import { DEFAULT_PORT, importStudyModeFile, invite, loadEnv, up } from "./commands.js";
 
 const HELP = `myelin <command>
 
@@ -11,9 +11,11 @@ const HELP = `myelin <command>
   import study-mode <path> [--user NAME] [--data DIR]
                                  Import a study-mode memory.jsonl
 
-The data directory defaults to $MYELIN_DATA or ~/.myelin/data.`;
+The data directory defaults to $MYELIN_DATA or ~/.myelin/data. The tutor needs a model key:
+GEMINI_API_KEY for the default model, MYELIN_MODEL (provider/model) for another. Both may go in .env.`;
 
 async function main(argv: string[]): Promise<number> {
+  loadEnv();
   const { values, positionals } = parseArgs({
     args: argv,
     allowPositionals: true,
