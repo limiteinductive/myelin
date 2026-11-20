@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { importStudyModeFile, invite, metricsReport, up } from "../src/commands.js";
 
 let dir: string;
@@ -42,6 +42,20 @@ it("invite makes a user once, then device links", () => {
   const b = invite("Bo", { data: dir });
   expect(b).toMatchObject({ created: false, user: { id: a.user.id } });
   expect(b.link).not.toBe(a.link);
+});
+
+it("invite says when a learner will be asked for their own key", () => {
+  vi.stubEnv("MYELIN_MODEL", "google/gemini-4-neon");
+  vi.stubEnv("GEMINI_API_KEY", "host-key-1234");
+  try {
+    // The first user runs on the host's key.
+    expect(invite("me", { data: dir }).bringsKey).toBeNull();
+    expect(invite("Bo", { data: dir }).bringsKey).toBe("Gemini");
+    vi.stubEnv("GEMINI_API_KEY", "");
+    expect(invite("me", { data: dir }).bringsKey).toBe("Gemini");
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
 
 it("imports study-mode once", () => {

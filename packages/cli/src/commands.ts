@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACTIVITIES, importStudyMode, metrics, type Metrics } from "@myelin/core";
-import { hostModel, keyEnvFor, Registry, Stores, startServer, type RunningServer, type TutorOptions, type User } from "@myelin/server";
+import { keyEnvFor, ModelKeys, providerName, Registry, Stores, startServer, type RunningServer, type TutorOptions, type User } from "@myelin/server";
 
 export const DEFAULT_PORT = 4317;
 
@@ -27,33 +27,34 @@ export function promptPath(): string {
   return process.env.MYELIN_PROMPT ?? fileURLToPath(new URL("../../../prompts/tutor.md", import.meta.url));
 }
 
-/** The tutor, if the host has a key for the model in MYELIN_MODEL. Never logs the key. */
-export async function tutorFromEnv(dir: string, log: (s: string) => void): Promise<TutorOptions | undefined> {
-  const spec = process.env.MYELIN_MODEL || "google/gemini-4-neon";
-  const keyName = keyEnvFor(spec.split("/")[0] ?? "");
-  const apiKey = process.env[keyName];
-  if (!apiKey) {
-    log(`${keyName} is not set, so the tutor is off.`);
-    return undefined;
-  }
+const modelSpec = () => process.env.MYELIN_MODEL || "google/gemini-4-neon";
+const providerOf = (spec: string) => spec.split("/")[0] ?? "";
+
+/**
+ * The tutor and whose key it runs on. The first user runs on the host's key, if it is set; everyone
+ * else brings their own. Never logs a key.
+ */
+export async function tutorFromEnv(dir: string, registry: Registry, log: (s: string) => void): Promise<{ tutor: TutorOptions; keys: ModelKeys }> {
+  const spec = modelSpec();
+  const provider = providerOf(spec);
+  const keyName = keyEnvFor(provider);
+  const hostKey = process.env[keyName] || undefined;
   const agentDir = join(dir, "pi");
-  const model = await hostModel({ spec, apiKey, agentDir });
-  log(`The tutor is ${spec}.`);
-  const opts: TutorOptions = { systemPrompt: readFileSync(promptPath(), "utf8"), model, agentDir, timeZone: process.env.TZ || undefined };
-  const pause = Number(process.env.MYELIN_OBSERVE_PAUSE_MS);
-  if (pause > 0) opts.observePauseMs = pause;
-  // The observer's triage may use a cheaper model.
   const triage = process.env.MYELIN_TRIAGE_MODEL;
-  if (triage && triage !== spec) {
-    const triageKeyName = keyEnvFor(triage.split("/")[0] ?? "");
-    const triageKey = process.env[triageKeyName];
-    if (!triageKey) log(`${triageKeyName} is not set, so triage uses ${spec}.`);
-    else {
-      opts.triageModel = await hostModel({ spec: triage, apiKey: triageKey, agentDir });
-      log(`Triage is ${triage}.`);
-    }
-  }
-  return opts;
+  const keys = await ModelKeys.create({
+    registry,
+    agentDir,
+    spec,
+    hostKey,
+    triage: triage ? { spec: triage, hostKey: process.env[keyEnvFor(providerOf(triage))] || undefined } : undefined,
+  });
+  log(`The tutor is ${spec}${triage && triage !== spec ? `, with ${triage} for triage when there is a key for it` : ""}.`);
+  const name = providerName(provider);
+  log(hostKey ? `You run on ${keyName}. Each friend brings their own ${name} key.` : `${keyName} is not set, so every learner, you too, brings their own ${name} key.`);
+  const tutor: TutorOptions = { systemPrompt: readFileSync(promptPath(), "utf8"), model: keys.model, triageModel: keys.triage, agentDir, timeZone: process.env.TZ || undefined };
+  const pause = Number(process.env.MYELIN_OBSERVE_PAUSE_MS);
+  if (pause > 0) tutor.observePauseMs = pause;
+  return { tutor, keys };
 }
 
 const linkFor = (base: string, token: string) => `${base.replace(/\/$/, "")}/login/${token}`;
@@ -65,16 +66,24 @@ export async function up(opts: {
   data?: string;
   name?: string;
   log?: (s: string) => void;
-  /** false turns the tutor off; by default it is on when the host has a model key. */
+  /** false turns the tutor off; by default it runs on keys from the environment and from friends. */
   tutor?: TutorOptions | false;
 }): Promise<RunningServer & { link: string }> {
   const log = opts.log ?? console.log;
   const root = webRoot();
   const dir = dataDir(opts.data);
-  const tutor = opts.tutor === false ? undefined : (opts.tutor ?? (await tutorFromEnv(dir, log)));
+  const registry = new Registry(dir);
+  let tutor: TutorOptions | undefined;
+  let keys: ModelKeys | undefined;
+  try {
+    if (opts.tutor !== false) ({ tutor, keys } = opts.tutor ? { tutor: opts.tutor, keys: undefined } : await tutorFromEnv(dir, registry, log));
+  } catch (e) {
+    registry.close();
+    throw e;
+  }
   const timeout = Number(process.env.MYELIN_RUN_TIMEOUT_MS);
   const sandbox = { python: process.env.MYELIN_PYTHON || undefined, timeoutMs: timeout > 0 ? timeout : undefined };
-  const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dir, webRoot: root, tutor, sandbox });
+  const srv = await startServer({ port: opts.port ?? DEFAULT_PORT, host: opts.host ?? "127.0.0.1", dataDir: dir, webRoot: root, tutor, keys, registry, sandbox });
   let owner = srv.registry.users()[0];
   if (!owner) {
     owner = srv.registry.createUser(opts.name ?? "me");
@@ -88,15 +97,21 @@ export async function up(opts: {
   return { ...srv, link };
 }
 
-/** Makes a user, or a new device link for an existing one. */
-export function invite(name: string, opts: { data?: string; url?: string }): { user: User; created: boolean; link: string } {
+/**
+ * Makes a user, or a new device link for an existing one. Says which provider's key they will be
+ * asked for when they sign in, if any.
+ */
+export function invite(name: string, opts: { data?: string; url?: string }): { user: User; created: boolean; link: string; bringsKey: string | null } {
   const registry = new Registry(dataDir(opts.data));
   try {
     let user = registry.userByName(name.trim());
     const created = !user;
     user ??= registry.createUser(name);
     const base = opts.url ?? process.env.MYELIN_URL ?? `http://localhost:${DEFAULT_PORT}`;
-    return { user, created, link: linkFor(base, registry.issueLink(user.id)) };
+    const provider = providerOf(modelSpec());
+    const owner = registry.users()[0]?.id === user.id;
+    const hasKey = registry.modelKey(user.id, provider) !== undefined || (owner && !!process.env[keyEnvFor(provider)]);
+    return { user, created, link: linkFor(base, registry.issueLink(user.id)), bringsKey: hasKey ? null : providerName(provider) };
   } finally {
     registry.close();
   }

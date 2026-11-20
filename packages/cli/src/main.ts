@@ -54,6 +54,7 @@ async function main(argv: string[]): Promise<number> {
       const r = invite(name, { data: values.data, url: values.url });
       console.log(r.created ? `Made a user, ${r.user.name}.` : `${r.user.name} already exists. This link signs in one more device.`);
       console.log(`One-time sign-in link (valid for 7 days): ${r.link}`);
+      if (r.bringsKey) console.log(`When they sign in, Myelin asks for their own ${r.bringsKey} API key. Their tutor runs on it.`);
       return 0;
     }
     case "import": {

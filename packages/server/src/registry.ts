@@ -1,8 +1,9 @@
 // Who may sign in: users, one-time login links and signed-in devices. This is server bookkeeping,
 // not a learner's record, so unlike the event log its rows change (a link is used, a device is seen).
-// Secrets are stored only as SHA-256 hashes.
+// Login and device secrets are stored only as SHA-256 hashes. A friend's model API key is stored as
+// given, since the server must send it to the provider: the file is readable by its owner only.
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -30,7 +31,10 @@ export class Registry {
 
   constructor(readonly dataDir: string) {
     mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSync(join(dataDir, "registry.sqlite"));
+    const file = join(dataDir, "registry.sqlite");
+    this.db = new DatabaseSync(file);
+    // Before the WAL exists, which SQLite then makes with the same mode.
+    chmodSync(file, 0o600);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
@@ -44,6 +48,10 @@ export class Registry {
       CREATE TABLE IF NOT EXISTS devices (
         id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL REFERENCES users(id),
         created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, user_agent TEXT
+      );
+      CREATE TABLE IF NOT EXISTS model_keys (
+        user_id TEXT NOT NULL REFERENCES users(id), provider TEXT NOT NULL, api_key TEXT NOT NULL,
+        set_at INTEGER NOT NULL, PRIMARY KEY (user_id, provider)
       );
     `);
   }
@@ -111,5 +119,18 @@ export class Registry {
     if (!row) return null;
     if (now - row.last_seen_at > 60_000) this.db.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?").run(now, row.id);
     return { user: this.user(row.user_id)!, device: { id: row.id, user_id: row.user_id } };
+  }
+
+  /** A learner's own key for a model provider. Never sent to a client. */
+  modelKey(userId: string, provider: string): string | undefined {
+    const row = this.db.prepare("SELECT api_key FROM model_keys WHERE user_id = ? AND provider = ?").get(userId, provider) as { api_key: string } | undefined;
+    return row?.api_key;
+  }
+
+  setModelKey(userId: string, provider: string, apiKey: string, now = Date.now()): void {
+    if (!this.user(userId)) throw new RegistryError(`no user ${userId}`);
+    this.db
+      .prepare("INSERT INTO model_keys (user_id, provider, api_key, set_at) VALUES (?, ?, ?, ?) ON CONFLICT (user_id, provider) DO UPDATE SET api_key = excluded.api_key, set_at = excluded.set_at")
+      .run(userId, provider, apiKey, now);
   }
 }

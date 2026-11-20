@@ -4,6 +4,7 @@ import { createApp } from "./app.js";
 import { Registry } from "./registry.js";
 import { Sandbox, type SandboxOptions } from "./sandbox.js";
 import { Stores } from "./stores.js";
+import type { ModelKeys } from "./tutor/keys.js";
 import { Tutors, type TutorOptions } from "./tutor/tutor.js";
 
 export interface ServerOptions {
@@ -13,6 +14,10 @@ export interface ServerOptions {
   webRoot?: string | undefined;
   /** Turns the tutor on. */
   tutor?: TutorOptions | undefined;
+  /** Whose model key each learner's tutor uses. Without it the tutor's model source decides alone. */
+  keys?: ModelKeys | undefined;
+  /** The registry for dataDir, if it is already open. The server closes it. */
+  registry?: Registry | undefined;
   /** How code runs. On by default with `python3`; false turns Run page and run_code off. */
   sandbox?: SandboxOptions | false | undefined;
 }
@@ -25,13 +30,12 @@ export interface RunningServer {
   close(): Promise<void>;
 }
 
-export async function startServer({ port = 4317, host = "127.0.0.1", dataDir, webRoot, tutor, sandbox: box }: ServerOptions): Promise<RunningServer> {
-  const registry = new Registry(dataDir);
+export async function startServer({ port = 4317, host = "127.0.0.1", dataDir, webRoot, tutor, keys, registry = new Registry(dataDir), sandbox: box }: ServerOptions): Promise<RunningServer> {
   const stores = new Stores(dataDir);
   stores.watch();
   const sandbox = box === false ? undefined : new Sandbox(box ?? {});
   const tutors = tutor ? new Tutors(stores, { sandbox, ...tutor }, (id) => registry.user(id)?.name ?? "the learner") : undefined;
-  const app = createApp({ registry, stores, webRoot, tutors, sandbox });
+  const app = createApp({ registry, stores, webRoot, tutors, sandbox, keys });
   const { server, address } = await new Promise<{ server: Server; address: { port: number } }>((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port, hostname: host }, (info) => resolve({ server: s as Server, address: info }));
     (s as Server).once("error", reject);

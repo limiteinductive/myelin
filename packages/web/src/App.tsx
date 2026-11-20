@@ -4,7 +4,7 @@ import { watchActivity } from "./activity.js";
 import { createEffect, createMemo, createSignal, createStore, For, Match, onSettled, Show, Switch } from "solid-js";
 import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResult } from "./editor.js";
 import { foldPages, pageFacts, pageStatus } from "./pages.js";
-import { draft, login, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
+import { draft, login, saveKey, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
 import { Body, inline, splitLead } from "./text.js";
 import { current, foldUnits, type UnitView } from "./units.js";
 import type { JSX } from "@solidjs/web";
@@ -416,6 +416,34 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     };
   });
 
+  // A friend brings their own model key: until it is given, the composer takes the key, not a message.
+  const [needsKey, setNeedsKey] = createSignal(props.session.needs_key ?? null);
+  const [keyError, setKeyError] = createSignal<string | null>(null);
+  const giveKey = async (text: string): Promise<boolean> => {
+    setKeyError(null);
+    try {
+      await saveKey(text);
+      setNeedsKey(null);
+      return true;
+    } catch (e) {
+      setKeyError(e instanceof SendError ? e.message : "Could not reach the server. Try again.");
+      return false;
+    }
+  };
+  const KeyNote = () => (
+    <Show when={needsKey()}>
+      {(name) => (
+        <p class="myl-trace">
+          Your tutor runs on your own {name()} API key{name() === "Gemini" ? ", which you can make in Google AI Studio" : ""}. Paste it below and send. It is kept on the
+          server for your tutor and never shown again.
+        </p>
+      )}
+    </Show>
+  );
+  const KeyComposer = () => (
+    <Composer secret connected={view.connected} lost={view.lost} send={giveKey} scope={keyError()} placeholder={`Your ${needsKey()} API key`} />
+  );
+
   const send = async (text: string, startedAt: number | null): Promise<boolean> => {
     if (!sync) return false;
     stick = true;
@@ -629,10 +657,13 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
             <Show when={view.notice}>
               <p class="myl-trace">{view.notice}</p>
             </Show>
+            <KeyNote />
           </main>
         </div>
         <div class="myl-phone__foot app-foot">
-          <Composer connected={view.connected} lost={view.lost} send={send} />
+          <Show when={needsKey()} fallback={<Composer connected={view.connected} lost={view.lost} send={send} />}>
+            <KeyComposer />
+          </Show>
         </div>
       </div>
     );
@@ -695,6 +726,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
               <Show when={view.notice}>
                 <p class="myl-trace">{view.notice}</p>
               </Show>
+              <KeyNote />
             </section>
             <div class="app-asides" ref={(el) => (asidesBox = el)}>
               <For each={pageAsides()} keyed={(a) => a.id}>
@@ -702,14 +734,21 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
               </For>
             </div>
             <div class="app-dock">
-              <Composer
-                connected={view.connected}
-                lost={view.lost}
-                send={send}
-                scope={scopeText()}
-                placeholder="Type or dictate"
-                escape={() => editor?.dismissScope()}
-              />
+              <Show
+                when={needsKey()}
+                fallback={
+                  <Composer
+                    connected={view.connected}
+                    lost={view.lost}
+                    send={send}
+                    scope={scopeText()}
+                    placeholder="Type or dictate"
+                    escape={() => editor?.dismissScope()}
+                  />
+                }
+              >
+                <KeyComposer />
+              </Show>
             </div>
           </div>
         </div>
@@ -912,8 +951,14 @@ function Composer(props: {
   scope?: JSX.Element | null;
   placeholder?: string;
   escape?: () => void;
+  /** For an API key: nothing is kept as a draft, and the browser neither suggests nor checks it. */
+  secret?: boolean;
 }) {
-  const [empty, setEmpty] = createSignal(draft.get().trim() === "");
+  const kept = () => (props.secret ? "" : draft.get());
+  const keep = (text: string) => {
+    if (!props.secret) draft.set(text);
+  };
+  const [empty, setEmpty] = createSignal(kept().trim() === "");
   const [sending, setSending] = createSignal(false);
   // The first keystroke since the last send. A restored draft has no start time.
   let startedAt: number | null = null;
@@ -926,7 +971,7 @@ function Composer(props: {
   };
 
   onSettled(() => {
-    field.value = draft.get();
+    field.value = kept();
     grow();
   });
 
@@ -938,7 +983,7 @@ function Composer(props: {
     if (await props.send(text, startedAt)) {
       startedAt = null;
       field.value = "";
-      draft.set("");
+      keep("");
       setEmpty(true);
       grow();
     }
@@ -962,11 +1007,14 @@ function Composer(props: {
           ref={field}
           class="myl-composer__field"
           rows="1"
-          aria-label="Message"
+          aria-label={props.secret ? "API key" : "Message"}
           placeholder={props.placeholder ?? "Say anything"}
+          autocomplete={props.secret ? "off" : undefined}
+          autocapitalize={props.secret ? "off" : undefined}
+          spellcheck={props.secret ? false : undefined}
           onInput={(e) => {
             startedAt ??= Date.now();
-            draft.set(e.currentTarget.value);
+            keep(e.currentTarget.value);
             setEmpty(e.currentTarget.value.trim() === "");
             grow();
           }}

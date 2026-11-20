@@ -12,6 +12,7 @@ import { RegistryError, type Device, type Registry, type User } from "./registry
 import type { Sandbox } from "./sandbox.js";
 import { ConflictError, StaleError, type Appended } from "./store.js";
 import type { Stores } from "./stores.js";
+import { KeyRejected, type ModelKeys } from "./tutor/keys.js";
 import type { Draft, Tutors } from "./tutor/tutor.js";
 
 export const COOKIE = "myelin_device";
@@ -28,6 +29,8 @@ export interface AppOptions {
   tutors?: Tutors | undefined;
   /** Runs the code on pages. Without it Run page is refused. */
   sandbox?: Sandbox | undefined;
+  /** Whose model key each tutor uses. With it a friend is asked for their own key. */
+  keys?: ModelKeys | undefined;
 }
 
 /** The device recorded on a page.ran event: the server ran the code. */
@@ -57,8 +60,10 @@ export function clientMayWrite(e: { type?: unknown; payload?: unknown }): boolea
 
 const isHttps = (c: Context) => (c.req.header("x-forwarded-proto") ?? new URL(c.req.url).protocol.replace(":", "")) === "https";
 
-export function createApp({ registry, stores, webRoot, tutors, sandbox }: AppOptions): Hono<Env> {
+export function createApp({ registry, stores, webRoot, tutors, sandbox, keys }: AppOptions): Hono<Env> {
   const app = new Hono<Env>();
+  // The provider whose key the learner must paste before the tutor answers, or null.
+  const needsKey = (userId: string) => (tutors && keys ? keys.needed(userId) : null);
 
   app.use("*", async (c, next) => {
     await next();
@@ -85,7 +90,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox }: AppOpt
     try {
       const { user, device, deviceToken } = registry.redeemLink(token, c.req.header("user-agent") ?? null);
       setCookie(c, COOKIE, deviceToken, { httpOnly: true, sameSite: "Strict", secure: isHttps(c), path: "/", maxAge: COOKIE_MAX_AGE });
-      return c.json({ user: { id: user.id, name: user.name }, device_id: device.id });
+      return c.json({ user: { id: user.id, name: user.name }, device_id: device.id, needs_key: needsKey(user.id) });
     } catch (e) {
       if (e instanceof RegistryError) return c.json({ error: "That link has already been used or is not valid." }, 401);
       throw e;
@@ -108,7 +113,24 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox }: AppOpt
     const { user, device } = c.get("session");
     const store = stores.get(user.id);
     store.catchUp();
-    return c.json({ user: { id: user.id, name: user.name }, device_id: device.id, head: store.head });
+    return c.json({ user: { id: user.id, name: user.name }, device_id: device.id, head: store.head, needs_key: needsKey(user.id) });
+  });
+
+  // A friend's own model key, pasted once. It is checked with the provider, kept on the server and
+  // never sent back.
+  app.post("/api/key", async (c) => {
+    const { user } = c.get("session");
+    if (!tutors || !keys) return c.json({ error: "this server has no tutor" }, 404);
+    const body = (await c.req.json().catch(() => null)) as { key?: unknown } | null;
+    if (typeof body?.key !== "string") return c.json({ error: "send {key: \"...\"}" }, 400);
+    try {
+      await keys.set(user.id, body.key);
+    } catch (e) {
+      if (e instanceof KeyRejected) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+    tutors.get(user.id).opened();
+    return c.json({ needs_key: null });
   });
 
   app.get("/api/events", (c) => {
@@ -221,7 +243,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox }: AppOpt
         };
         undraft = tutor.onDraft(pushDraft);
         if (tutor.draft) pushDraft({ ...tutor.draft });
-        tutor.opened();
+        // The tutor's first words wait for the learner's key.
+        if (!needsKey(user.id)) tutor.opened();
       }
       try {
         while (!stream.aborted) {

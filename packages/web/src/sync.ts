@@ -8,6 +8,8 @@ export interface Me {
   user: { id: string; name: string };
   device_id: string;
   head?: number;
+  /** The provider whose API key this learner must paste before the tutor answers, such as "Gemini". */
+  needs_key?: string | null;
 }
 
 /** The tutor's reply while it is being written. It is never stored; the finished reply arrives as a message with the same id. */
@@ -49,6 +51,12 @@ export async function login(link: string): Promise<Me> {
   const r = await fetch("/api/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ token: link }) });
   if (r.status === 401) throw new SignInError(((await r.json()) as { error: string }).error);
   return json<Me>(r);
+}
+
+/** Gives the server this learner's own model API key. Throws a SendError saying why if it is refused. */
+export async function saveKey(key: string): Promise<void> {
+  const r = await fetch("/api/key", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ key }) });
+  await json<{ needs_key: null }>(r);
 }
 
 type Listener = () => void;
