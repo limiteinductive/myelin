@@ -1,9 +1,11 @@
 import { fileURLToPath } from "node:url";
+import solid from "@solidjs/vite-plugin";
 import { defineConfig } from "vite";
 
 const at = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 export default defineConfig({
+  plugins: [solid()],
   resolve: { alias: { "@myelin/core": at("../core/src/index.ts") } },
   server: {
     port: 5173,

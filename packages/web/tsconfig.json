@@ -3,10 +3,26 @@
   "compilerOptions": {
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "lib": [
+      "ES2023",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "noEmit": true,
-    "types": ["vite/client"],
-    "paths": { "@myelin/core": ["../core/src/index.ts"] }
+    "types": [
+      "vite/client"
+    ],
+    "paths": {
+      "@myelin/core": [
+        "../core/src/index.ts"
+      ]
+    },
+    "jsx": "preserve",
+    "jsxImportSource": "@solidjs/web"
   },
-  "include": ["src", "vite.config.ts"]
+  "include": [
+    "src",
+    "test",
+    "vite.config.ts"
+  ]
 }
