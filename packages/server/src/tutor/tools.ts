@@ -3,18 +3,24 @@
 // creates one with its problem statement, and open_aside only posts a message anchored to it.
 import {
   DAY_MS,
+  clockText,
+  currentRun,
   findPassage,
   isRebuildable,
   pageLines,
   nextProbe,
   resolveUnit,
+  runElapsed,
+  runLeft,
   uuidv7,
   type Depth,
   type EventOf,
   type EventType,
   type Grade,
+  type MyelinEvent,
   type Payload,
   type Probe,
+  type Run,
   type Scheduler,
   type SlotKind,
   type State,
@@ -24,9 +30,10 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Type } from "typebox";
 import type { RunResult } from "../sandbox.js";
 import { formatDate, openPage, type ThreadMessage } from "./context.js";
+import { LONG_QUIET_MS, quietStretches, runClock, runReport, timeline, type TimelineCard } from "./runs.js";
 
 /** A card carried on the tutor's reply. The client draws a unit card or the grey trace line. */
-export type Card = { kind: "unit"; unit_id: string; how: string; note: string | null } | { kind: "trace"; text: string } | { kind: "page"; page_id: string };
+export type Card = { kind: "unit"; unit_id: string; how: string; note: string | null } | { kind: "trace"; text: string } | { kind: "page"; page_id: string } | TimelineCard;
 
 /** What the tools know about the turn in progress. */
 export interface TurnInfo {
@@ -55,6 +62,10 @@ export interface ToolHost {
   readonly offers: Map<string, Offer>;
   /** Runs Python in the sandbox. Absent when code does not run on this server. */
   run?: ((code: string) => Promise<RunResult>) | undefined;
+  /** The whole log, for a run's report. */
+  events(): readonly MyelinEvent[];
+  /** The learner's active time between two moments, with absences left out. */
+  activeMs(from: number, to: number): number;
 }
 
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
@@ -62,6 +73,28 @@ const ok = (text: string) => ({ content: [{ type: "text" as const, text }], deta
 /** An offer older than this no longer says how the probe was asked. */
 const OFFER_TTL_MS = 6 * 3_600_000;
 const SLOT_SECONDS: Record<"in_context" | "greeting" | "seam", number> = { in_context: 30, greeting: 30, seam: 180 };
+
+/** What the tutor does when a run ends, after its report. */
+export const DEBRIEF =
+  "Debrief now. First call show_card with kind timeline: name the steps of the run in order, each with the time on the run's clock it ended (until, m:ss), " +
+  "and mark as costly the one step that cost the most avoidable time, if one did. A quiet stretch of a few minutes or more, or time away, is a step of its own, " +
+  "named for what it was, not folded into the work around it. The app adds any unused time. Then, in a few short lines after the card: " +
+  "the one move that would have saved the most time, which units cost the most (against their own earlier speed if get_profile shows it), " +
+  "and any reflex that was missing (record each with observe_unit). Record use probes with record_probe for the units the run tested. End with one question.";
+
+/** A run that ended this long ago still owns the probes recorded in its debrief. */
+const DEBRIEF_MS = 30 * 60_000;
+
+/** The run on now, as the tutor is told it each turn. */
+export function runNote(r: Run, now: number): string {
+  const left = clockText(runLeft(r, now));
+  const state = r.paused_at !== null ? `paused with ${left} left` : `${left} left`;
+  return (
+    `[app: a timed run is on (run_id ${r.id}): ${state} of ${clockText(r.duration_ms)}. Conditions: ${r.conditions || "none given"}. ` +
+    "Answer clarifying questions only, in a line, as an interviewer would: no hints, no probes, no asides, no comment on the work. " +
+    "If they ask to pause, resume or stop, use pause_run, resume_run or end_run. Never mention the time left; the clock shows it.]"
+  );
+}
 
 /** "2026-12-01" as the end of that day, server time. */
 export function parseDue(s: string | undefined): number | null {
@@ -454,6 +487,7 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     }),
     async execute(_id, p) {
       const now = host.now();
+      if (currentRun(host.state.runs)) return ok("A timed run is on. Ask nothing until it ends.");
       const context = (p.context ?? []).filter((id) => resolveUnit(host.state, id));
       const probe = offerProbe(host, { kind: p.slot, seconds: p.seconds ?? SLOT_SECONDS[p.slot], context }, now);
       if (!probe) return ok("No probe is worth asking now. Ask nothing.");
@@ -476,6 +510,7 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
       corrected_grade: Type.Optional(StringEnum(GRADES, { description: "The grade the learner claimed in the same answer, if they corrected you" })),
       corrects: Type.Optional(Type.String({ description: "The id of an earlier probe this corrects" })),
       note: Type.Optional(Type.String({ description: "For a correction: what the learner said" })),
+      away: Type.Optional(Type.Boolean({ description: "True if the learner said they were away while answering, so the time does not count" })),
     }),
     async execute(_id, p) {
       const s = host.state;
@@ -499,14 +534,20 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
       const open = openPage(s, host.messages(), now);
       const onPage = open?.probe && resolveUnit(s, open.probe.unit_id)?.id === u.id && open.probe.depth === p.depth ? open : null;
       const t = onPage ? null : answer?.timing;
-      const latency = t && t.sent_at !== null && t.shown_at !== null && t.sent_at >= t.shown_at ? t.sent_at - t.shown_at : null;
+      // Time is active time, so a break in the middle does not count. A page probe is timed by the
+      // work on the page, from its opening to its last edit.
+      let latency: number | null = null;
+      if (onPage && onPage.rev > 0) latency = host.activeMs(onPage.created_at, onPage.edited_at);
+      else if (t && t.sent_at !== null && t.shown_at !== null && t.sent_at >= t.shown_at) latency = host.activeMs(t.shown_at, t.sent_at);
+      if (p.away) latency = null;
+      const run = Object.values(s.runs).findLast((r) => r.ended_at === null || now - r.ended_at < DEBRIEF_MS);
       const asked = answer ? host.messages().findLast((m) => m.author === "tutor" && m.seq < answer.seq) : undefined;
       const pagePrompt = onPage ? `On page "${onPage.title}"${onPage.starter ? `: ${onPage.starter}` : ""}` : "";
       const prompt = p.prompt?.trim() || pagePrompt.slice(0, 1000) || asked?.text.slice(0, 1000) || "";
       const e = host.append("unit.probed", {
         unit_id: u.id,
         depth: p.depth,
-        slot: offer?.probe.slot ?? "in_context",
+        slot: offer?.probe.slot ?? (run ? "timed_run" : "in_context"),
         prompt,
         answer_message_id: answer?.id ?? null,
         grade: p.grade,
@@ -594,6 +635,7 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     }),
     async execute(_id, p) {
       const s = host.state;
+      if (currentRun(s.runs)) return ok("A timed run is on: no asides until it ends. Keep what you saw for the debrief.");
       const page = p.page_id ? s.pages[p.page_id] : openPage(s, host.messages(), host.now());
       if (!page) return ok(p.page_id ? `No page with id ${p.page_id}.` : "No page is open. Pass page_id.");
       const text = p.text.trim();
@@ -631,6 +673,113 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     },
   });
 
+  const startRun = defineTool({
+    name: "start_run",
+    label: "Start run",
+    description:
+      "Starts a timed run, only when the learner asks for one or accepts your offer. The app shows a clock counting down and ends the run when it reaches zero, then asks you to debrief. " +
+      "Set the problem in your reply right after; for work that needs room, open a page with open_page first and pass its page_id. During the run, answer clarifying questions only.",
+    parameters: Type.Object({
+      minutes: Type.Number({ description: "The run's length in minutes" }),
+      conditions: Type.String({ description: "The conditions in a few words, such as 'interview: clarifying questions only' or 'exam, closed book'" }),
+      page_id: Type.Optional(Type.String({ description: "The page the work is on, if any" })),
+    }),
+    async execute(_id, p) {
+      const s = host.state;
+      const now = host.now();
+      const on = currentRun(s.runs);
+      if (on) return ok(`A run is already on (run_id ${on.id}, ${clockText(runLeft(on, now))} left). End it with end_run first.`);
+      const duration_ms = Math.round(p.minutes * 60_000);
+      if (!(duration_ms >= 1000) || duration_ms > 4 * 3_600_000) return ok("A run lasts from a few seconds to four hours. Pass minutes.");
+      if (p.page_id && !s.pages[p.page_id]) return ok(`No page with id ${p.page_id}.`);
+      const run_id = uuidv7(now);
+      host.append("run.started", { run_id, duration_ms, conditions: p.conditions.trim(), page_id: p.page_id ?? null });
+      const probe = p.page_id ? null : offerProbe(host, { kind: "timed_run", seconds: duration_ms / 1000, context: [] }, now);
+      const hint = probe ? ` If it fits what they asked for, a use probe worth setting: ${describeProbe(probe, s)}` : "";
+      return ok(
+        `Run started (run_id ${run_id}): ${clockText(duration_ms)} on the clock, which the learner now sees. Set the problem now in one message and say nothing else; do not mention the clock.${hint}`,
+      );
+    },
+  });
+
+  const pauseRun = defineTool({
+    name: "pause_run",
+    label: "Pause run",
+    description: "Stops the run's clock when the learner asks to pause.",
+    parameters: Type.Object({}),
+    async execute() {
+      const r = currentRun(host.state.runs);
+      if (!r) return ok("No run is on.");
+      if (r.paused_at !== null) return ok("The run is already paused.");
+      host.append("run.paused", { run_id: r.id });
+      return ok(`Paused with ${clockText(runLeft(r, host.now()))} left. Say so in a few words; the clock resumes when they say so.`);
+    },
+  });
+
+  const resumeRun = defineTool({
+    name: "resume_run",
+    label: "Resume run",
+    description: "Restarts a paused run's clock when the learner says to go on.",
+    parameters: Type.Object({}),
+    async execute() {
+      const r = currentRun(host.state.runs);
+      if (!r) return ok("No run is on.");
+      if (r.paused_at === null) return ok("The run is not paused.");
+      host.append("run.resumed", { run_id: r.id });
+      return ok(`Resumed with ${clockText(runLeft(r, host.now()))} left. Say nothing else, or one word.`);
+    },
+  });
+
+  const endRun = defineTool({
+    name: "end_run",
+    label: "End run",
+    description: "Ends the run early, when the learner says stop or that they are done. Returns what happened in the run, for the debrief.",
+    parameters: Type.Object({}),
+    async execute() {
+      const r = currentRun(host.state.runs);
+      if (!r) return ok("No run is on. When the clock runs out, the app ends the run itself.");
+      host.append("run.ended", { run_id: r.id, reason: "stopped" });
+      const ended = host.state.runs[r.id]!;
+      return ok(`Run ended.\n\n${runReport(ended, host.events(), host.now())}\n\n${DEBRIEF}`);
+    },
+  });
+
+  const showCard = defineTool({
+    name: "show_card",
+    label: "Show card",
+    description:
+      "Posts a card with your reply. kind timeline: the debrief of the last timed run, as named steps in order, each ending at a time on the run's clock. " +
+      "The bar shows each step's share; durations are worked out by the app, which adds unused time.",
+    parameters: Type.Object({
+      kind: StringEnum(["timeline"] as const, { description: "The card" }),
+      steps: Type.Array(
+        Type.Object({
+          name: Type.String({ description: "What the step was, in a few words, such as 'Sign of the update, three variants tried'" }),
+          until: Type.Optional(Type.String({ description: "When the step ended on the run's clock, m:ss. The last step may leave it out" })),
+        }),
+        { description: "The steps of the run in order" },
+      ),
+      costly: Type.Optional(Type.Number({ description: "The number (from 1) of the one step that cost the most avoidable time, if one did" })),
+      run_id: Type.Optional(Type.String({ description: "The run. Defaults to the last one" })),
+    }),
+    async execute(_id, p) {
+      const s = host.state;
+      const r = p.run_id ? s.runs[p.run_id] : Object.values(s.runs).findLast(() => true);
+      if (!r) return ok(p.run_id ? `No run with id ${p.run_id}.` : "There has been no timed run.");
+      const events = host.events();
+      const clock = runClock(r, events);
+      const quiet = quietStretches(r, events, host.now(), LONG_QUIET_MS).map(([a, b]): [number, number] => [clock(a), clock(b)]);
+      const card = timeline(r, runElapsed(r, host.now()), p.steps, p.costly, quiet);
+      if (typeof card === "string") return ok(card);
+      const turn = host.turn();
+      const i = turn.cards.findIndex((c) => c.kind === "timeline");
+      if (i >= 0) turn.cards.splice(i, 1, card);
+      else turn.cards.push(card);
+      const rows = card.segments.map((g) => `${g.name} ${clockText(g.ms)}${g.costly ? " (costly)" : ""}`).join("; ");
+      return ok(`Timeline shown under your reply: ${rows}. Do not repeat the times; say what they mean.`);
+    },
+  });
+
   const stayQuiet = defineTool({
     name: "stay_quiet",
     label: "Stay quiet",
@@ -655,6 +804,11 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     openPageTool,
     openAside,
     runCode,
+    startRun,
+    pauseRun,
+    resumeRun,
+    endRun,
+    showCard,
     stayQuiet,
   ] as unknown as ToolDefinition[];
 }

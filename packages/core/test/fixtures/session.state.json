@@ -19,6 +19,16 @@
       "event_id": "01a11fe4-1df0-7fd2-ac11-7329dc1943a4",
       "reason": "cannot retire unit u-mult",
       "seq": 28
+    },
+    {
+      "event_id": "01a13ece-c260-714b-8b3b-03837c596a46",
+      "reason": "run r-2 is already paused",
+      "seq": 39
+    },
+    {
+      "event_id": "01a13ed9-bee0-782e-b7e7-81e184b28867",
+      "reason": "pause of run r-9, which is not on",
+      "seq": 42
     }
   ],
   "budget": {
@@ -253,8 +263,32 @@
       }
     }
   },
+  "runs": {
+    "r-1": {
+      "conditions": "closed book",
+      "duration_ms": 1200000,
+      "end": "stopped",
+      "ended_at": 1791969600000,
+      "id": "r-1",
+      "page_id": null,
+      "paused_at": null,
+      "paused_ms": 0,
+      "started_at": 1791968400000
+    },
+    "r-2": {
+      "conditions": "interview",
+      "duration_ms": 600000,
+      "end": "time",
+      "ended_at": 1792055700000,
+      "id": "r-2",
+      "page_id": "p-2",
+      "paused_at": null,
+      "paused_ms": 300000,
+      "started_at": 1792054800000
+    }
+  },
   "scheduler": "fsrs-6",
-  "seq": 35,
+  "seq": 42,
   "units": {
     "u-bayes": {
       "evidence": [

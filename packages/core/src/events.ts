@@ -130,10 +130,12 @@ export const payloads = {
   }),
 
   "activity.signal": z.looseObject({ signal: z.enum(["focus", "blur", "typing", "away"]) }),
-  "run.started": z.looseObject({ run_id: Id, duration_ms: Ms, conditions: z.string() }),
+  /** A timed run. `page_id` is the page its work is on, if any. */
+  "run.started": z.looseObject({ run_id: Id, duration_ms: z.number().int().positive(), conditions: z.string(), page_id: Id.nullable().default(null) }),
   "run.paused": z.looseObject({ run_id: Id }),
   "run.resumed": z.looseObject({ run_id: Id }),
-  "run.ended": z.looseObject({ run_id: Id }),
+  /** `time` when the clock ran out, `stopped` when the learner stopped it early. */
+  "run.ended": z.looseObject({ run_id: Id, reason: z.enum(["time", "stopped"]).default("stopped") }),
 
   "goal.set": z.object({
     goal_id: Id,

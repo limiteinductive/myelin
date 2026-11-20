@@ -1,5 +1,6 @@
 // The whole app: the sign-in screen, or the thread with its composer, and at a desk a page beside it.
-import { groupAsides, passageText, type Anchor, type Aside, type PageState } from "@myelin/core";
+import { applyRunEvent, clockText, currentRun, groupAsides, passageText, runLeft, type Anchor, type Aside, type PageState, type Run } from "@myelin/core";
+import { watchActivity } from "./activity.js";
 import { createEffect, createMemo, createSignal, createStore, For, Match, onSettled, Show, Switch } from "solid-js";
 import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResult } from "./editor.js";
 import { foldPages, pageFacts, pageStatus } from "./pages.js";
@@ -84,6 +85,7 @@ function SignIn(props: { error?: string | undefined; go: (s: Screen) => void }) 
 
 type UnitCard = { kind: "unit"; unit_id: string; how: string; note: string | null };
 type PageCard = { kind: "page"; page_id: string };
+type TimelineCard = { kind: "timeline"; run_id: string; duration_ms: number; segments: { name: string; ms: number; costly?: boolean; unused?: boolean }[] };
 type Line = {
   id: string;
   author: "learner" | "tutor";
@@ -92,6 +94,7 @@ type Line = {
   trace: string | null;
   units: UnitCard[];
   pages: PageCard[];
+  timelines: TimelineCard[];
   anchor: Anchor | null;
 };
 /** A message on its own, or a run of messages in one aside, shown as its passage and then the messages. */
@@ -99,6 +102,8 @@ type Item = { id: string; kind: "line"; line: Line } | { id: string; kind: "asid
 
 const isUnitCard = (c: { kind: string }): c is UnitCard => c.kind === "unit" && typeof (c as UnitCard).unit_id === "string";
 const isPageCard = (c: { kind: string }): c is PageCard => c.kind === "page" && typeof (c as PageCard).page_id === "string";
+const isTimelineCard = (c: { kind: string }): c is TimelineCard =>
+  c.kind === "timeline" && Array.isArray((c as TimelineCard).segments) && (c as TimelineCard).duration_ms > 0;
 
 const dayLabel = (ts: number, now = Date.now()) => {
   const d = new Date(ts);
@@ -203,7 +208,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null };
         const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
         const anchor = p.anchor ? { ...p.anchor } : null;
-        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), anchor };
+        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), anchor };
       }),
   );
   /** The lines with the tutor's reply in progress at the end, in the thread or in its aside. */
@@ -212,7 +217,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     const ls = lines();
     if (!r || !r.text) return ls;
     const anchor = r.anchor ? { ...r.anchor } : null;
-    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], anchor }];
+    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], anchor }];
   });
   const asides = createMemo<Aside[]>(() => {
     pageTick();
@@ -280,6 +285,31 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     folded = evs.length;
     return { map: unitMap, n: folded };
   });
+
+  // The timed run that is on, if any, folded once per new event like the units.
+  const runMap: Record<string, Run> = {};
+  let runsFolded = 0;
+  const run = createMemo<Run | null>(() => {
+    const evs = view.events;
+    for (; runsFolded < evs.length; runsFolded++) applyRunEvent(runMap, evs[runsFolded]!);
+    const r = currentRun(runMap);
+    return r ? { ...r } : null;
+  });
+  // The clock ticks only while a run's clock is running.
+  const [clockNow, setClockNow] = createSignal(Date.now());
+  createEffect(
+    () => {
+      const r = run();
+      return r !== null && r.paused_at === null;
+    },
+    (running) => {
+      setClockNow(Date.now());
+      if (!running) return;
+      const t = setInterval(() => setClockNow(Date.now()), 250);
+      return () => clearInterval(t);
+    },
+  );
+  const Clock = () => <Show when={run()}>{(r) => <RunClock run={r()} now={clockNow()} />}</Show>;
 
   // When the newest tutor message was first on screen: the start of the learner's answer time.
   let shownId: string | null = null;
@@ -368,7 +398,9 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     const tick = setInterval(() => setNow(Date.now()), 60_000);
     const off = s.subscribe(pull);
     s.start();
+    const unwatch = watchActivity(s);
     return () => {
+      unwatch();
       off();
       clearInterval(tick);
       document.removeEventListener("visibilitychange", visible);
@@ -456,6 +488,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
             </Show>
           )}
         </For>
+        <For each={p.line.timelines}>{(card) => <Timeline card={card} />}</For>
       </>
     );
   };
@@ -499,6 +532,11 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     const lastAuthor = (it: Item) => (it.kind === "line" ? it.line.author : it.lines.at(-1)!.author);
     return (
       <div class="myl-phone app-phone">
+        <Show when={run()}>
+          <div class="app-clockbar">
+            <Clock />
+          </div>
+        </Show>
         <div
           class="myl-phone__scroll"
           ref={scroller}
@@ -591,6 +629,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
               >
                 Thread
               </a>
+              <Clock />
             </div>
             <h1>{p.page.title}</h1>
             <PageView page={p.page} editable={true} sync={() => sync} bind={bindEditor} changed={editorChanged} />
@@ -651,6 +690,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                     <path d="M4.5 4.5l9 9M13.5 4.5l-9 9" />
                   </svg>
                 </button>
+                <Clock />
               </div>
               <h1>{page.title}</h1>
               <PageView page={page} editable={false} sync={() => sync} bind={bindEditor} changed={editorChanged} />
@@ -659,6 +699,65 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         )}
       </Show>
     </>
+  );
+}
+
+/** A countdown reads whole seconds rounded up, so it shows 0:00 only at zero; padded like 05:30. */
+const countdown = (ms: number) => {
+  const t = clockText(Math.ceil(Math.max(0, ms) / 1000) * 1000);
+  return t.length === 4 ? `0${t}` : t;
+};
+
+/** The run clock: the time left in a timed run. It has no buttons; pause and stop are said in words. */
+function RunClock(props: { run: Run; now: number }) {
+  const paused = () => props.run.paused_at !== null;
+  const left = () => runLeft(props.run, props.now);
+  const last = () => !paused() && left() <= 60_000;
+  return (
+    <div
+      class={{ "myl-clock": true, "myl-clock--last": last(), "myl-clock--paused": paused() }}
+      role="timer"
+      aria-label={paused() ? "Paused" : last() ? "Time left, last minute" : "Time left"}
+    >
+      <span class="myl-clock__time">{countdown(left())}</span>
+      <span class="myl-clock__of">{paused() ? "paused" : `left of ${countdown(props.run.duration_ms)}`}</span>
+    </div>
+  );
+}
+
+/** Where the minutes of a timed run went: a bar of segments, and the same in words below it. */
+function Timeline(props: { card: TimelineCard }) {
+  const length = () => {
+    const ms = props.card.duration_ms;
+    return ms % 60_000 === 0 ? `${ms / 60_000} minute` : clockText(ms);
+  };
+  const share = (ms: number) => `${Math.max(0, ms)} 1 0px`;
+  return (
+    <div class="myl-card myl-card--padded app-timeline">
+      <div class="myl-timeline__bar" role="img" aria-label={`Timeline of a ${length()} run in ${props.card.segments.length} parts`}>
+        <For each={props.card.segments}>
+          {(seg) => (
+            <div
+              class={{ "myl-timeline__segment": true, "myl-timeline__segment--costly": !!seg.costly, "myl-timeline__segment--unused": !!seg.unused }}
+              style={{ flex: share(seg.ms) }}
+            />
+          )}
+        </For>
+      </div>
+      <dl class="myl-timeline__rows">
+        <For each={props.card.segments}>
+          {(seg) => {
+            const cls = { "myl-timeline__costly": !!seg.costly, "myl-timeline__unused": !!seg.unused };
+            return (
+              <>
+                <dt class={cls}>{seg.name}</dt>
+                <dd class={cls}>{clockText(seg.ms)}</dd>
+              </>
+            );
+          }}
+        </For>
+      </dl>
+    </div>
   );
 }
 

@@ -4,4 +4,5 @@ export * from "./scheduler.js";
 export * from "./state.js";
 export * from "./probe.js";
 export * from "./page.js";
+export * from "./time.js";
 export * from "./import/study-mode.js";

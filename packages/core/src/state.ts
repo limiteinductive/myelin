@@ -11,6 +11,7 @@ import type { Depth, EventOf, EventType, Grade, MyelinEvent, Origin, Payload, Sl
 import { isCorrection } from "./events.js";
 import { applyPageEdit, applyPageRun, newPage, PageEditError, type PageState } from "./page.js";
 import type { Scheduler, UnitMemory } from "./scheduler.js";
+import { applyRunEvent, type Run } from "./time.js";
 
 export const DAY_MS = 86_400_000;
 /** Explain and use probes are spaced on this fixed ladder, in days, back to the start after a miss. */
@@ -115,13 +116,15 @@ export interface State {
   preferences: Record<string, Preference>;
   budget: { seconds: number; note: string | null; set_at: number } | null;
   pages: Record<string, PageState>;
+  /** Timed runs. At most one has not ended. */
+  runs: Record<string, Run>;
   anomalies: Anomaly[];
 }
 
 export class ReplayError extends Error {}
 
 export function emptyState(scheduler: Scheduler): State {
-  return { seq: 0, scheduler: scheduler.name, units: {}, evidence: {}, goals: {}, preferences: {}, budget: null, pages: {}, anomalies: [] };
+  return { seq: 0, scheduler: scheduler.name, units: {}, evidence: {}, goals: {}, preferences: {}, budget: null, pages: {}, runs: {}, anomalies: [] };
 }
 
 /** A unit can be rebuilt from others when it rests on something. Otherwise it is arbitrary. */
@@ -442,6 +445,11 @@ const reducers: { [T in EventType]?: Reducer<T> } = {
     }
   },
 
+  "run.started": runReducer,
+  "run.paused": runReducer,
+  "run.resumed": runReducer,
+  "run.ended": runReducer,
+
   "goal.set": (state, e) => {
     const p = e.payload;
     state.goals[p.goal_id] = { id: p.goal_id, text: p.text, due: p.due, topic: p.topic, unit_ids: p.unit_ids, active: p.active, set_at: e.ts };
@@ -456,6 +464,11 @@ const reducers: { [T in EventType]?: Reducer<T> } = {
     state.preferences[p.key] = { value: p.value, lasting: p.lasting, set_at: e.ts, event_id: e.id };
   },
 };
+
+function runReducer(state: State, e: Applied<"run.started" | "run.paused" | "run.resumed" | "run.ended">): void {
+  const refused = applyRunEvent(state.runs, e as MyelinEvent);
+  if (refused) anomaly(state, e, refused);
+}
 
 /** JSON with object keys sorted at every level, for comparing states byte for byte. */
 export function canonicalJson(value: unknown): string {

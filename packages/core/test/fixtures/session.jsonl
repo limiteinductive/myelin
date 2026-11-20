@@ -26,10 +26,17 @@
 {"id":"01a11fe4-1620-7c53-9a2e-9374334669bf","device_id":"dev-phone","ts":1791536404000,"type":"unit.probed","v":1,"payload":{"unit_id":"u-chain","depth":"use","slot":"seam","prompt":"Three cards in a row…","answer_message_id":null,"grade":"good","corrected_grade":null,"hints":0,"latency_ms":null,"scheduler":"fsrs-6","predicted_recall":null},"seq":26}
 {"id":"01a11fe4-1a08-7d6b-9854-c7dd6e3ffbd0","device_id":"server:tutor","ts":1791536405000,"type":"unit.retired","v":1,"payload":{"unit_id":"u-mult","reason":"held well"},"seq":27}
 {"id":"01a11fe4-1df0-7fd2-ac11-7329dc1943a4","device_id":"server:tutor","ts":1791536406000,"type":"unit.retired","v":1,"payload":{"unit_id":"u-mult","reason":"again"},"seq":28}
-{"id":"01a139a3-d280-7d58-8295-5f35c248beb6","device_id":"dev-desk","ts":1791968400000,"type":"run.started","v":1,"payload":{"run_id":"r-1","duration_ms":1200000,"conditions":"closed book"},"seq":29}
+{"id":"01a139a3-d280-7d58-8295-5f35c248beb6","device_id":"dev-desk","ts":1791968400000,"type":"run.started","v":1,"payload":{"run_id":"r-1","duration_ms":1200000,"conditions":"closed book","page_id":null},"seq":29}
 {"id":"01a139a3-d668-78c0-a0ad-817d7ab0621d","device_id":"dev-desk","ts":1791968401000,"type":"unit.probed","v":1,"payload":{"unit_id":"u-mult","depth":"use","slot":"timed_run","prompt":"Two dice…","answer_message_id":null,"grade":"again","corrected_grade":null,"hints":0,"latency_ms":140000,"scheduler":"fsrs-6","predicted_recall":0.81},"seq":30}
 {"id":"01a139a3-da50-79a6-9c4c-eb1ff0a016e7","device_id":"dev-desk","ts":1791968402000,"type":"unit.probed","v":1,"payload":{"unit_id":"u-mult","depth":"recall","slot":"timed_run","prompt":"State the product rule.","answer_message_id":null,"grade":"again","corrected_grade":null,"hints":0,"latency_ms":null,"scheduler":"fsrs-6","predicted_recall":0.81},"seq":31}
 {"id":"01a139a3-de38-7cc2-9aa2-2a6b2a51f271","device_id":"dev-desk","ts":1791968403000,"type":"unit.observed","v":1,"payload":{"unit_id":"u-check","present":false,"note":null,"page_id":"p-2","message_id":null,"elapsed_ms":null},"seq":32}
-{"id":"01a139b6-2200-7707-9321-59b90dc7a084","device_id":"dev-desk","ts":1791969600000,"type":"run.ended","v":1,"payload":{"run_id":"r-1"},"seq":33}
+{"id":"01a139b6-2200-7707-9321-59b90dc7a084","device_id":"dev-desk","ts":1791969600000,"type":"run.ended","v":1,"payload":{"run_id":"r-1","reason":"stopped"},"seq":33}
 {"id":"01a139b7-0c60-7e1c-80df-42f264db71be","device_id":"server:tutor","ts":1791969660000,"type":"preference.set","v":1,"payload":{"key":"hints","value":{"style":"small steps","max":2},"lasting":true},"seq":34}
 {"id":"01a139b7-f6c0-792c-b5a3-e2e18a25c793","device_id":"server:tutor","ts":1791969720000,"type":"unit.reworded","v":1,"payload":{"unit_id":"u-bayes","kind":"rule","by":"tutor"},"seq":35}
+{"id":"01a13eca-2e80-79ff-8ed9-191aac6c460d","device_id":"server:tutor","ts":1792054800000,"type":"run.started","v":1,"payload":{"run_id":"r-2","duration_ms":600000,"conditions":"interview","page_id":"p-2"},"seq":36}
+{"id":"01a13ecb-18e0-791a-bce5-2ed7a886beff","device_id":"dev-desk","ts":1792054860000,"type":"activity.signal","v":1,"payload":{"signal":"typing"},"seq":37}
+{"id":"01a13ecc-eda0-7a80-9131-d2f75919e62c","device_id":"server:tutor","ts":1792054980000,"type":"run.paused","v":1,"payload":{"run_id":"r-2"},"seq":38}
+{"id":"01a13ece-c260-714b-8b3b-03837c596a46","device_id":"server:tutor","ts":1792055100000,"type":"run.paused","v":1,"payload":{"run_id":"r-2"},"seq":39}
+{"id":"01a13ed1-8180-7770-b212-4fe3204dcbb3","device_id":"server:tutor","ts":1792055280000,"type":"run.resumed","v":1,"payload":{"run_id":"r-2"},"seq":40}
+{"id":"01a13ed8-d480-7bf7-a081-1991d03b51a4","device_id":"server:tutor","ts":1792055760000,"type":"run.ended","v":1,"payload":{"run_id":"r-2","reason":"time"},"seq":41}
+{"id":"01a13ed9-bee0-782e-b7e7-81e184b28867","device_id":"server:tutor","ts":1792055820000,"type":"run.paused","v":1,"payload":{"run_id":"r-9"},"seq":42}

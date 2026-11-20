@@ -71,6 +71,8 @@ describe("replay", () => {
       "probe of unknown unit u-nope",
       "correction of unknown probe 0190e0d0-0000-7000-8000-000000000000",
       "cannot retire unit u-mult",
+      "run r-2 is already paused",
+      "pause of run r-9, which is not on",
     ]);
   });
 });

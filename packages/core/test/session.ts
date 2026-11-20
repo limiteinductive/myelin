@@ -77,6 +77,15 @@ export function buildSession(): MyelinEvent[] {
   add(9 * D + 20 * 60_000, desk, (m) => makeEvent("run.ended", { run_id: "r-1" }, m));
   add(9 * D + 21 * 60_000, tutor, (m) => makeEvent("preference.set", { key: "hints", value: { style: "small steps", max: 2 } }, m));
   add(9 * D + 22 * 60_000, tutor, (m) => makeEvent("unit.reworded", { unit_id: "u-bayes", kind: "rule", by: "tutor" }, m));
+
+  // Day 10: a run on a page that is paused, resumed and runs out of time; a pause of no run.
+  add(10 * D, tutor, (m) => makeEvent("run.started", { run_id: "r-2", duration_ms: 10 * 60_000, conditions: "interview", page_id: "p-2" }, m));
+  add(10 * D + 60_000, desk, (m) => makeEvent("activity.signal", { signal: "typing" }, m));
+  add(10 * D + 3 * 60_000, tutor, (m) => makeEvent("run.paused", { run_id: "r-2" }, m));
+  add(10 * D + 5 * 60_000, tutor, (m) => makeEvent("run.paused", { run_id: "r-2" }, m)); // anomaly
+  add(10 * D + 8 * 60_000, tutor, (m) => makeEvent("run.resumed", { run_id: "r-2" }, m));
+  add(10 * D + 16 * 60_000, tutor, (m) => makeEvent("run.ended", { run_id: "r-2", reason: "time" }, m));
+  add(10 * D + 17 * 60_000, tutor, (m) => makeEvent("run.paused", { run_id: "r-9" }, m)); // anomaly
   return out;
 }
 

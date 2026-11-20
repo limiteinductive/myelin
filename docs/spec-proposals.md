@@ -211,3 +211,49 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 
 66. **A run does not start a look.** The observer waits for edits, not runs, so a failing run alone gets no aside. The tutor sees the run's output in its next turn. Whether a failed run should count as a pause can be tuned by use.
     *Spec change:* none.
+
+## Milestone 8
+
+67. **Run events carry the page and the reason.** `run.started` is `{run_id, duration_ms, conditions, page_id}`, where `page_id` is the page the work is on, or null. `run.ended` is `{run_id, reason}`, where the reason is `time` or `stopped`. A run that ran out of time ends at its length, however late the event that says so arrives. At most one run is on at a time.
+    *Spec change:* add the payloads to "Events".
+
+68. **Four run tools, and the run's length in minutes.** The spec lists `start_run(duration, conditions)` and `end_run()`. The tools are `start_run(minutes, conditions, page_id?)`, `pause_run()`, `resume_run()` and `end_run()`. The learner pauses and stops in words, and the tutor calls the tool. A run is from 1 second to 4 hours. With no page, `start_run` offers a `timed_run` probe, so the tutor sets the problem in the thread.
+    *Spec change:* replace the row in "Tutor tools".
+
+69. **The app ends the run at zero, and the tutor debriefs.** The server holds a timer for the run that is on. At zero it writes `run.ended` with reason `time` and starts a tutor turn. That turn gets the run's report and is told to say time is up in a few words and then debrief. If the learner wrote as time ran out, their words follow. If the clock reached zero while no one was there (longer ago than the sitting gap), the run ends quietly and the tutor gets a note at the next turn instead.
+    *Spec change:* add to "Timed runs and debriefs".
+
+70. **The debrief is built from a report.** The tutor gets a chronology on the run's clock: what was sent, each stretch of writing with the lines it left new or changed, each run of the page and how it went, pauses, the learner leaving the app, quiet stretches of 90 seconds or more, how the run ended, and the page at the end. The tutor names the steps from it.
+    *Spec change:* add to "Timed runs and debriefs".
+
+71. **`show_card` with `kind: "timeline"` takes steps with end times.** `steps: [{name, until?}]`, where `until` is m:ss on the run's clock. The last step ends where the run did. `costly` is the step number of the one move that would have saved the most, or left out when nothing stands out. The server works out the durations, adds "Unused" for time left on a run stopped early, and refuses steps that do not increase. Up to 12 steps.
+    *Spec change:* describe the timeline's data in "Tutor tools".
+
+72. **The timeline card sits under the tutor's reply.** Cards follow a message's text, as unit cards do, so the sentence about the costly step comes before the card, not after it as `design/components/Timeline/README.md` says. Putting it after would mean splitting the reply in two.
+    *Spec change:* in the Timeline README, "The tutor's sentence about the costly step comes with the card". Needs your say, since it touches the design.
+
+73. **The speed trend is in words for now.** The spec's debrief shows "the speed trend on the units involved". The card shows only the timeline. The tutor can speak to speed from the probes it records, which carry latency. A trend on the card waits for the metrics in milestone 9.
+    *Spec change:* none yet; revisit at milestone 9.
+
+74. **How active time is measured.** The marks are learner messages (when input began and when sent), page edits (when the batch began and when it was sent), rewordings, and activity signals. Two marks no more than 5 minutes apart are joined. A blur or away signal ends a span. The client sends focus and blur when the window gains or loses focus, away when the page is hidden or closed, typing at most every 30 seconds while keys are pressed, and focus at most every minute while the pointer moves or the page scrolls.
+    *Spec change:* add "away" to the signals in "Measuring", and the 5-minute rule.
+
+75. **Probe latency is active time.** A probe answered in the thread measures the active time from the question being shown to the answer being sent. A probe answered on a page measures the active time from the page's creation to its last edit, which lifts proposal 64. `record_probe` takes `away: true` when the learner says they were away, and the latency is then null. The explain trace now says how long, for example "Explained in 4 minutes."
+    *Spec change:* add to "Measuring"; proposal 64 is withdrawn.
+
+76. **Probes during and after a run count as timed.** A probe recorded while a run is on, or within 30 minutes of one ending, gets the `timed_run` slot unless it was offered with another. During a run, `next_probe` and `open_aside` refuse, and every turn reminds the tutor of the conditions and that the clock shows the time, so it never says it.
+    *Spec change:* none; this is how "a silent tutor" is enforced.
+
+77. **The budget is a note each turn.** `set_budget` already records "I have 20 minutes". The budget lasts until the sitting ends, and at most 12 hours. While it does, each turn tells the tutor how many of the minutes are used, counted as active time in this sitting, and to mention it only near the end. Once they are used up, the tutor wraps up in a line unless the learner wants to go on.
+    *Spec change:* add to "Planning".
+
+78. **A goal date brings runs closer.** Within 14 days of an active goal's date, the context says so, with when the last timed run was, and asks the tutor to offer a timed run under the goal's conditions at most once a sitting, starting it only if the learner accepts.
+    *Spec change:* add to "Planning". The 14 days can be tuned by use.
+
+79. **Weekly time is deferred to the metrics.** Active time per week is one of the three metrics, so it is built at milestone 9 from the same marks.
+    *Spec change:* none.
+
+80. **The clock's placement and look.** At a desk, the clock sits at the right of the page's bar, on the line of the link back to the thread. With no page open, and on a phone, it sits at the top of the thread above the scrolling messages, so it stays in view. The time is shown as mm:ss, rounded up, so it reads 00:00 only at zero. In the last minute it turns `warning`. Paused, it reads "paused". It ticks only while the clock runs.
+    *Spec change:* none.
+
+81. **Quiet stretches are steps of their own.** In the first live run the tutor folded 17 minutes with nothing on the page into the last step of work, so the bar said the proof took most of the run. `show_card` now refuses a step that holds a quiet stretch of 3 minutes or more along with more than a minute (or a fifth of the stretch) of other time, and says which stretch to split out. The report also says once that the learner left the app, and when they came back, instead of a line per blur and away signal.

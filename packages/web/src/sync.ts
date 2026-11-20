@@ -153,13 +153,13 @@ export class Sync {
    * Appends one event. The id is made here (or by the caller), so a retry after a dropped response
    * cannot duplicate it. Resolves once the server has stored it; the event itself arrives over the stream.
    */
-  async append<T extends EventType>(type: T, payload: Parameters<typeof makeEvent<T>>[1], opts: { id?: string; ts?: number; attempts?: number } = {}): Promise<EventOf<T>> {
+  async append<T extends EventType>(type: T, payload: Parameters<typeof makeEvent<T>>[1], opts: { id?: string; ts?: number; attempts?: number; keepalive?: boolean } = {}): Promise<EventOf<T>> {
     const attempts = opts.attempts ?? 3;
     const event = makeEvent(type, payload, { id: opts.id ?? uuidv7(), device_id: this.session.device_id, ts: opts.ts ?? Date.now() });
     let lastError: unknown;
     for (let i = 0; i < attempts; i++) {
       try {
-        const r = await fetch("/api/events", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ events: [event] }) });
+        const r = await fetch("/api/events", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ events: [event] }), keepalive: opts.keepalive ?? false });
         await json(r);
         return event;
       } catch (e) {

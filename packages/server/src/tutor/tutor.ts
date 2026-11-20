@@ -3,7 +3,24 @@
 // The reply becomes a message.added event when the turn ends; the draft itself is never stored.
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { makeEvent, mapRange, pageLines, pageText, STUDY_MODE_DEVICE, uuidv7, type Anchor, type EventType, type MyelinEvent, type PageState } from "@myelin/core";
+import {
+  activeMs,
+  addMark,
+  currentRun,
+  makeEvent,
+  mapRange,
+  marksOf,
+  pageLines,
+  pageText,
+  runEndsAt,
+  STUDY_MODE_DEVICE,
+  uuidv7,
+  type Anchor,
+  type EventType,
+  type Mark,
+  type MyelinEvent,
+  type PageState,
+} from "@myelin/core";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -19,12 +36,15 @@ import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
 import { anchorLabel, buildSittingContext, formatAgo, newcomerUnit, openPage, probeNote, tailOf, type ThreadMessage } from "./context.js";
 import { changedLines, OBSERVE_PAUSE_MS, observationPrompt, parseVerdict, TRIAGE_SYSTEM, triagePrompt, WORKING_MS, type Verdict } from "./observer.js";
-import { describeProbe, offerProbe, tutorTools, type Card, type Offer, type ToolHost, type TurnInfo } from "./tools.js";
+import { runReport } from "./runs.js";
+import { DEBRIEF, describeProbe, offerProbe, runNote, tutorTools, type Card, type Offer, type ToolHost, type TurnInfo } from "./tools.js";
 
 /** The device id on everything the tutor writes. */
 export const TUTOR_DEVICE = "server:tutor";
 export const FIRST_RUN_TEXT = "What do you want to learn, and is there a date you are working toward?";
 export const SITTING_GAP_MS = 30 * 60_000;
+/** A budget is for the sitting it was set in; after this long it no longer applies. */
+const BUDGET_LIFE_MS = 12 * 3_600_000;
 
 export interface Draft {
   id: string;
@@ -68,7 +88,7 @@ const APP_NOTE = `
 
 Text in square brackets that starts with "app:" comes from the app, not from the learner. Everything else in a user turn is what the learner wrote. Your reply is posted to the thread as one message when you finish. If nothing needs saying, call stay_quiet and write nothing.`;
 
-type Trigger = "message" | "greeting" | "observation";
+type Trigger = "message" | "greeting" | "observation" | "run";
 
 export class Tutor {
   private messages: ThreadMessage[] = [];
@@ -100,6 +120,12 @@ export class Tutor {
   private due = new Set<string>();
   /** Each page as the observer or the tutor last looked at it. */
   private looked = new Map<string, { rev: number; lines: string[] }>();
+  /** When the learner was there, for active time. */
+  private marks: Mark[] = [];
+  /** Fires when the run on reaches zero. */
+  private runTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Runs whose time ran out and which the tutor has not debriefed yet. */
+  private runsOut: string[] = [];
   private readonly gap: number;
   private readonly now: () => number;
 
@@ -118,6 +144,7 @@ export class Tutor {
     const stale = this.messages.findLast((m) => m.author === "learner" && this.now() - m.ts > this.gap)?.seq ?? 0;
     this.answeredThrough = Math.max(lastTutor, stale);
     this.unsubscribe = store.subscribe((fresh) => this.onAppended(fresh));
+    this.armRun();
   }
 
   /** The reply being written, if any. */
@@ -145,6 +172,7 @@ export class Tutor {
       return;
     }
     const last = this.messages.at(-1)!;
+    if (currentRun(this.store.state.runs)) return;
     if (this.now() - last.ts > this.gap && !this.busy) this.kick("greeting");
   }
 
@@ -152,6 +180,8 @@ export class Tutor {
     this.closed = true;
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
+    if (this.runTimer) clearTimeout(this.runTimer);
+    this.runTimer = null;
     this.unsubscribe();
     this.endSitting();
   }
@@ -159,6 +189,7 @@ export class Tutor {
   // -------------------------------------------------------------------------------------------
 
   private index(e: MyelinEvent & { seq?: number }): ThreadMessage | null {
+    for (const m of marksOf(e)) addMark(this.marks, m);
     if (e.type !== "message.added" || e.seq === undefined) return null;
     const p = e.payload;
     const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, anchor: p.anchor ?? null, timing: p.timing ?? null };
@@ -174,6 +205,7 @@ export class Tutor {
         this.notes.push(`[app: the learner reworded unit ${p.unit_id}${p.text ? ` to "${p.text}"` : ""}${p.kind ? ` (kind ${p.kind})` : ""}. Their wording stands.]`);
       }
       if (e.type === "page.edited" && e.device_id !== TUTOR_DEVICE && e.device_id !== STUDY_MODE_DEVICE) this.paused(e.payload.page_id);
+      if (e.type.startsWith("run.")) this.armRun();
       const m = this.index(e);
       if (m?.author === "learner" && !this.imported.has(m.id)) this.kick("message");
     }
@@ -194,6 +226,36 @@ export class Tutor {
     }, this.opts.observePauseMs ?? OBSERVE_PAUSE_MS);
     t.unref?.();
     this.timers.set(pageId, t);
+  }
+
+  /** Sets the timer for the run on, if its clock is running. Called whenever a run event lands. */
+  private armRun(): void {
+    if (this.runTimer) clearTimeout(this.runTimer);
+    this.runTimer = null;
+    if (this.closed) return;
+    const r = currentRun(this.store.state.runs);
+    const at = r ? runEndsAt(r) : null;
+    if (!r || at === null) return;
+    const t = setTimeout(() => {
+      this.runTimer = null;
+      this.timeUp(r.id, at);
+    }, Math.max(0, at - this.now()));
+    t.unref?.();
+    this.runTimer = t;
+  }
+
+  /** The run's clock reached zero: the app ends it and the tutor debriefs. */
+  private timeUp(id: string, at: number): void {
+    const r = this.store.state.runs[id];
+    if (this.closed || !r || r.ended_at !== null || r.paused_at !== null) return;
+    this.write("run.ended", { run_id: id, reason: "time" });
+    // Found long after, as on a server that was down: the learner has gone, so it waits for their return.
+    if (this.now() - at > this.gap) {
+      this.notes.push(`[app: the timed run ${id} ran out of time while no one was here, and has not been debriefed. Offer to go through it; end_run is not needed.]`);
+      return;
+    }
+    this.runsOut.push(id);
+    this.kick("run");
   }
 
   private kick(t: Trigger): void {
@@ -221,24 +283,32 @@ export class Tutor {
   }
 
   private async turn(triggers: Set<Trigger>): Promise<void> {
-    if (triggers.has("message") || triggers.has("greeting")) await this.reply(triggers);
+    if (triggers.has("message") || triggers.has("greeting") || triggers.has("run")) await this.reply(triggers);
     if (this.due.size > 0) await this.observe();
   }
 
   private async reply(triggers: Set<Trigger>): Promise<void> {
     const now = this.now();
     const asked = this.unanswered();
-    if (asked.length === 0 && !triggers.has("greeting")) return;
+    const out = this.runsOut.splice(0).map((id) => this.store.state.runs[id]!).filter(Boolean);
+    if (asked.length === 0 && out.length === 0 && !triggers.has("greeting")) return;
     // While a page is being worked on, a message in the thread may be the learner thinking aloud.
-    if (asked.length > 0 && !triggers.has("greeting") && asked.every((m) => !m.anchor)) {
+    if (asked.length > 0 && out.length === 0 && !triggers.has("greeting") && asked.every((m) => !m.anchor)) {
       const page = this.workingPage(now);
       if (page && (await this.thinkingAloud(page, asked))) return;
     }
     const session = await this.sitting(now, new Set(asked.map((m) => m.id)));
     const state = this.store.state;
+    const events = out.length > 0 ? this.store.read(0, -1) : [];
+    const debrief = out.map(
+      (r) => `[app: the timed run's clock reached zero. Tell them time is up in a few words, then debrief.]\n\n${runReport(r, events, now)}\n\n[app: ${DEBRIEF}]`,
+    );
     let prompt: string;
     if (asked.length > 0) {
       prompt = asked.map((m) => (m.anchor ? `[app: this is in an aside ${anchorLabel(state, m.anchor)}]\n${m.text}` : m.text)).join("\n\n");
+      if (debrief.length > 0) prompt = `${debrief.join("\n\n")}\n\n[app: the learner wrote, as time ran out:]\n${prompt}`;
+    } else if (debrief.length > 0) {
+      prompt = debrief.join("\n\n");
     } else {
       const last = this.messages.at(-1);
       const opened = `[app: the learner just opened the app${last ? `; the last message was ${formatAgo(now - last.ts)}` : ""}. `;
@@ -248,7 +318,7 @@ export class Tutor {
           "Once it is graded, ask what they want to work on now, toward their goal if they have one.]"
         : `${opened}Greet them in one short line, then ask what they want to work on now, toward their goal if they have one. One question.]`;
     }
-    const notes = [...this.notes, ...this.pageNotes(now)];
+    const notes = [...this.notes, ...this.pageNotes(now), ...this.runNotes(now)];
     this.notes = [];
     if (notes.length > 0) prompt = `${notes.join("\n")}\n\n${prompt}`;
 
@@ -379,7 +449,8 @@ export class Tutor {
     const v = await this.triage(page, said);
     if (!v || v.addressed !== false) return false;
     this.answeredThrough = Math.max(this.answeredThrough, ...asked.map((m) => m.seq));
-    if (v.raise) await this.observation(page, v, said);
+    // In a timed run the tutor holds what it sees for the debrief.
+    if (v.raise && !currentRun(this.store.state.runs)) await this.observation(page, v, said);
     else this.notes.push(`[app: while working on the page, the learner thought aloud in the thread:\n${said.map((s) => `"${s}"`).join("\n")}\nNo reply was needed.]`);
     return true;
   }
@@ -388,10 +459,16 @@ export class Tutor {
   private async observe(): Promise<void> {
     const ids = [...this.due];
     this.due.clear();
+    const running = currentRun(this.store.state.runs) !== null;
     for (const id of ids) {
       const page = this.store.state.pages[id];
       // Edited again since: the next pause will bring it back.
       if (!page || this.timers.has(id)) continue;
+      // A timed run is not interrupted; the debrief covers what happened on the page.
+      if (running) {
+        this.remember(page);
+        continue;
+      }
       const seen = this.looked.get(id);
       if (seen?.rev === page.rev) continue;
       if (changedLines(page, seen?.lines ?? null).length === 0) {
@@ -448,7 +525,7 @@ export class Tutor {
     const now = this.now();
     const session = await this.sitting(now, new Set());
     let prompt = observationPrompt(page, v, said, newcomerUnit(this.store.state, page) !== null);
-    const notes = [...this.notes, ...this.pageNotes(now, page)];
+    const notes = [...this.notes, ...this.pageNotes(now, page), ...this.runNotes(now)];
     this.notes = [];
     if (notes.length > 0) prompt = `${notes.join("\n")}\n\n${prompt}`;
 
@@ -495,6 +572,30 @@ export class Tutor {
     return [`[app: the open page ${changed ? "now reads" : "reads"}:\n${pageText(page)}${note ? `\n\n${note}` : ""}]`];
   }
 
+  /** The run on, if any, or how much of the sitting's budget is used, as the tutor is told it each turn. */
+  private runNotes(now: number): string[] {
+    const s = this.store.state;
+    const r = currentRun(s.runs);
+    if (r) return [runNote(r, now)];
+    const b = s.budget;
+    if (!b || now - b.set_at > BUDGET_LIFE_MS || !this.oneSitting(b.set_at, now)) return [];
+    const used = activeMs(this.marks, b.set_at, now);
+    const min = (ms: number) => Math.round(ms / 60_000);
+    if (used >= b.seconds * 1000) return [`[app: the time budget of ${min(b.seconds * 1000)} minutes is used up (${min(used)} active minutes). Wrap up in a line unless they want to go on.]`];
+    return [`[app: ${min(used)} of the ${min(b.seconds * 1000)} budgeted minutes used. Plan within what is left; mention it only near the end.]`];
+  }
+
+  /** Whether [from, to] is one sitting: no break in the thread longer than the sitting gap. */
+  private oneSitting(from: number, to: number): boolean {
+    let prev = from;
+    for (const m of this.messages) {
+      if (m.ts <= from) continue;
+      if (m.ts - prev > this.gap) return false;
+      prev = m.ts;
+    }
+    return to - prev <= this.gap;
+  }
+
   /** An anchor carried to the page's current revision. The quote stays as first written. */
   private carry(a: Anchor): Anchor {
     const page = this.store.state.pages[a.page_id];
@@ -526,6 +627,8 @@ export class Tutor {
       turn: () => this.turnInfo ?? { replyId: uuidv7(this.now()), answer: null, cards: [] },
       offers: this.offers,
       run: this.opts.sandbox ? (code: string) => this.opts.sandbox!.run([code]) : undefined,
+      events: () => store.read(0, -1),
+      activeMs: (from, to) => activeMs(this.marks, from, to),
     };
   }
 

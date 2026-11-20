@@ -147,6 +147,9 @@ export function relevantUnits(state: State, limit = UNITS): Unit[] {
     .slice(0, limit);
 }
 
+/** How many days before a goal's date the tutor starts offering timed runs. */
+export const RAMP_DAYS = 14;
+
 export function buildSittingContext({ name, now, state, tail, timeZone, scheduler, page }: SittingInput): string {
   const lines: string[] = ["# This sitting", ""];
   lines.push(`It is ${formatWhen(now, timeZone)}. The learner is ${name}.`);
@@ -160,6 +163,13 @@ export function buildSittingContext({ name, now, state, tail, timeZone, schedule
   for (const g of goals) {
     const due = g.due ? `, due ${formatDate(g.due, timeZone)} (${Math.ceil((g.due - now) / 86_400_000)} days from now)` : ", no date";
     lines.push(`- ${g.text}${due}${g.topic ? `, topic ${g.topic}` : ""} (goal_id ${g.id})`);
+  }
+  // As a dated goal nears, practice moves toward its conditions: timed runs.
+  const soon = goals.filter((g) => g.due !== null && g.due > now && g.due - now <= RAMP_DAYS * 86_400_000);
+  if (soon.length > 0) {
+    const lastRun = Object.values(state.runs).findLast(() => true);
+    const ran = lastRun ? `The last timed run was ${formatAgo(now - lastRun.started_at)}.` : "There has been no timed run yet.";
+    lines.push(`The goal date is near. ${ran} When the work allows, offer a timed run under the goal's conditions, at most once a sitting; start it only if they accept.`);
   }
   const budget = state.budget;
   if (budget && now - budget.set_at < 12 * 3600_000) {

@@ -841,14 +841,160 @@ describe("code and explaining", () => {
     await a.say("done, does it make sense?");
     await until(() => a.of("unit.probed").length === 2 && a.messages().length === 10);
     const probe = a.of("unit.probed")[1]!;
-    expect(probe.payload).toMatchObject({ unit_id: unitId, depth: "explain", grade: "good", latency_ms: null });
+    // Timed by the work on the page: active time from its opening to its last edit.
+    expect(probe.payload).toMatchObject({ unit_id: unitId, depth: "explain", grade: "good", latency_ms: expect.any(Number) });
+    expect((probe.payload as { latency_ms: number }).latency_ms).toBeGreaterThan(0);
     expect((probe.payload as { prompt: string }).prompt).toContain('On page "Importance sampling, for a newcomer"');
     const unit = store.state.units[unitId]!;
     expect(unit.ladders.explain!.step).toBe(2);
     expect(unit.ladders.explain!.due).toBeGreaterThanOrEqual(before + 7 * 86_400_000);
     expect(unit.memory_reviews).toBe(1);
-    expect(a.messages()[9]!.cards).toEqual([{ kind: "trace", text: expect.stringMatching(/^Explained\. /) }]);
+    expect(a.messages()[9]!.cards).toEqual([{ kind: "trace", text: expect.stringMatching(/^Explained in /) }]);
     expect(faux.getPendingResponseCount()).toBe(0);
+    a.stop();
+  });
+});
+
+describe("timed runs", () => {
+  const runs = (u: User) => Object.values(srv.stores.get(u.id).state.runs);
+
+  it("starts a run when asked, answers clarifying questions only, ends on time and debriefs with a timeline", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+
+    // Asked for a run: the tutor starts it and sets the problem. A second start is refused.
+    let refused = "";
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("start_run", { minutes: 0.04, conditions: "interview: clarifying questions only" }), { stopReason: "toolUse" }),
+      (ctx) => {
+        expect(lastToolResult(ctx)).toContain("Run started");
+        return fauxAssistantMessage(fauxToolCall("start_run", { minutes: 5, conditions: "again" }), { stopReason: "toolUse" });
+      },
+      (ctx) => {
+        refused = lastToolResult(ctx);
+        return fauxAssistantMessage("Reverse a linked list in place.");
+      },
+    ]);
+    await a.say("give me a timed interview question");
+    await until(() => a.messages().length === 3);
+    expect(refused).toContain("already on");
+    expect(a.of("run.started")).toHaveLength(1);
+    expect(a.of("run.started")[0]!.payload).toMatchObject({ duration_ms: 2400, conditions: "interview: clarifying questions only", page_id: null });
+
+    // During the run the tutor is told the run is on, and asides are refused.
+    let prompt = "";
+    let aside = "";
+    faux.setResponses([
+      (ctx) => {
+        prompt = lastUser(ctx as never);
+        return fauxAssistantMessage(fauxToolCall("open_aside", { passage: "x", text: "hint" }), { stopReason: "toolUse" });
+      },
+      (ctx) => {
+        aside = lastToolResult(ctx);
+        return fauxAssistantMessage("Singly linked.");
+      },
+    ]);
+    await a.say("singly or doubly linked?");
+    await until(() => a.messages().length === 5);
+    expect(prompt).toContain("a timed run is on");
+    expect(prompt).toContain("clarifying questions only");
+    expect(aside).toContain("no asides");
+
+    // The clock reaches zero: the app ends the run and the tutor debriefs with a timeline.
+    let debrief = "";
+    let shownCard = "";
+    faux.setResponses([
+      (ctx) => {
+        debrief = lastUser(ctx as never);
+        return fauxAssistantMessage(
+          fauxToolCall("show_card", { kind: "timeline", steps: [{ name: "Clarifying", until: "0:01" }, { name: "Pointer juggling" }], costly: 2 }),
+          { stopReason: "toolUse" },
+        );
+      },
+      (ctx) => {
+        shownCard = lastToolResult(ctx);
+        return fauxAssistantMessage("Time. The pointers cost the most. What would you draw first next time?");
+      },
+    ]);
+    await until(() => a.of("run.ended").length === 1, 6000);
+    expect(a.of("run.ended")[0]!.payload).toMatchObject({ reason: "time" });
+    expect(a.of("run.ended")[0]!.device_id).toBe(TUTOR_DEVICE);
+    await until(() => a.messages().length === 6);
+    expect(debrief).toContain("clock reached zero");
+    expect(debrief).toContain("time ran out");
+    expect(debrief).toContain('learner: \\"singly or doubly linked?\\"');
+    expect(debrief).toContain("show_card");
+    expect(shownCard).toContain("Pointer juggling");
+    const run = runs(u)[0]!;
+    expect(run.end).toBe("time");
+    expect(run.ended_at! - run.started_at).toBe(2400);
+    const card = a.messages()[5]!.cards[0] as { kind: string; duration_ms: number; segments: { name: string; ms: number; costly?: boolean }[] };
+    expect(card).toMatchObject({ kind: "timeline", run_id: run.id, duration_ms: 2400 });
+    expect(card.segments).toEqual([
+      { name: "Clarifying", ms: 1000 },
+      { name: "Pointer juggling", ms: 1400, costly: true },
+    ]);
+    expect(faux.getPendingResponseCount()).toBe(0);
+    a.stop();
+  });
+
+  it("pauses, resumes and stops a run in words, and end_run returns what happened", async () => {
+    const [u, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("start_run", { minutes: 20, conditions: "exam" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Prove that the square root of 2 is irrational."),
+    ]);
+    await a.say("20 minute run please");
+    await until(() => a.messages().length === 3);
+
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("pause_run", {}), { stopReason: "toolUse" }), fauxAssistantMessage("Paused.")]);
+    await a.say("pause, the door");
+    await until(() => a.messages().length === 5);
+    expect(runs(u)[0]!.paused_at).not.toBeNull();
+    // An app signal in the thread's log: the learner left the app.
+    await a.post(makeEvent("activity.signal", { signal: "blur" }, { id: uuidv7(), device_id: a.id, ts: Date.now() }));
+
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("resume_run", {}), { stopReason: "toolUse" }), fauxAssistantMessage("Go on.")]);
+    await a.say("back");
+    await until(() => a.messages().length === 7);
+    expect(runs(u)[0]!.paused_at).toBeNull();
+    expect(runs(u)[0]!.paused_ms).toBeGreaterThan(0);
+
+    let report = "";
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("end_run", {}), { stopReason: "toolUse" }),
+      (ctx) => {
+        report = lastToolResult(ctx);
+        return fauxAssistantMessage(fauxToolCall("show_card", { kind: "timeline", steps: [{ name: "Setting up the contradiction" }] }), { stopReason: "toolUse" });
+      },
+      fauxAssistantMessage("You stopped early with most of the time left. Where did you get stuck?"),
+    ]);
+    await a.say("stop, I'm done");
+    await until(() => a.messages().length === 9);
+    expect(a.of("run.ended")[0]!.payload).toMatchObject({ reason: "stopped" });
+    expect(report).toContain("Run ended");
+    expect(report).toContain("paused");
+    expect(report).toContain("resumed");
+    expect(report).toContain("left the app");
+    expect(report).toMatch(/stopped; (20:00|19:5\d) of 20:00 unused/);
+    const card = a.messages()[8]!.cards[0] as unknown as { segments: { name: string; ms: number; unused?: boolean }[] };
+    expect(card.segments).toHaveLength(2);
+    expect(card.segments[1]).toMatchObject({ name: "Unused", unused: true });
+    expect(card.segments[0]!.ms + card.segments[1]!.ms).toBe(20 * 60_000);
+    // With no run on, the tools say so.
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("pause_run", {}), { stopReason: "toolUse" }),
+      (ctx) => {
+        report = lastToolResult(ctx);
+        return fauxAssistantMessage("Nothing to pause.");
+      },
+    ]);
+    await a.say("pause");
+    await until(() => a.messages().length === 11);
+    expect(report).toContain("No run is on");
     a.stop();
   });
 });
