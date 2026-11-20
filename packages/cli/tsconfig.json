@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    "types": ["node"],
+    "paths": { "@myelin/core": ["../core/src/index.ts"], "@myelin/server": ["../server/src/index.ts"] }
+  },
+  "include": ["src", "test"]
+}

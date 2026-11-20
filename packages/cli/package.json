@@ -1,0 +1,21 @@
+{
+  "name": "@myelin/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "myelin": "./dist/main.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@myelin/core": "0.1.0",
+    "@myelin/server": "0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2",
+    "vitest": "5.1.1"
+  }
+}

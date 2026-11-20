@@ -2,11 +2,15 @@
   "name": "myelin",
   "private": true,
   "type": "module",
-  "workspaces": ["packages/*"],
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build -w @myelin/core -w @myelin/server -w @myelin/web -w @myelin/cli --if-present",
     "test": "npm test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
-  "engines": { "node": ">=22" }
+  "engines": {
+    "node": ">=22"
+  }
 }
