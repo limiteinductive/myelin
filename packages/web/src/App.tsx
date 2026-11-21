@@ -635,7 +635,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                 <PageLink
                   page={page()}
                   status={(pageTick(), pageStatus(page(), pageMap, now(), shown()?.id ?? null))}
-                  facts={(pageTick(), pageFacts(page(), now(), asides().filter((a) => a.page_id === page().id && a.raised_by === "tutor").length))}
+                  facts={(pageTick(), pageFacts(page(), asides().filter((a) => a.page_id === page().id && a.raised_by === "tutor").length))}
                   open={() => openPage(page().id)}
                 />
               )}
@@ -1086,8 +1086,10 @@ function Composer(props: {
   plus?: { page: (() => void) | null };
 }) {
   const kept = () => (props.secret ? "" : draft.get());
+  /** The message on its way to the server. It stays in the draft until the server has it. */
+  let pending: string | null = null;
   const keep = (text: string) => {
-    if (!props.secret) draft.set(text);
+    if (!props.secret) draft.set(pending === null ? text : text.trim() ? `${pending}\n${text}` : pending);
   };
   const [empty, setEmpty] = createSignal(kept().trim() === "");
   const [sending, setSending] = createSignal(false);
@@ -1160,14 +1162,29 @@ function Composer(props: {
     const text = field.value.trim();
     if (!text || !props.connected || sending()) return;
     setSending(true);
-    if (await props.send(text, startedAt)) {
-      startedAt = null;
-      field.value = "";
-      keep("");
-      setEmpty(true);
-      grow();
+    // The field clears at once, so what is typed while the message goes is the next one.
+    const started = startedAt;
+    startedAt = null;
+    pending = text;
+    show("");
+    const sent = await props.send(text, started);
+    pending = null;
+    if (sent) keep(field.value);
+    else {
+      // Not sent: the message comes back, ahead of anything typed since.
+      const after = field.value;
+      const at = field.selectionStart;
+      show(after.trim() ? `${text}\n${after}` : text);
+      if (after.trim() && document.activeElement === field) field.setSelectionRange(at + text.length + 1, at + text.length + 1);
+      startedAt = started ?? startedAt;
     }
     setSending(false);
+  };
+  const show = (text: string) => {
+    field.value = text;
+    keep(text);
+    setEmpty(text.trim() === "");
+    grow();
   };
 
   return (

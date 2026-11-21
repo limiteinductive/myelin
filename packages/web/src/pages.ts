@@ -33,14 +33,11 @@ export function pageStatus(page: PageState, pages: Readonly<Record<string, PageS
   return latest?.id === page.id && now - page.edited_at < IN_PROGRESS_MS ? "in progress" : "kept";
 }
 
-/** One or two plain facts for the page link. */
-export function pageFacts(page: PageState, now: number, asked = 0): string {
+/** One or two plain facts for the page link. No time: time is shown only in timed runs and debriefs. */
+export function pageFacts(page: PageState, asked = 0): string {
   const written = pageLines(page).filter((l) => l.kind !== "problem" && l.text.trim() !== "").length;
   if (written === 0) return page.starter ? "A problem, not started" : "Nothing written yet";
-  const d = new Date(page.edited_at);
-  const today = new Date(now).toDateString() === d.toDateString();
-  const when = today ? d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) : d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
   const lines = `${written} ${written === 1 ? "line" : "lines"}`;
   if (asked > 0) return `${lines}, ${asked} ${asked === 1 ? "question" : "questions"} from the tutor`;
-  return `${lines} · edited ${when}`;
+  return lines;
 }
