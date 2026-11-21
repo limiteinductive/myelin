@@ -39,6 +39,12 @@ const Anchor = z.object({
   quote: z.string(),
 });
 
+/** A passage of an earlier thread message that a learner's message replies to. */
+const Quote = z.object({
+  message_id: Id,
+  text: z.string().min(1).max(2000),
+});
+
 const Timing = z.object({
   shown_at: Ms.nullable().default(null),
   input_started_at: Ms.nullable().default(null),
@@ -76,6 +82,7 @@ export const payloads = {
     text: z.string(),
     cards: z.array(z.looseObject({ kind: z.string() })).default([]),
     anchor: Anchor.nullable().default(null),
+    quote: Quote.nullable().default(null),
     timing: Timing.nullable().default(null),
   }),
 

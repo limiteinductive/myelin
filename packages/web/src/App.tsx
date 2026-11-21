@@ -6,6 +6,7 @@ import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResu
 import { foldPages, pageFacts, pageStatus } from "./pages.js";
 import { draft, login, saveKey, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
 import { Body, inline, splitLead } from "./text.js";
+import { lineOf, markQuote, quoteText, type Quote } from "./quote.js";
 import { current, foldUnits, type UnitView } from "./units.js";
 import type { JSX } from "@solidjs/web";
 
@@ -109,6 +110,8 @@ type Line = {
   timelines: TimelineCard[];
   tables: UnitsTableCard[];
   anchor: Anchor | null;
+  /** The passage of an earlier message this one replies to. */
+  quote: Quote | null;
 };
 /** A message on its own, or a run of messages in one aside, shown as its passage and then the messages. */
 type Item = { id: string; kind: "line"; line: Line } | { id: string; kind: "aside"; aside: Aside; lines: Line[] };
@@ -220,10 +223,10 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     view.events
       .filter((e) => e.type === "message.added")
       .map((e) => {
-        const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null };
+        const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null; quote?: Quote | null };
         const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
         const anchor = p.anchor ? { ...p.anchor } : null;
-        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor };
+        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor, quote: p.quote ? { ...p.quote } : null };
       }),
   );
   /** The lines with the tutor's reply in progress at the end, in the thread or in its aside. */
@@ -232,7 +235,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     const ls = lines();
     if (!r) return ls;
     const anchor = r.anchor ? { ...r.anchor } : null;
-    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor }];
+    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor, quote: null }];
   });
   const asides = createMemo<Aside[]>(() => {
     pageTick();
@@ -453,21 +456,74 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     <Composer secret connected={view.connected} lost={view.lost} send={giveKey} scope={keyError()} placeholder={`Your ${needsKey()} API key`} />
   );
 
+  /** A passage of a thread message the learner selected: the composer replies to it. */
+  const [quote, setQuote] = createSignal<(Quote & { range: Range }) | null>(null);
+  const aim = (q: (Quote & { range: Range }) | null) => {
+    setQuote(q);
+    markQuote(q?.range ?? null);
+  };
+  onSettled(() => {
+    // Selecting in a message aims the composer at the passage. Moving into the composer keeps it;
+    // a click elsewhere, or a selection on the page, lets it go.
+    const watch = () => {
+      const sel = getSelection();
+      if (!sel || sel.rangeCount === 0) return;
+      const range = sel.getRangeAt(0);
+      if (!sel.isCollapsed) {
+        const from = lineOf(range.startContainer);
+        const to = lineOf(range.endContainer);
+        const id = from?.dataset.line;
+        if (id && to?.dataset.line === id && lines().some((l) => l.id === id)) {
+          const text = quoteText(range);
+          if (text) {
+            aim({ message_id: id, text, range: range.cloneRange() });
+            editor?.dismissScope();
+          }
+          return;
+        }
+      }
+      const at = range.startContainer instanceof Element ? range.startContainer : range.startContainer.parentElement;
+      if (at?.closest(".myl-composer") || document.activeElement?.closest(".myl-composer")) return;
+      if (quote()) aim(null);
+    };
+    document.addEventListener("selectionchange", watch);
+    return () => {
+      document.removeEventListener("selectionchange", watch);
+      markQuote(null);
+    };
+  });
+  const quoteScope = () => {
+    const q = quote();
+    if (!q) return null;
+    return (
+      <>
+        Replying to “<span class="app-scope-quote">{inline(q.text.replace(/\$\$/g, "$"))}</span>” · Esc to let go
+      </>
+    );
+  };
+  /** A learner's message shows the passage it replies to above it. */
+  const Quoted = (p: { quote: Quote | null }) => (
+    <Show when={p.quote}>{(q) => <blockquote class="myl-aside__quote app-quote">{inline(q().text.replace(/\$\$/g, "$"))}</blockquote>}</Show>
+  );
+
   const send = async (text: string, startedAt: number | null): Promise<boolean> => {
     if (!sync) return false;
     stick = true;
     const answering = lines().at(-1)?.id === shownId;
     const ed = editor;
     // A message about a passage is anchored to it, at a revision the server has.
-    const anchor = ed && ed.scope() ? await ed.anchor() : null;
+    const q = quote();
+    const anchor = !q && ed && ed.scope() ? await ed.anchor() : null;
     try {
       await sync.append("message.added", {
         author: "learner",
         text,
         cards: [],
         anchor,
+        quote: q ? { message_id: q.message_id, text: q.text } : null,
         timing: { shown_at: answering ? shownAt : null, input_started_at: startedAt, sent_at: Date.now() },
       });
+      if (q && quote() === q) aim(null);
       return true;
     } catch (e) {
       if (e instanceof SendError) console.warn(e.message);
@@ -639,7 +695,8 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                                     </article>
                                   </Show>
                                   <Show when={line().text.trim() || line().trace}>
-                                    <article class={{ "myl-message": true, "myl-message--learner": line().author === "learner", "myl-turn": turn() }}>
+                                    <article class={{ "myl-message": true, "myl-message--learner": line().author === "learner", "myl-turn": turn() }} data-line={line().id}>
+                                      <Quoted quote={line().quote} />
                                       <Body text={line().text} />
                                       <Show when={line().trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
                                     </article>
@@ -650,11 +707,11 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                             >
                               {(parts) => (
                                 <>
-                                  <article class={{ "myl-message": true, "myl-turn": turn() }}>
+                                  <article class={{ "myl-message": true, "myl-turn": turn() }} data-line={line().id}>
                                     <Body text={parts()[0]} />
                                   </article>
                                   <Extras line={line()} part="inline" />
-                                  <article class="myl-message">
+                                  <article class="myl-message" data-line={line().id}>
                                     <Body text={parts()[1]} />
                                     <Show when={line().trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
                                   </article>
@@ -687,7 +744,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
           </main>
         </div>
         <div class="myl-phone__foot app-foot">
-          <Show when={needsKey()} fallback={<Composer connected={view.connected} lost={view.lost} send={send} />}>
+          <Show when={needsKey()} fallback={<Composer connected={view.connected} lost={view.lost} send={send} scope={quoteScope()} escape={() => aim(null)} />}>
             <KeyComposer />
           </Show>
         </div>
@@ -741,8 +798,9 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                 {(l) => (
                   <>
                     <Show when={l().text.trim() || thinking(l().id)}>
-                      <div class="myl-aside__message">
+                      <div class="myl-aside__message" data-line={l().id}>
                         <Who author={l().author} />
+                        <Quoted quote={l().quote} />
                         <Show when={!thinking(l().id)} fallback={<Thinking />}>
                           <Body text={l().text} />
                         </Show>
@@ -770,9 +828,9 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                     connected={view.connected}
                     lost={view.lost}
                     send={send}
-                    scope={scopeText()}
+                    scope={quote() ? quoteScope() : scopeText()}
                     placeholder="Type or dictate"
-                    escape={() => editor?.dismissScope()}
+                    escape={() => (quote() ? aim(null) : editor?.dismissScope())}
                   />
                 }
               >

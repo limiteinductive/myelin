@@ -308,6 +308,35 @@ describe("tutor", () => {
     b.stop();
   });
 
+  it("tells the tutor which passage of its message the learner replies to", async () => {
+    const [, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    const first = a.messages()[0]!;
+    let prompt = "";
+    faux.setResponses([
+      (ctx) => {
+        prompt = lastUser(ctx as never);
+        return fauxAssistantMessage("A date lets me plan each sitting toward it. When is yours?");
+      },
+    ]);
+    const e = makeEvent(
+      "message.added",
+      { author: "learner", text: "why is that?", quote: { message_id: first.id, text: "is there a date you are working toward" } },
+      { id: uuidv7(Date.now()), device_id: a.id, ts: Date.now() },
+    );
+    await a.post(e);
+    await until(() => a.messages().length === 3);
+    expect(prompt).toContain("[app: the learner selected this passage of your message (just now) and replies to it:");
+    expect(prompt).toContain("is there a date you are working toward");
+    expect(prompt).toContain("why is that?");
+    // The quote is kept with the message.
+    const stored = (await (await fetch(`${srv.url}/api/events`, { headers: { cookie: a.cookie } })).json()) as { events: MyelinEvent[] };
+    const kept = stored.events.find((x) => x.id === e.id)!;
+    expect(kept.type === "message.added" && kept.payload.quote).toEqual({ message_id: first.id, text: "is there a date you are working toward" });
+    a.stop();
+  });
+
   it("stays quiet when the model calls stay_quiet", async () => {
     const [, a] = await learner();
     await a.listen();

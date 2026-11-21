@@ -115,3 +115,7 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 
 /* The quoted passage in the composer's scope line: one line, cut with an ellipsis. */
 .app-scope-quote { display: inline-block; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+
+/* A reply to a passage: the quote above the learner's message, and the passage marked while the composer replies to it. */
+.app-quote { margin: 0 0 var(--space-2); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+::highlight(myl-quote) { background-color: var(--selection); }

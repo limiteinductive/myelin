@@ -200,7 +200,7 @@ export class Tutor {
     if ((e.type === "message.added" || e.type === "page.edited") && marks.length > 0) this.workedAt = Math.max(this.workedAt, e.ts);
     if (e.type !== "message.added" || e.seq === undefined) return null;
     const p = e.payload;
-    const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, anchor: p.anchor ?? null, timing: p.timing ?? null };
+    const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, anchor: p.anchor ?? null, quote: p.quote ?? null, timing: p.timing ?? null };
     this.messages.push(m);
     if (e.device_id === STUDY_MODE_DEVICE) this.imported.add(e.id);
     return m;
@@ -217,6 +217,13 @@ export class Tutor {
       const m = this.index(e);
       if (m?.author === "learner" && !this.imported.has(m.id)) this.kick("message");
     }
+  }
+
+  /** Tells the tutor which passage of an earlier message the learner is replying to. */
+  private quoteNote(q: { message_id: string; text: string }): string {
+    const of = this.messages.find((m) => m.id === q.message_id);
+    const whose = !of ? "an earlier message" : of.author === "tutor" ? `your message (${formatAgo(this.now() - of.ts)})` : `their own message (${formatAgo(this.now() - of.ts)})`;
+    return `[app: the learner selected this passage of ${whose} and replies to it: "${q.text}"]`;
   }
 
   private unanswered(): ThreadMessage[] {
@@ -313,7 +320,7 @@ export class Tutor {
     );
     let prompt: string;
     if (asked.length > 0) {
-      prompt = asked.map((m) => (m.anchor ? `[app: this is in an aside ${anchorLabel(state, m.anchor)}]\n${m.text}` : m.text)).join("\n\n");
+      prompt = asked.map((m) => (m.anchor ? `[app: this is in an aside ${anchorLabel(state, m.anchor)}]\n${m.text}` : m.quote ? `${this.quoteNote(m.quote)}\n${m.text}` : m.text)).join("\n\n");
       if (debrief.length > 0) prompt = `${debrief.join("\n\n")}\n\n[app: the learner wrote, as time ran out:]\n${prompt}`;
     } else if (debrief.length > 0) {
       prompt = debrief.join("\n\n");
