@@ -8,6 +8,16 @@ import { createSignal } from "solid-js";
 import { App, type Screen } from "./App.js";
 import { login, me, SignInError } from "./sync.js";
 
+// The tokens define both themes under data-theme; follow the device's setting, and its changes.
+const dark = matchMedia("(prefers-color-scheme: dark)");
+const theme = () => {
+  const t = dark.matches ? "dark" : "light";
+  document.documentElement.dataset.theme = t;
+  document.documentElement.style.colorScheme = t;
+};
+theme();
+dark.addEventListener("change", theme);
+
 const [screen, setScreen] = createSignal<Screen>({ kind: "loading" });
 
 async function boot(): Promise<Screen> {
