@@ -105,6 +105,8 @@ export class Tutor {
   private unsubscribe: () => void;
   private closed = false;
   private firstRunSent = false;
+  /** When the learner last wrote in the thread or on a page. */
+  private workedAt = 0;
   /** The turn in progress, for the tools. */
   private turnInfo: TurnInfo | null = null;
   /** Probes offered and not yet recorded, by unit id. */
@@ -173,7 +175,11 @@ export class Tutor {
     }
     const last = this.messages.at(-1)!;
     if (currentRun(this.store.state.runs)) return;
-    if (this.now() - last.ts > this.gap && !this.busy) this.kick("greeting");
+    if (this.now() - last.ts <= this.gap || this.busy) return;
+    // The tutor's last word came after a break with nothing from the learner since: it opened the
+    // last return, and its question still stands. Greet once, not on every open.
+    if (last.author === "tutor" && last.ts - this.workedAt > this.gap) return;
+    this.kick("greeting");
   }
 
   close(): void {
@@ -189,7 +195,9 @@ export class Tutor {
   // -------------------------------------------------------------------------------------------
 
   private index(e: MyelinEvent & { seq?: number }): ThreadMessage | null {
-    for (const m of marksOf(e)) addMark(this.marks, m);
+    const marks = marksOf(e);
+    for (const m of marks) addMark(this.marks, m);
+    if ((e.type === "message.added" || e.type === "page.edited") && marks.length > 0) this.workedAt = Math.max(this.workedAt, e.ts);
     if (e.type !== "message.added" || e.seq === undefined) return null;
     const p = e.payload;
     const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, anchor: p.anchor ?? null, timing: p.timing ?? null };

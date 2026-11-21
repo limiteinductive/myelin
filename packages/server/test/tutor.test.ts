@@ -273,6 +273,41 @@ describe("tutor", () => {
     a.stop();
   });
 
+  it("greets once per return: an unanswered greeting is not repeated, and a reply left unanswered is", async () => {
+    const day = 86_400_000;
+    const old = Date.now() - 3 * day;
+    const said = (ts: number, author: "tutor" | "learner", text: string) =>
+      makeEvent("message.added", { author, text }, { id: uuidv7(ts), device_id: author === "tutor" ? TUTOR_DEVICE : "dev", ts });
+    const thread = [
+      said(old, "tutor", FIRST_RUN_TEXT),
+      said(old + 1000, "learner", "Probability, for interviews"),
+      said(old + 2000, "tutor", "What is the expected value of one fair die?"),
+    ];
+    faux.setResponses([fauxAssistantMessage("Welcome back. What does linearity of expectation say?")]);
+
+    // Ada left a reply unanswered and comes back a day later: she is greeted.
+    const [ada] = await learner("ada");
+    srv.stores.get(ada.id).append(thread);
+    const a = new Device();
+    await a.login(ada);
+    await a.listen();
+    await until(() => a.messages().length === 4);
+    expect(faux.state.callCount).toBe(1);
+    a.stop();
+
+    // Bo was greeted a day ago and has not answered: opening again adds nothing.
+    const [bo] = await learner("bo");
+    srv.stores.get(bo.id).append([...thread.map((e) => ({ ...e, id: uuidv7(e.ts) })), said(old + day, "tutor", "Welcome back. What does linearity of expectation say?")]);
+    const b = new Device();
+    await b.login(bo);
+    await b.listen();
+    await until(() => b.ready);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(b.messages()).toHaveLength(4);
+    expect(faux.state.callCount).toBe(1);
+    b.stop();
+  });
+
   it("stays quiet when the model calls stay_quiet", async () => {
     const [, a] = await learner();
     await a.listen();
