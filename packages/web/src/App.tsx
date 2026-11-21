@@ -1,5 +1,5 @@
 // The whole app: the sign-in screen, or the thread with its composer, and at a desk a page beside it.
-import { applyRunEvent, clockText, currentRun, groupAsides, passageText, runLeft, type Anchor, type Aside, type PageState, type Run } from "@myelin/core";
+import { applyRunEvent, clockText, currentRun, groupAsides, passageText, runLeft, uuidv7, type Anchor, type Aside, type PageState, type Run } from "@myelin/core";
 import { watchActivity } from "./activity.js";
 import { createEffect, createMemo, createSignal, createStore, For, Match, onSettled, Show, Switch } from "solid-js";
 import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResult } from "./editor.js";
@@ -7,6 +7,7 @@ import { foldPages, pageFacts, pageStatus } from "./pages.js";
 import { draft, login, saveKey, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
 import { Body, inline, splitLead } from "./text.js";
 import { renderMathText } from "./math.js";
+import { inFence, insertFence } from "./fence.js";
 import { lineOf, markQuote, quoteText, type Quote } from "./quote.js";
 import { current, foldUnits, type UnitView } from "./units.js";
 import type { JSX } from "@solidjs/web";
@@ -16,6 +17,9 @@ export type Screen = { kind: "loading" } | { kind: "signin"; error?: string } | 
 /** Every button is an icon, named for screen readers by its aria-label (proposal 94). */
 const ICONS = {
   send: "M9 14V4M4.5 8.5 9 4l4.5 4.5",
+  plus: "M9 4v10M4 9h10",
+  code: "M6.5 5 3 9l3.5 4M11.5 5 15 9l-3.5 4",
+  page: "M4.75 2.75h5.5l3 3v9.5h-8.5zM10.25 2.75v3h3",
   close: "M4.5 4.5l9 9M13.5 4.5l-9 9",
   reword: "M11.5 3.5l3 3L6 15H3v-3zM9.5 5.5l3 3",
   done: "M3.75 9.5l3.5 3.5 7-7.5",
@@ -113,6 +117,8 @@ type Line = {
   anchor: Anchor | null;
   /** The passage of an earlier message this one replies to. */
   quote: Quote | null;
+  /** A page the learner opened with the plus button: no message, only its link. */
+  opened: boolean;
 };
 /** A message on its own, or a run of messages in one aside, shown as its passage and then the messages. */
 type Item = { id: string; kind: "line"; line: Line } | { id: string; kind: "aside"; aside: Aside; lines: Line[] };
@@ -220,23 +226,31 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     return editor?.scope() ?? null;
   });
 
-  const lines = createMemo<Line[]>(() =>
-    view.events
-      .filter((e) => e.type === "message.added")
-      .map((e) => {
-        const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null; quote?: Quote | null };
-        const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
-        const anchor = p.anchor ? { ...p.anchor } : null;
-        return { id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor, quote: p.quote ? { ...p.quote } : null };
-      }),
+  /** The thread in log order: its messages, and the pages the learner opened. */
+  const entries = createMemo<Line[]>(() =>
+    view.events.flatMap((e): Line[] => {
+      if (e.type === "page.created") {
+        const p = e.payload as { page_id: string; probe?: unknown };
+        // The tutor's pages are linked from its messages; a learner's page is linked where it was opened.
+        if (e.device_id.startsWith("server:") || e.device_id.startsWith("import:") || p.probe) return [];
+        return [{ id: e.id, author: "learner", text: "", ts: e.ts, trace: null, units: [], pages: [{ kind: "page", page_id: p.page_id }], timelines: [], tables: [], anchor: null, quote: null, opened: true }];
+      }
+      if (e.type !== "message.added") return [];
+      const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null; quote?: Quote | null };
+      const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
+      const anchor = p.anchor ? { ...p.anchor } : null;
+      return [{ id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor, quote: p.quote ? { ...p.quote } : null, opened: false }];
+    }),
   );
-  /** The lines with the tutor's reply in progress at the end, in the thread or in its aside. */
+  /** The messages alone. */
+  const lines = createMemo<Line[]>(() => entries().filter((l) => !l.opened));
+  /** The thread with the tutor's reply in progress at the end, in the thread or in its aside. */
   const allLines = createMemo<Line[]>(() => {
     const r = view.reply;
-    const ls = lines();
+    const ls = entries();
     if (!r) return ls;
     const anchor = r.anchor ? { ...r.anchor } : null;
-    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor, quote: null }];
+    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor, quote: null, opened: false }];
   });
   const asides = createMemo<Aside[]>(() => {
     pageTick();
@@ -365,6 +379,21 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
 
   // A page the tutor opens while the learner watches opens beside the thread at a desk.
   let liveFrom = -1;
+  /** A scratch page the learner asked for, opened once its event is folded, with the caret on it. */
+  let opening: string | null = null;
+  let writeIn: string | null = null;
+  const scratch = async () => {
+    if (!sync) return;
+    const page_id = uuidv7();
+    opening = page_id;
+    try {
+      await sync.append("page.created", { page_id, title: "Scratch", starter: null, probe: null });
+    } catch {
+      if (opening === page_id) opening = null;
+    }
+  };
+  /** The plus menu: a code block in the composer, and scratch work where pages can be edited. */
+  const plus = () => ({ page: phone() ? null : () => void scratch() });
 
   onSettled(() => {
     const s = new Sync(props.session);
@@ -382,6 +411,10 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         setPageTick((n) => n + 1);
       }
       let opened: string | null = null;
+      if (opening && pageMap[opening]) {
+        opened = writeIn = opening;
+        opening = null;
+      }
       if (s.ready && liveFrom < 0) liveFrom = s.events.length;
       for (; liveFrom >= 0 && liveFrom < s.events.length; liveFrom++) {
         const e = s.events[liveFrom]!;
@@ -396,7 +429,10 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         v.reply = s.reply ? { ...s.reply, anchor: s.reply.anchor ? { ...s.reply.anchor } : null } : null;
         v.notice = s.notice;
       });
-      if (opened && !phone()) openPage(opened);
+      if (opened && !phone()) {
+        stick = true;
+        openPage(opened);
+      }
       // A link to a page that is not in the log goes to the thread.
       const r = route();
       if (s.ready && r && !pageMap[r]) {
@@ -546,6 +582,10 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
   const bindEditor = (ed: PageEditor | null) => {
     editor = ed;
     setEdBound((n) => n + 1);
+    if (ed && writeIn && writeIn === shown()?.id) {
+      writeIn = null;
+      ed.focusEnd();
+    }
   };
   const editorChanged = () => {
     setEdTick((n) => n + 1);
@@ -745,7 +785,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
           </main>
         </div>
         <div class="myl-phone__foot app-foot">
-          <Show when={needsKey()} fallback={<Composer connected={view.connected} lost={view.lost} send={send} scope={quoteScope()} escape={() => aim(null)} />}>
+          <Show when={needsKey()} fallback={<Composer connected={view.connected} lost={view.lost} send={send} scope={quoteScope()} escape={() => aim(null)} plus={plus()} />}>
             <KeyComposer />
           </Show>
         </div>
@@ -832,6 +872,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                     scope={quote() ? quoteScope() : scopeText()}
                     placeholder="Type or dictate"
                     escape={() => (quote() ? aim(null) : editor?.dismissScope())}
+                    plus={plus()}
                   />
                 }
               >
@@ -1041,6 +1082,8 @@ function Composer(props: {
   escape?: () => void;
   /** For an API key: nothing is kept as a draft, and the browser neither suggests nor checks it. */
   secret?: boolean;
+  /** The plus button. Without `page`, where pages cannot be edited, it starts a code block. */
+  plus?: { page: (() => void) | null };
 }) {
   const kept = () => (props.secret ? "" : draft.get());
   const keep = (text: string) => {
@@ -1052,6 +1095,55 @@ function Composer(props: {
   let startedAt: number | null = null;
   let field!: HTMLTextAreaElement;
   let form!: HTMLFormElement;
+  let plusButton: HTMLButtonElement | undefined;
+  let menuEl: HTMLDivElement | undefined;
+  const [menu, setMenu] = createSignal(false);
+  const closeMenu = (refocus: boolean) => {
+    setMenu(false);
+    if (refocus) plusButton?.focus();
+  };
+
+  /** Starts a code block at the caret, around the selection if there is one. Undo takes it back. */
+  const code = () => {
+    setMenu(false);
+    field.focus();
+    const e = insertFence(field.value, field.selectionStart, field.selectionEnd);
+    field.setSelectionRange(e.from, e.to);
+    if (!document.execCommand("insertText", false, e.insert)) {
+      field.setRangeText(e.insert, e.from, e.to, "end");
+      field.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    field.setSelectionRange(e.caret, e.caret);
+  };
+  const onPlus = () => {
+    if (!props.plus?.page) return code();
+    if (menu()) return closeMenu(false);
+    setMenu(true);
+    requestAnimationFrame(() => menuEl?.querySelector<HTMLButtonElement>("button")?.focus());
+  };
+  const menuKeys = (e: KeyboardEvent) => {
+    const items = Array.from(menuEl?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+    const at = items.indexOf(document.activeElement as HTMLButtonElement);
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeMenu(true);
+    } else if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === "ArrowLeft" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const step = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : -1;
+      items[(at + step + items.length) % items.length]?.focus();
+    } else if (e.key === "Tab") closeMenu(false);
+  };
+  onSettled(() => {
+    // A press anywhere but the menu or the plus closes the menu.
+    const away = (e: PointerEvent) => {
+      if (!menu()) return;
+      const t = e.target as Node;
+      if (menuEl?.contains(t) || plusButton?.contains(t)) return;
+      setMenu(false);
+    };
+    document.addEventListener("pointerdown", away);
+    return () => document.removeEventListener("pointerdown", away);
+  });
 
   const grow = () => {
     field.style.height = "auto";
@@ -1090,7 +1182,39 @@ function Composer(props: {
           {props.scope}
         </div>
       </Show>
+      <Show when={menu()}>
+        <div class="app-plus-menu" role="menu" aria-label="Add" ref={menuEl} onKeyDown={menuKeys}>
+          <button type="button" role="menuitem" class="myl-icon-button" aria-label="Code block" onClick={code}>
+            <Icon name="code" />
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            class="myl-icon-button"
+            aria-label="Scratch page"
+            onClick={() => {
+              setMenu(false);
+              props.plus?.page?.();
+            }}
+          >
+            <Icon name="page" />
+          </button>
+        </div>
+      </Show>
       <div class="myl-composer__row">
+        <Show when={props.plus}>
+          <button
+            type="button"
+            ref={plusButton}
+            class="myl-icon-button app-plus"
+            aria-label={props.plus?.page ? "Add" : "Code block"}
+            aria-haspopup={props.plus?.page ? "menu" : undefined}
+            aria-expanded={props.plus?.page ? (menu() ? "true" : "false") : undefined}
+            onClick={onPlus}
+          >
+            <Icon name="plus" />
+          </button>
+        </Show>
         <textarea
           ref={field}
           class="myl-composer__field"
@@ -1107,7 +1231,13 @@ function Composer(props: {
             grow();
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !isTouch()) {
+            const code = inFence(field.value, field.selectionStart);
+            if (code && e.key === "Tab" && !e.shiftKey && field.selectionStart === field.selectionEnd) {
+              // Indenting code: four spaces. Outside a code block Tab moves on as usual.
+              e.preventDefault();
+              if (!document.execCommand("insertText", false, "    ")) field.setRangeText("    ", field.selectionStart, field.selectionEnd, "end");
+            } else if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !isTouch() && !(code && !(e.metaKey || e.ctrlKey))) {
+              // Inside a code block Enter starts a new line, and Cmd or Ctrl with Enter sends.
               e.preventDefault();
               form.requestSubmit();
             } else if (e.key === "Escape" && props.scope) {

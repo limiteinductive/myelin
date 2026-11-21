@@ -41,6 +41,11 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 .myl-composer { border-radius: calc(var(--target-min) / 2 + var(--space-1)); transition: border-color 120ms; }
 .myl-composer:focus-within { border-color: var(--annotation-edge); }
 .myl-composer__field { padding-inline: var(--space-3); }
+/* The plus sits on the left, level with Send; its menu opens above the composer. */
+.myl-composer { position: relative; }
+.app-plus + .myl-composer__field { padding-left: var(--space-1); }
+.app-plus[aria-expanded="true"] { color: var(--ink); background-color: color-mix(in srgb, currentColor 12%, transparent); }
+.app-plus-menu { position: absolute; z-index: 3; left: 0; bottom: calc(100% + var(--space-2)); display: flex; gap: var(--space-1); padding: var(--space-1); background: var(--surface); border: 1px solid var(--line); border-radius: calc(var(--target-min) / 2 + var(--space-1)); box-shadow: var(--elevation-panel); }
 .myl-send { transition: background-color 120ms, color 120ms; }
 /* Nothing to send is not something to act on, so it is not in accent. */
 .myl-send:disabled { background-color: var(--hover); color: var(--muted); }
