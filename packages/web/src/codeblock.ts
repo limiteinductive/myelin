@@ -51,8 +51,9 @@ export class CodeBlockView implements NodeView {
     if (run) {
       const b = document.createElement("button");
       b.type = "button";
-      b.className = "myl-text-button";
-      b.textContent = "Run page";
+      b.className = "myl-icon-button app-act";
+      b.setAttribute("aria-label", "Run page");
+      b.append(runIcon());
       b.addEventListener("mousedown", (e) => e.preventDefault());
       b.addEventListener("click", () => run());
       foot.append(b);
@@ -92,4 +93,17 @@ export class CodeBlockView implements NodeView {
 
 export function codeBlockView(run: (() => void) | null) {
   return (node: PMNode, _view: EditorView, _getPos: () => number | undefined, decorations: readonly Decoration[]) => new CodeBlockView(node, decorations, run);
+}
+
+/** Run page's icon, a triangle drawn like the app's other icons (proposal 94). */
+function runIcon(): SVGSVGElement {
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  for (const [k, v] of Object.entries({ "aria-hidden": "true", width: "18", height: "18", viewBox: "0 0 18 18", fill: "none", stroke: "currentColor", "stroke-width": "1.75", "stroke-linejoin": "round" })) {
+    svg.setAttribute(k, v);
+  }
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", "M5.5 4v10l8.5-5z");
+  svg.append(path);
+  return svg;
 }

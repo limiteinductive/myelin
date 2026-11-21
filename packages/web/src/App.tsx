@@ -11,9 +11,18 @@ import type { JSX } from "@solidjs/web";
 
 export type Screen = { kind: "loading" } | { kind: "signin"; error?: string } | { kind: "thread"; session: Me };
 
-const SendIcon = () => (
+/** Every button is an icon, named for screen readers by its aria-label (proposal 94). */
+const ICONS = {
+  send: "M9 14V4M4.5 8.5 9 4l4.5 4.5",
+  close: "M4.5 4.5l9 9M13.5 4.5l-9 9",
+  reword: "M11.5 3.5l3 3L6 15H3v-3zM9.5 5.5l3 3",
+  done: "M3.75 9.5l3.5 3.5 7-7.5",
+  open: "M7 4.5l4.5 4.5L7 13.5",
+} as const;
+
+const Icon = (props: { name: keyof typeof ICONS }) => (
   <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M9 14V4M4.5 8.5 9 4l4.5 4.5" />
+    <path d={ICONS[props.name]} />
   </svg>
 );
 
@@ -72,7 +81,7 @@ function SignIn(props: { error?: string | undefined; go: (s: Screen) => void }) 
             onInput={(e) => setEmpty(e.currentTarget.value.trim() === "")}
           />
           <button type="submit" class="myl-send" aria-label="Sign in" disabled={empty() || busy()}>
-            <SendIcon />
+            <Icon name="send" />
           </button>
         </div>
       </form>
@@ -709,15 +718,16 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
           <article class="myl-page app-page" ref={article}>
             <div class="myl-page__bar">
               <a
-                class="myl-text-button"
+                class="myl-icon-button"
                 href="/"
+                aria-label="Back to the thread"
                 onClick={(e) => {
                   if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
                   e.preventDefault();
                   openPage(null);
                 }}
               >
-                Thread
+                <Icon name="close" />
               </a>
               <Clock />
             </div>
@@ -786,9 +796,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
             <article class="myl-page">
               <div class="myl-page__bar">
                 <button type="button" class="myl-icon-button" aria-label="Back to the thread" onClick={() => openPage(null)}>
-                  <svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-                    <path d="M4.5 4.5l9 9M13.5 4.5l-9 9" />
-                  </svg>
+                  <Icon name="close" />
                 </button>
                 <Clock />
               </div>
@@ -957,7 +965,9 @@ function PageLink(props: { page: PageState; status: string; facts: string; open:
         <span class="myl-pagelink__title">{props.page.title}</span>
         <span class="myl-trace">{props.facts}</span>
       </span>
-      <span class="myl-pagelink__open">Open</span>
+      <span class="myl-pagelink__open">
+        <Icon name="open" />
+      </span>
     </a>
   );
 }
@@ -1048,7 +1058,7 @@ function Composer(props: {
           }}
         />
         <button type="submit" class="myl-send" aria-label="Send" disabled={empty() || sending() || !props.connected}>
-          <SendIcon />
+          <Icon name="send" />
         </button>
       </div>
     </form>
@@ -1104,7 +1114,20 @@ function Unit(props: { card: UnitCard; unit: () => UnitView; reword: (id: string
   return (
     <aside class={{ "myl-unit": true, "myl-unit--noted": noted() }} aria-label={noted() ? "Unit noted" : "Unit found"}>
       <div class="myl-unit__body">
-        <span class="myl-unit__label">{label()}</span>
+        <div class="app-unit-head">
+          <span class="myl-unit__label">{label()}</span>
+          <Show when={!noted()}>
+            <button
+              type="button"
+              class="myl-icon-button app-act"
+              aria-label={editing() ? "Done" : "Reword"}
+              onMouseDown={(e) => editing() && e.preventDefault()}
+              onClick={() => (editing() ? void finish(true) : start())}
+            >
+              <Icon name={editing() ? "done" : "reword"} />
+            </button>
+          </Show>
+        </div>
         <span
           ref={statement}
           class={{ "myl-unit__statement": true, "app-editing": editing() }}
@@ -1125,11 +1148,6 @@ function Unit(props: { card: UnitCard; unit: () => UnitView; reword: (id: string
         />
         <Show when={props.card.note}>{(n) => <span class="myl-unit__note">{n()}</span>}</Show>
       </div>
-      <Show when={!noted()}>
-        <button type="button" class="myl-text-button" onMouseDown={(e) => editing() && e.preventDefault()} onClick={() => (editing() ? void finish(true) : start())}>
-          {editing() ? "Done" : "Reword"}
-        </button>
-      </Show>
     </aside>
   );
 }

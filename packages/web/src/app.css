@@ -1,18 +1,53 @@
-/* Layout only. Every colour, space and font comes from the tokens. */
+/* Layout, and refinements to the myl- components. Every colour, space and font comes from the tokens. */
 html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 .app-phone { height: 100dvh; }
 .app-phone > .myl-phone__scroll { overscroll-behavior: contain; padding-top: var(--space-6); }
-.app-phone > .myl-phone__scroll > .myl-thread { padding-bottom: var(--space-4); }
+.app-phone > .myl-phone__scroll > .myl-thread { padding-bottom: var(--space-6); }
 .app-clockbar { display: flex; justify-content: flex-end; box-sizing: border-box; width: 100%; max-width: calc(var(--reading-width) + 2 * var(--space-4)); margin-inline: auto; padding: var(--space-3) var(--space-4) 0; }
 .app-timeline { margin-block: var(--space-2); }
 .app-units { margin-block: var(--space-2); }
-.app-foot { padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom)); }
+.app-foot { position: relative; padding-bottom: calc(var(--space-4) + env(safe-area-inset-bottom)); }
+/* The thread fades out above the composer rather than being cut off. */
+.app-foot::before { content: ""; position: absolute; left: 0; right: 0; bottom: 100%; height: var(--space-6); background: linear-gradient(transparent, var(--paper)); pointer-events: none; }
 .app-foot > .myl-composer { box-sizing: border-box; width: 100%; max-width: var(--reading-width); margin-inline: auto; }
 .app-foot .myl-composer__field { overflow-y: auto; }
 .app-warning { color: var(--warning); }
 .app-code { padding: 0.1em 0.3em; border-radius: var(--radius-control); background: var(--code-surface); font: 400 0.88em/1 var(--font-mono); }
 .myl-message .myl-code pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 .app-editing { outline: none; border-bottom: 1px solid var(--accent); cursor: text; }
+
+/* ---------- controls: every button is an icon (proposal 94) ---------- */
+/* The hit area stays target-min; what shows on hover is a 32px chip tinted with the icon's own colour. */
+.myl-icon-button { border: 6px solid transparent; border-radius: calc(var(--radius-control) + 6px); background-clip: padding-box; text-decoration: none; }
+.myl-icon-button:hover { background-color: color-mix(in srgb, currentColor 12%, transparent); }
+.myl-icon-button:disabled { color: var(--muted); background-color: transparent; cursor: default; }
+/* A button that does something to the learner's work is in accent; one that only moves around stays muted. */
+.myl-icon-button.app-act { color: var(--accent); }
+
+/* A unit: Reword sits on the label's line, so the statement keeps the card's full width. */
+.myl-unit { display: block; padding: var(--space-3) var(--space-4); }
+.myl-unit__body { padding-right: 0; }
+.app-unit-head { display: flex; align-items: flex-start; gap: var(--space-2); }
+.app-unit-head > .myl-unit__label { flex: 1; min-width: 0; }
+/* Centred on the label's 16px line, and as far from the card's right edge as from its top, so it sits square in the corner. */
+.app-unit-head > .myl-icon-button { margin: calc((16px - var(--target-min)) / 2) calc(var(--space-3) + 8px - var(--space-4) - var(--target-min) / 2) calc((16px - var(--target-min)) / 2) 0; }
+
+/* A page link: the whole card is the link, with a chevron on its right. */
+.myl-pagelink { flex-wrap: nowrap; }
+.myl-pagelink__open { display: flex; flex: none; color: var(--accent); transition: transform 120ms ease-out; }
+.myl-pagelink:hover .myl-pagelink__open { transform: translateX(2px); }
+
+/* The composer: its corners are concentric with the send button's. */
+.myl-composer { border-radius: calc(var(--target-min) / 2 + var(--space-1)); transition: border-color 120ms; }
+.myl-composer:focus-within { border-color: var(--annotation-edge); }
+.myl-composer__field { padding-inline: var(--space-3); }
+.myl-send { transition: background-color 120ms, color 120ms; }
+/* Nothing to send is not something to act on, so it is not in accent. */
+.myl-send:disabled { background-color: var(--hover); color: var(--muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  .myl-pagelink__open, .myl-composer, .myl-send { transition: none; }
+}
 
 /* The tutor is working on a reply and has written nothing yet. Shown after a moment, so a quick reply does not flicker. */
 .app-thinking { display: flex; align-items: center; gap: var(--space-1); height: 1lh; animation: app-fade 220ms ease-out 400ms both; }
