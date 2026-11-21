@@ -221,7 +221,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
   const allLines = createMemo<Line[]>(() => {
     const r = view.reply;
     const ls = lines();
-    if (!r || !r.text) return ls;
+    if (!r) return ls;
     const anchor = r.anchor ? { ...r.anchor } : null;
     return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor }];
   });
@@ -541,6 +541,16 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     }
   };
 
+  /** The reply in progress has no words yet: the tutor is thinking or using its tools. */
+  const thinking = (id: string) => view.reply?.id === id && !view.reply.text;
+  const Thinking = () => (
+    <div class="app-thinking" role="img" aria-label="The tutor is thinking">
+      <span />
+      <span />
+      <span />
+    </div>
+  );
+
   const Who = (p: { author: "learner" | "tutor" }) => (
     <span class={{ "myl-aside__who": true, "myl-aside__who--tutor": p.author === "tutor" }}>{p.author === "tutor" ? "Tutor" : "You"}</span>
   );
@@ -552,7 +562,9 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         {(m) => (
           <div class="myl-aside__message">
             <Who author={m().author} />
-            <Body text={m().text} />
+            <Show when={!thinking(m().id)} fallback={<Thinking />}>
+              <Body text={m().text} />
+            </Show>
           </div>
         )}
       </For>
@@ -612,6 +624,11 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                               when={split()}
                               fallback={
                                 <>
+                                  <Show when={thinking(line().id)}>
+                                    <article class={{ "myl-message": true, "myl-turn": turn() }}>
+                                      <Thinking />
+                                    </article>
+                                  </Show>
                                   <Show when={line().text.trim() || line().trace}>
                                     <article class={{ "myl-message": true, "myl-message--learner": line().author === "learner", "myl-turn": turn() }}>
                                       <Body text={line().text} />
@@ -713,10 +730,12 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
               <For each={recent()} keyed={(l) => l.id}>
                 {(l) => (
                   <>
-                    <Show when={l().text.trim()}>
+                    <Show when={l().text.trim() || thinking(l().id)}>
                       <div class="myl-aside__message">
                         <Who author={l().author} />
-                        <Body text={l().text} />
+                        <Show when={!thinking(l().id)} fallback={<Thinking />}>
+                          <Body text={l().text} />
+                        </Show>
                       </div>
                     </Show>
                     <Extras line={l()} />

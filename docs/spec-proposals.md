@@ -295,3 +295,8 @@ Places where the code differs from `docs/spec.md` or settles something the spec 
 
 92. **`myelin backup` and `myelin restore` are not built.** The CLI table lists them, but no milestone does. Until they are, a learner's file can be copied out of the `myelin-data` volume by hand.
     *Spec change:* none, unless you want them added to a milestone.
+
+## After milestone 9
+
+93. **Three dots while the tutor works on a reply and has written nothing yet.** You asked for feedback while the model thinks: with a thinking model, several seconds pass before the first word, and the thread looked stuck. `design/README.md` and `design/components/Message/README.md` say there is no typing indicator. In the tutor's place, three small dots in `muted` pulse from the moment the server starts a reply until its first word replaces them, in the thread, in an aside, or in the thread card beside a page. They appear only after 400ms, so a quick reply does not flicker, and they hold still when the device asks for reduced motion. The observer's unasked looks show no dots, so the quiet observer stays quiet.
+    *Design change:* in "Motion" and in Message's rules, "Until the first word arrives, three muted dots pulse where the reply will be. There is no typing effect."
