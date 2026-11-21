@@ -349,6 +349,60 @@ describe("tutor", () => {
     a.stop();
   });
 
+  it("records what a derived unit rests on, reusing recorded units and adding the rest without cards", async () => {
+    const [, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("find_unit", { text: "Variance is the mean squared distance from the mean", kind: "definition", origin: "told" }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Noted. Now expand the square."),
+    ]);
+    await a.say("what is variance again?");
+    await until(() => a.messages().length === 3);
+    const variance = a.of("unit.found")[0]!.payload.unit_id;
+    faux.setResponses([
+      fauxAssistantMessage(
+        fauxToolCall("find_unit", {
+          text: "$E[X^2] = \\mathrm{Var}(X) + E[X]^2$",
+          kind: "result",
+          origin: "derived",
+          basics: [
+            { text: "variance is the mean squared distance from the mean.", kind: "definition" },
+            { text: "Expectation is linear", kind: "result" },
+          ],
+        }),
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("Right. Use it on the next one."),
+    ]);
+    await a.say("so E[X^2] = Var(X) + E[X]^2");
+    await until(() => a.messages().length === 5);
+    const found = a.of("unit.found");
+    expect(found).toHaveLength(3);
+    const linearity = found[1]!.payload;
+    expect(linearity).toMatchObject({ text: "Expectation is linear", kind: "result", origin: "used", rests_on: [], told: false });
+    const result = found[2]!.payload;
+    expect(result.rests_on).toEqual([variance, linearity.unit_id]);
+    // Only the derived unit gets a card, and it names what it rests on.
+    expect(a.messages()[4]!.cards).toEqual([
+      { kind: "unit", unit_id: result.unit_id, how: "Found", note: "It rests on Variance is the mean squared distance from the mean; Expectation is linear." },
+    ]);
+
+    // An arbitrary-looking unit is linked later the same way.
+    faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("revise_unit", { unit_id: variance, action: "link", basics: [{ text: "Expectation is linear", kind: "result" }, { text: "The mean is E[X]", kind: "definition" }] }), { stopReason: "toolUse" }),
+      fauxAssistantMessage("Linked."),
+    ]);
+    await a.say("link it");
+    await until(() => a.messages().length === 7);
+    const linked = a.of("unit.linked").at(-1)!.payload;
+    expect(linked.unit_id).toBe(variance);
+    expect(linked.rests_on).toHaveLength(2);
+    expect(linked.rests_on[0]).toBe(linearity.unit_id);
+    expect(a.of("unit.found")).toHaveLength(4);
+    a.stop();
+  });
+
   it("asks on Tuesday for a unit found on Monday, with no queue involved", async () => {
     const [u, a] = await learner();
     await a.listen();

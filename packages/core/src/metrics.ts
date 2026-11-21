@@ -155,7 +155,7 @@ export function metrics(events: readonly MyelinEvent[], state: State, now: numbe
     return w;
   };
   for (const s of activeByActivity(events, now)) week(s.at).active_ms[s.activity] += s.ms;
-  for (const e of events) if (e.type === "unit.found" && e.payload.origin !== "imported") week(e.ts).units_found++;
+  for (const e of events) if (e.type === "unit.found" && e.payload.origin !== "imported" && e.payload.origin !== "used") week(e.ts).units_found++;
   for (const u of uses) {
     const w = week(u.at);
     w.use.probes++;

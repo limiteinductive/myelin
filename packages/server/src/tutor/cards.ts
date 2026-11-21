@@ -33,6 +33,7 @@ const HOW: Record<Origin, string> = {
   told: "told",
   observed: "in your work",
   imported: "imported",
+  used: "as something a later unit rests on",
 };
 
 /** The depths that apply to a unit: explain and rebuild only to what rests on something. */

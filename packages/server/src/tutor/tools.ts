@@ -267,6 +267,34 @@ function duplicateOf(state: State, text: string): Unit | undefined {
   return Object.values(state.units).find((u) => (u.status === "active" || u.status === "retired") && norm(u.text) === t);
 }
 
+/** What a unit rests on that is not recorded yet, as the tutor names it. */
+const Basics = Type.Optional(
+  Type.Array(
+    Type.Object({
+      text: Type.String({ description: "One sentence, such as the definition it unpacks or a result it applies" }),
+      kind: Type.String({ description: "Its kind, such as definition, result or move" }),
+    }),
+    {
+      description:
+        "What it can be rebuilt from that is not recorded yet. Each is recorded as its own unit resting on nothing, without a card, or matched to a unit already recorded with the same text",
+    },
+  ),
+);
+
+/** Records the basics a unit rests on, reusing any already recorded; returns their ids. */
+function recordBasics(host: ToolHost, basics: readonly { text: string; kind: string }[], topic: string | null): string[] {
+  const ids: string[] = [];
+  for (const b of basics) {
+    const text = b.text.trim();
+    if (!text) continue;
+    const dup = duplicateOf(host.state, text);
+    const unit_id = dup?.id ?? uuidv7(host.now());
+    if (!dup) host.append("unit.found", { unit_id, text, kind: b.kind.trim() || "unit", topic, rests_on: [], origin: "used", told: false, observe_only: false, message_id: host.turn().replyId });
+    if (!ids.includes(unit_id)) ids.push(unit_id);
+  }
+  return ids;
+}
+
 /** The card's sub-line: where the unit came from, then what it rests on. */
 export function unitNote(state: State, u: { rests_on: string[]; told: boolean }, note: string | undefined): string {
   let rests: string;
@@ -370,7 +398,12 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
       origin: StringEnum(ORIGINS, {
         description: "hint: a hint unblocked them. derived: they derived or explained it. error: a miss revealed it. need: the work needed it and they lacked it. told: they were told it. observed: a habit seen in their work",
       }),
-      rests_on: Type.Optional(Type.Array(Type.String(), { description: "Ids of units it can be rebuilt from. Leave empty if it is arbitrary" })),
+      rests_on: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Ids of recorded units it can be rebuilt from. Leave this and basics empty only if it is arbitrary: a word, a notation, a definition, a convention or a seed move",
+        }),
+      ),
+      basics: Basics,
       topic: Type.Optional(Type.String({ description: "A short lowercase topic label. Defaults to the active goal's topic" })),
       told: Type.Optional(Type.Boolean({ description: "True when they were told it rather than producing it" })),
       observe_only: Type.Optional(Type.Boolean({ description: "True for a reflex: evidence only from watching their work, never asked" })),
@@ -382,19 +415,20 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
       if (!text) return ok("A unit needs text.");
       const dup = duplicateOf(s, text);
       if (dup) return ok(`That is already unit ${dup.id} (${dup.kind}): ${dup.text}. Use revise_unit to change it.`);
-      const rests = resolveIds(s, p.rests_on ?? []);
-      if (typeof rests === "string") return ok(rests);
+      const linked = resolveIds(s, p.rests_on ?? []);
+      if (typeof linked === "string") return ok(linked);
       const goals = Object.values(s.goals).filter((g) => g.active && g.topic);
       const topic = p.topic?.trim().toLowerCase() || (goals.length === 1 ? goals[0]!.topic : null);
       const told = p.told ?? p.origin === "told";
       const observe_only = p.observe_only ?? false;
+      const rests = [...new Set([...linked, ...recordBasics(host, (p.basics ?? []).filter((b) => norm(b.text) !== norm(text)), topic)])];
       const unit_id = uuidv7(host.now());
       const turn = host.turn();
       host.append("unit.found", { unit_id, text, kind: p.kind.trim() || "unit", topic, rests_on: rests, origin: p.origin, told, observe_only, message_id: turn.replyId });
       // A reflex is raised in a debrief, not announced mid-work.
       if (!observe_only) {
         const how = told && rests.length > 0 ? "Noted" : p.origin === "error" ? "Found by this miss" : "Found";
-        turn.cards.push({ kind: "unit", unit_id, how, note: unitNote(s, { rests_on: rests, told }, p.note) });
+        turn.cards.push({ kind: "unit", unit_id, how, note: unitNote(host.state, { rests_on: rests, told }, p.note) });
       }
       const gate = told && rests.length > 0 ? " It is told and rebuildable, so it is probed only by rebuilding until rebuilt once." : "";
       return ok(`Unit recorded (unit_id ${unit_id}).${observe_only ? " It is observe-only and gets no card." : " The card is shown under your reply."}${gate}`);
@@ -405,14 +439,15 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
     name: "revise_unit",
     label: "Revise unit",
     description:
-      "Changes a unit: reword it (text and/or kind), link it (replace what it rests on), split it into parts that fail differently, merge others into it, or retire it. " +
+      "Changes a unit: reword it (text and/or kind), link it (replace what it rests on: recorded units by id, unrecorded ones as basics), split it into parts that fail differently, merge others into it, or retire it. " +
       "Use it when the learner asks, or when the evidence shows the unit was the wrong size.",
     parameters: Type.Object({
       unit_id: Type.String({ description: "The unit to change" }),
       action: StringEnum(["reword", "link", "split", "merge", "retire"] as const, { description: "What to do" }),
       text: Type.Optional(Type.String({ description: "reword: the new sentence. merge: the merged unit's sentence, if it changes" })),
       kind: Type.Optional(Type.String({ description: "reword: a new kind label" })),
-      rests_on: Type.Optional(Type.Array(Type.String(), { description: "link: the ids it rests on now (replaces the old list)" })),
+      rests_on: Type.Optional(Type.Array(Type.String(), { description: "link: the ids of recorded units it rests on now (replaces the old list)" })),
+      basics: Basics,
       parts: Type.Optional(
         Type.Array(
           Type.Object({
@@ -439,9 +474,10 @@ export function tutorTools(host: ToolHost): ToolDefinition[] {
           return ok(`Unit ${u.id} reworded.`);
         }
         case "link": {
-          const rests = resolveIds(s, p.rests_on ?? []);
-          if (typeof rests === "string") return ok(rests);
-          if (rests.includes(u.id)) return ok("A unit cannot rest on itself.");
+          const linked = resolveIds(s, p.rests_on ?? []);
+          if (typeof linked === "string") return ok(linked);
+          if (linked.includes(u.id) || (p.basics ?? []).some((b) => norm(b.text) === norm(u.text))) return ok("A unit cannot rest on itself.");
+          const rests = [...new Set([...linked, ...recordBasics(host, p.basics ?? [], u.topic)])];
           host.append("unit.linked", { unit_id: u.id, rests_on: rests });
           return ok(rests.length ? `Unit ${u.id} now rests on ${rests.join(", ")}.` : `Unit ${u.id} is now arbitrary.`);
         }

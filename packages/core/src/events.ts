@@ -19,7 +19,8 @@ export const SlotKind = z.enum(["in_context", "greeting", "seam", "timed_run"]);
 export type SlotKind = z.infer<typeof SlotKind>;
 
 /** How a unit was found (spec: "How units are found"). */
-export const Origin = z.enum(["hint", "derived", "error", "need", "told", "observed", "imported"]);
+/** "used" marks a unit the learner already had, recorded because a found unit rests on it. */
+export const Origin = z.enum(["hint", "derived", "error", "need", "told", "observed", "imported", "used"]);
 export type Origin = z.infer<typeof Origin>;
 
 const UnitSpec = z.object({
