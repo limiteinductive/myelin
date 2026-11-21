@@ -44,3 +44,16 @@ export function mathElement(tex: string, display: boolean): HTMLElement {
   el.innerHTML = mathHtml(tex, display);
   return el;
 }
+
+/** Sets an element's content to text with its math rendered, for a view whose DOM is managed by hand. */
+export function renderMathText(el: HTMLElement, text: string): void {
+  const nodes: Node[] = [];
+  let at = 0;
+  for (const s of mathSpans(text)) {
+    if (s.from > at) nodes.push(document.createTextNode(text.slice(at, s.from)));
+    nodes.push(mathElement(s.tex, s.display));
+    at = s.to;
+  }
+  if (at < text.length) nodes.push(document.createTextNode(text.slice(at)));
+  el.replaceChildren(...nodes);
+}

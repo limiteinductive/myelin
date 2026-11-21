@@ -6,6 +6,7 @@ import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResu
 import { foldPages, pageFacts, pageStatus } from "./pages.js";
 import { draft, login, saveKey, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
 import { Body, inline, splitLead } from "./text.js";
+import { renderMathText } from "./math.js";
 import { lineOf, markQuote, quoteText, type Quote } from "./quote.js";
 import { current, foldUnits, type UnitView } from "./units.js";
 import type { JSX } from "@solidjs/web";
@@ -1132,20 +1133,28 @@ function Unit(props: { card: UnitCard; unit: () => UnitView; reword: (id: string
   let statement!: HTMLSpanElement;
   const noted = () => props.card.how === "Noted";
   const label = () => `${props.card.how} · ${props.unit().kind}${noted() ? ", told" : ""}`;
-  // The statement is set by hand, not rendered, so the browser's editing never fights the renderer.
+  // The statement is set by hand, not by Solid, so the browser's editing never fights the renderer:
+  // its math is rendered while it is read, and its source is shown while it is reworded.
   // A saved wording shows until the event carrying it arrives.
   let pending: string | null = null;
   let seen: string | null = null;
+  let rendered: string | null = null;
+  const show = (text: string) => {
+    rendered = text;
+    renderMathText(statement, text);
+  };
   createEffect(
     () => [props.unit().text, editing()] as const,
     ([text, busy]) => {
       if (text !== seen) [seen, pending] = [text, null];
       const shown = pending ?? text;
-      if (!busy && statement.textContent !== shown) statement.textContent = shown;
+      if (!busy && rendered !== shown) show(shown);
     },
   );
 
   const start = () => {
+    statement.textContent = pending ?? props.unit().text;
+    rendered = null;
     setEditing(true);
     requestAnimationFrame(() => {
       statement.focus();
@@ -1165,7 +1174,7 @@ function Unit(props: { card: UnitCard; unit: () => UnitView; reword: (id: string
     setEditing(false);
     if (save && !(await props.reword(u.id, text))) {
       pending = null;
-      statement.textContent = props.unit().text;
+      show(props.unit().text);
     }
   };
 
