@@ -30,7 +30,8 @@ import {
   type AgentSession,
   type CreateAgentSessionOptions,
 } from "@earendil-works/pi-coding-agent";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model } from "@earendil-works/pi-ai";
+import type { Files } from "../files.js";
 import type { Sandbox } from "../sandbox.js";
 import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
@@ -80,6 +81,8 @@ export interface TutorOptions {
   triageModel?: ModelSource;
   /** Runs code for run_code. Without it the tool says code does not run here. */
   sandbox?: Sandbox | undefined;
+  /** Where the learner's photos are kept. Without it a photo reaches the tutor only as a mention. */
+  files?: Files | undefined;
 }
 
 const APP_NOTE = `
@@ -200,7 +203,9 @@ export class Tutor {
     if ((e.type === "message.added" || e.type === "page.edited") && marks.length > 0) this.workedAt = Math.max(this.workedAt, e.ts);
     if (e.type !== "message.added" || e.seq === undefined) return null;
     const p = e.payload;
+    const photos = p.cards.filter((c) => c.kind === "photo" && typeof c.file === "string").map((c) => ({ file: c.file as string, mime: String(c.mime) }));
     const m: ThreadMessage = { id: e.id, seq: e.seq, ts: e.ts, author: p.author, text: p.text, anchor: p.anchor ?? null, quote: p.quote ?? null, timing: p.timing ?? null };
+    if (photos.length > 0) m.photos = photos;
     this.messages.push(m);
     if (e.device_id === STUDY_MODE_DEVICE) this.imported.add(e.id);
     return m;
@@ -307,8 +312,8 @@ export class Tutor {
     const asked = this.unanswered();
     const out = this.runsOut.splice(0).map((id) => this.store.state.runs[id]!).filter(Boolean);
     if (asked.length === 0 && out.length === 0 && !triggers.has("greeting")) return;
-    // While a page is being worked on, a message in the thread may be the learner thinking aloud.
-    if (asked.length > 0 && out.length === 0 && !triggers.has("greeting") && asked.every((m) => !m.anchor)) {
+    // While a page is being worked on, a message in the thread may be the learner thinking aloud. A photo is always sent to be looked at.
+    if (asked.length > 0 && out.length === 0 && !triggers.has("greeting") && asked.every((m) => !m.anchor && !m.photos)) {
       const page = this.workingPage(now);
       if (page && (await this.thinkingAloud(page, asked))) return;
     }
@@ -318,9 +323,17 @@ export class Tutor {
     const debrief = out.map(
       (r) => `[app: the timed run's clock reached zero. Tell them time is up in a few words, then debrief.]\n\n${runReport(r, events, now)}\n\n[app: ${DEBRIEF}]`,
     );
+    const sees = session.model?.input.includes("image") ?? false;
+    const images: ImageContent[] = [];
     let prompt: string;
     if (asked.length > 0) {
-      prompt = asked.map((m) => (m.anchor ? `[app: this is in an aside ${anchorLabel(state, m.anchor)}]\n${m.text}` : m.quote ? `${this.quoteNote(m.quote)}\n${m.text}` : m.text)).join("\n\n");
+      prompt = asked
+        .map((m) => {
+          const text = m.anchor ? `[app: this is in an aside ${anchorLabel(state, m.anchor)}]\n${m.text}` : m.quote ? `${this.quoteNote(m.quote)}\n${m.text}` : m.text;
+          const photo = this.photoNote(m, sees, images);
+          return photo ? `${photo}\n${text}`.trimEnd() : text;
+        })
+        .join("\n\n");
       if (debrief.length > 0) prompt = `${debrief.join("\n\n")}\n\n[app: the learner wrote, as time ran out:]\n${prompt}`;
     } else if (debrief.length > 0) {
       prompt = debrief.join("\n\n");
@@ -364,7 +377,7 @@ export class Tutor {
 
     let error: string | null = null;
     try {
-      await session.prompt(prompt);
+      await session.prompt(prompt, images.length > 0 ? { images } : undefined);
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -391,6 +404,18 @@ export class Tutor {
     const text = draft.text.trim();
     if (text || info.cards.length > 0) this.post(draft.id, text, info.cards, anchor);
     this.emit({ id: draft.id, text, done: true, anchor });
+  }
+
+  /** What the app says about a message's photos, adding the ones the model can see to `images`. */
+  private photoNote(m: ThreadMessage, sees: boolean, images: ImageContent[]): string | null {
+    if (!m.photos) return null;
+    const kept = sees && this.opts.files ? m.photos.map((p) => this.opts.files!.get(this.userId, p.file)).filter((f) => f !== null) : [];
+    for (const f of kept) images.push({ type: "image", data: f.bytes.toString("base64"), mimeType: f.mime });
+    const n = m.photos.length;
+    const what = n === 1 ? "a photo" : `${n} photos`;
+    if (!sees) return `[app: they sent ${what} of their work, but you cannot see images here. Tell them so in a few words and ask them to type out the part that matters.]`;
+    if (kept.length < n) return `[app: they sent ${what} of their work, and ${kept.length === 0 ? "none" : `only ${kept.length}`} could be loaded. Tell them so in a few words and ask them to send it again.]`;
+    return `[app: they sent ${what} of their work, attached in order. Where something cannot be read, say which part rather than guessing.]`;
   }
 
   /** The session for this sitting. A new sitting starts after a long enough break. */

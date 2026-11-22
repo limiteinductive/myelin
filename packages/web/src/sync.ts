@@ -59,6 +59,12 @@ export async function saveKey(key: string): Promise<void> {
   await json<{ needs_key: null }>(r);
 }
 
+/** Keeps a photo on the server and returns its hash, which a message then names. Throws a SendError if it is refused. */
+export async function uploadPhoto(mime: string, data: string): Promise<{ id: string; mime: string }> {
+  const r = await fetch("/api/files", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ mime, data }) });
+  return json<{ id: string; mime: string }>(r);
+}
+
 type Listener = () => void;
 
 export class Sync {

@@ -1,6 +1,7 @@
 import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
+import { Files } from "./files.js";
 import { Registry } from "./registry.js";
 import { Sandbox, type SandboxOptions } from "./sandbox.js";
 import { Stores } from "./stores.js";
@@ -34,8 +35,9 @@ export async function startServer({ port = 4317, host = "127.0.0.1", dataDir, we
   const stores = new Stores(dataDir);
   stores.watch();
   const sandbox = box === false ? undefined : new Sandbox(box ?? {});
-  const tutors = tutor ? new Tutors(stores, { sandbox, ...tutor }, (id) => registry.user(id)?.name ?? "the learner") : undefined;
-  const app = createApp({ registry, stores, webRoot, tutors, sandbox, keys });
+  const files = new Files(dataDir);
+  const tutors = tutor ? new Tutors(stores, { sandbox, files, ...tutor }, (id) => registry.user(id)?.name ?? "the learner") : undefined;
+  const app = createApp({ registry, stores, webRoot, tutors, sandbox, keys, files });
   const { server, address } = await new Promise<{ server: Server; address: { port: number } }>((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port, hostname: host }, (info) => resolve({ server: s as Server, address: info }));
     (s as Server).once("error", reject);

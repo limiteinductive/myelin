@@ -3,11 +3,12 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { codeBlocks, EventError, makeEvent, uuidv7 } from "@myelin/core";
+import { codeBlocks, EventError, makeEvent, PhotoCard, uuidv7 } from "@myelin/core";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { streamSSE } from "hono/streaming";
+import { FileError, type Files } from "./files.js";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
 import type { Sandbox } from "./sandbox.js";
 import { ConflictError, StaleError, type Appended } from "./store.js";
@@ -31,6 +32,8 @@ export interface AppOptions {
   sandbox?: Sandbox | undefined;
   /** Whose model key each tutor uses. With it a friend is asked for their own key. */
   keys?: ModelKeys | undefined;
+  /** Where photos are kept. Without it a photo is refused. */
+  files?: Files | undefined;
 }
 
 /** The device recorded on a page.ran event: the server ran the code. */
@@ -58,9 +61,23 @@ export function clientMayWrite(e: { type?: unknown; payload?: unknown }): boolea
   }
 }
 
+/** Why a learner's message names a photo the server cannot show, or null if every photo is kept. */
+export function missingPhoto(e: { type?: unknown; payload?: unknown }, kept: (id: string, mime: PhotoCard["mime"]) => boolean): string | null {
+  if (e.type !== "message.added") return null;
+  const cards = (e.payload as { cards?: unknown } | null)?.cards;
+  if (!Array.isArray(cards)) return null;
+  for (const card of cards) {
+    if ((card as { kind?: unknown } | null)?.kind !== "photo") continue;
+    const p = PhotoCard.safeParse(card);
+    // A malformed card is refused by the event schema with its own reason.
+    if (p.success && !kept(p.data.file, p.data.mime)) return "send the photo before the message that shows it";
+  }
+  return null;
+}
+
 const isHttps = (c: Context) => (c.req.header("x-forwarded-proto") ?? new URL(c.req.url).protocol.replace(":", "")) === "https";
 
-export function createApp({ registry, stores, webRoot, tutors, sandbox, keys }: AppOptions): Hono<Env> {
+export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, files }: AppOptions): Hono<Env> {
   const app = new Hono<Env>();
   // The provider whose key the learner must paste before the tutor answers, or null.
   const needsKey = (userId: string) => (tutors && keys ? keys.needed(userId) : null);
@@ -152,6 +169,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys }: 
       const ev = e as { device_id?: unknown; type?: unknown };
       if (ev.device_id !== device.id) return c.json({ error: `event ${i}: device_id must be this device` }, 400);
       if (!clientMayWrite(ev)) return c.json({ error: `event ${i}: a device may not append ${String(ev.type)}` }, 403);
+      const missing = missingPhoto(e as { type?: unknown; payload?: unknown }, (id, mime) => files?.has(user.id, id, mime) ?? false);
+      if (missing) return c.json({ error: `event ${i}: ${missing}` }, 400);
     }
     try {
       return c.json({ results: stores.get(user.id).append(events) });
@@ -161,6 +180,33 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys }: 
       if (e instanceof EventError) return c.json({ error: e.message }, 400);
       throw e;
     }
+  });
+
+  // A photo of the learner's work. It is kept first, then named by hash in the message that sends it.
+  app.post("/api/files", async (c) => {
+    if (!files) return c.json({ error: "Photos are not kept on this server." }, 501);
+    const { user } = c.get("session");
+    const body = (await c.req.json().catch(() => null)) as { mime?: unknown; data?: unknown } | null;
+    if (typeof body?.mime !== "string" || typeof body.data !== "string") return c.json({ error: 'send {mime: "image/jpeg", data: "<base64>"}' }, 400);
+    try {
+      return c.json(files.put(user.id, Buffer.from(body.data, "base64"), body.mime));
+    } catch (e) {
+      if (e instanceof FileError) return c.json({ error: e.message }, 400);
+      throw e;
+    }
+  });
+
+  // Only the learner who sent a file can fetch it. Its bytes never change, so it is cached for good.
+  app.get("/api/files/:id", (c) => {
+    const { user } = c.get("session");
+    const f = files?.get(user.id, c.req.param("id"));
+    if (!f) return c.json({ error: "no such file" }, 404);
+    return c.body(new Uint8Array(f.bytes), 200, {
+      "content-type": f.mime,
+      "cache-control": "private, max-age=31536000, immutable",
+      "content-security-policy": "default-src 'none'",
+      "x-content-type-options": "nosniff",
+    });
   });
 
   // Run page: every code block on the page as it is now, top to bottom, in a fresh interpreter. The

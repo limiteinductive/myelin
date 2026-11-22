@@ -46,6 +46,18 @@ const Quote = z.object({
   text: z.string().min(1).max(2000),
 });
 
+/** The image types a photo may be. The browser sends JPEG; the others are accepted as they are. */
+export const PHOTO_TYPES = ["image/jpeg", "image/png", "image/webp"] as const;
+/** A photo of the learner's work, kept on the server by its SHA-256. */
+export const PhotoCard = z.object({
+  kind: z.literal("photo"),
+  file: z.string().regex(/^[0-9a-f]{64}$/),
+  mime: z.enum(PHOTO_TYPES),
+  width: z.number().int().positive(),
+  height: z.number().int().positive(),
+});
+export type PhotoCard = z.infer<typeof PhotoCard>;
+
 const Timing = z.object({
   shown_at: Ms.nullable().default(null),
   input_started_at: Ms.nullable().default(null),
@@ -81,7 +93,10 @@ export const payloads = {
   "message.added": z.object({
     author: z.enum(["learner", "tutor"]),
     text: z.string(),
-    cards: z.array(z.looseObject({ kind: z.string() })).default([]),
+    cards: z
+      .array(z.looseObject({ kind: z.string() }))
+      .refine((cards) => cards.every((c) => c.kind !== "photo" || PhotoCard.safeParse(c).success), "a photo card needs a file hash, an image type, a width and a height")
+      .default([]),
     anchor: Anchor.nullable().default(null),
     quote: Quote.nullable().default(null),
     timing: Timing.nullable().default(null),

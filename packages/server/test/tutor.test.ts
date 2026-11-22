@@ -13,6 +13,8 @@ import { FIRST_RUN_TEXT, SANDBOX_DEVICE, startServer, TUTOR_DEVICE, type Draft, 
 let dir: string;
 let srv: RunningServer;
 let faux: ReturnType<typeof registerFauxProvider>;
+/** Whether the test model reads images. */
+let vision = true;
 let logs: string[];
 /** The tutor's clock. Null means real time. */
 let clock: number | null;
@@ -23,6 +25,7 @@ beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), "myelin-tutor-"));
   logs = [];
   clock = null;
+  vision = true;
   faux = registerFauxProvider({ tokensPerSecond: 400 });
   const agentDir = join(dir, "pi");
   const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -31,7 +34,7 @@ beforeEach(async () => {
     apiKey: "test",
     api: fm.api,
     baseUrl: fm.baseUrl,
-    models: [{ type: "chat", id: fm.id, name: fm.name, reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
+    models: [{ type: "chat", id: fm.id, name: fm.name, reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 100000, maxTokens: 1000 }],
   } as never);
   const model = runtime.getModel(fm.provider, fm.id) as Model<Api>;
   serve = async (extra = {}) => {
@@ -40,7 +43,7 @@ beforeEach(async () => {
       dataDir: dir,
       tutor: {
         systemPrompt: "You are a test tutor.",
-        model: async () => ({ runtime, model }),
+        model: async () => ({ runtime, model: vision ? model : { ...model, input: ["text"] } }),
         agentDir,
         retry: false,
         thinkingLevel: "off",
@@ -540,6 +543,82 @@ describe("tutor", () => {
     const r = await fetch(`${srv.url}/api/events`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ events: [forged] }) });
     expect(r.status).toBe(403);
     expect(Object.keys(srv.stores.get(u.id).state.units)).toHaveLength(1);
+    a.stop();
+  });
+});
+
+describe("photos", () => {
+  // A 1x1 PNG.
+  const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+  type Part = { type: string; text?: string; data?: string; mimeType?: string };
+  const userParts = (ctx: unknown) => (ctx as { messages: { role: string; content: Part[] | string }[] }).messages.findLast((m) => m.role === "user")!.content as Part[];
+
+  async function sendPhoto(a: Device, text: string): Promise<void> {
+    const r = await fetch(`${srv.url}/api/files`, { method: "POST", headers: { "content-type": "application/json", cookie: a.cookie }, body: JSON.stringify({ mime: "image/png", data: PNG }) });
+    expect(r.status).toBe(200);
+    const { id } = (await r.json()) as { id: string };
+    const ts = Date.now();
+    await a.post(makeEvent("message.added", { author: "learner", text, cards: [{ kind: "photo", file: id, mime: "image/png", width: 1, height: 1 }] }, { id: uuidv7(ts), device_id: a.id, ts }));
+  }
+
+  it("shows the tutor a photo with the message it came with", async () => {
+    const [, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    let parts: Part[] = [];
+    faux.setResponses([
+      (ctx) => {
+        parts = userParts(ctx);
+        return fauxAssistantMessage("The second line drops a sign.");
+      },
+    ]);
+    await sendPhoto(a, "is this right?");
+    await until(() => a.messages().length === 3);
+    expect(parts.find((p) => p.type === "image")).toMatchObject({ mimeType: "image/png", data: PNG });
+    const text = parts.map((p) => p.text ?? "").join("");
+    expect(text).toContain("[app: they sent a photo of their work, attached in order.");
+    expect(text).toContain("is this right?");
+    a.stop();
+  });
+
+  it("tells a tutor that cannot see images to say so", async () => {
+    vision = false;
+    const [, a] = await learner();
+    await a.listen();
+    await until(() => a.messages().length === 1);
+    let parts: Part[] = [];
+    faux.setResponses([
+      (ctx) => {
+        parts = userParts(ctx);
+        return fauxAssistantMessage("I cannot see photos here. Could you type the step?");
+      },
+    ]);
+    await sendPhoto(a, "");
+    await until(() => a.messages().length === 3);
+    expect(parts.some((p) => p.type === "image")).toBe(false);
+    expect(parts.map((p) => p.text ?? "").join("")).toContain("you cannot see images here");
+    a.stop();
+  });
+
+  it("marks a photo in the thread it is given at the start of a sitting", async () => {
+    const [u] = await learner();
+    const old = Date.now() - 86_400_000;
+    srv.stores.get(u.id).append([
+      makeEvent("message.added", { author: "tutor", text: FIRST_RUN_TEXT }, { id: uuidv7(old), device_id: TUTOR_DEVICE, ts: old }),
+      makeEvent("message.added", { author: "learner", text: "my working", cards: [{ kind: "photo", file: "ab".repeat(32), mime: "image/jpeg", width: 800, height: 600 }] }, { id: uuidv7(old + 1000), device_id: "dev", ts: old + 1000 }),
+    ]);
+    let context = "";
+    faux.setResponses([
+      (ctx) => {
+        context = shown(ctx);
+        return fauxAssistantMessage("Welcome back.");
+      },
+    ]);
+    const a = new Device();
+    await a.login(u);
+    await a.listen();
+    await until(() => a.messages().length === 3);
+    expect(context).toContain("[sent a photo] my working");
     a.stop();
   });
 });

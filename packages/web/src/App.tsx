@@ -4,7 +4,8 @@ import { watchActivity } from "./activity.js";
 import { createEffect, createMemo, createSignal, createStore, For, Match, onSettled, Show, Switch } from "solid-js";
 import { PageEditor, type EditPayload, type Highlight, type Scope, type SendResult } from "./editor.js";
 import { foldPages, pageFacts, pageStatus } from "./pages.js";
-import { draft, login, saveKey, SendError, SignInError, Sync, type Draft, type Ev, type Me } from "./sync.js";
+import { draft, login, saveKey, SendError, SignInError, Sync, uploadPhoto, type Draft, type Ev, type Me } from "./sync.js";
+import { MAX_PHOTOS, shrink } from "./photo.js";
 import { Body, inline, splitLead } from "./text.js";
 import { renderMathText } from "./math.js";
 import { inFence, insertFence } from "./fence.js";
@@ -24,6 +25,7 @@ const ICONS = {
   reword: "M11.5 3.5l3 3L6 15H3v-3zM9.5 5.5l3 3",
   done: "M3.75 9.5l3.5 3.5 7-7.5",
   open: "M7 4.5l4.5 4.5L7 13.5",
+  photo: "M2.75 6.75a1.5 1.5 0 0 1 1.5-1.5h1.75l1.25-1.75h3.5l1.25 1.75h1.75a1.5 1.5 0 0 1 1.5 1.5v6.5a1.5 1.5 0 0 1-1.5 1.5h-9.5a1.5 1.5 0 0 1-1.5-1.5zM11.5 9.75a2.5 2.5 0 1 1-5 0a2.5 2.5 0 1 1 5 0",
 } as const;
 
 const Icon = (props: { name: keyof typeof ICONS }) => (
@@ -104,6 +106,9 @@ type TimelineCard = { kind: "timeline"; run_id: string; duration_ms: number; seg
 type ChipState = "shown" | "not_yet" | "missed";
 type UnitsRow = { unit_id: string; text: string; kind: string; found: string | null; rests_on: string; told: boolean; depths: { depth: string; state: ChipState }[] };
 type UnitsTableCard = { kind: "units"; rows: UnitsRow[] };
+/** A photo the learner sent, kept on the server by hash. */
+type PhotoCard = { kind: "photo"; file: string; mime: string; width: number; height: number };
+type SentPhoto = Omit<PhotoCard, "kind">;
 type Line = {
   id: string;
   author: "learner" | "tutor";
@@ -119,11 +124,13 @@ type Line = {
   quote: Quote | null;
   /** A page the learner opened with the plus button: no message, only its link. */
   opened: boolean;
+  photos: PhotoCard[];
 };
 /** A message on its own, or a run of messages in one aside, shown as its passage and then the messages. */
 type Item = { id: string; kind: "line"; line: Line } | { id: string; kind: "aside"; aside: Aside; lines: Line[] };
 
 const isUnitCard = (c: { kind: string }): c is UnitCard => c.kind === "unit" && typeof (c as UnitCard).unit_id === "string";
+const isPhotoCard = (c: { kind: string }): c is PhotoCard => c.kind === "photo" && typeof (c as PhotoCard).file === "string" && (c as PhotoCard).width > 0;
 const isPageCard = (c: { kind: string }): c is PageCard => c.kind === "page" && typeof (c as PageCard).page_id === "string";
 const isTimelineCard = (c: { kind: string }): c is TimelineCard =>
   c.kind === "timeline" && Array.isArray((c as TimelineCard).segments) && (c as TimelineCard).duration_ms > 0;
@@ -233,13 +240,13 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
         const p = e.payload as { page_id: string; probe?: unknown };
         // The tutor's pages are linked from its messages; a learner's page is linked where it was opened.
         if (e.device_id.startsWith("server:") || e.device_id.startsWith("import:") || p.probe) return [];
-        return [{ id: e.id, author: "learner", text: "", ts: e.ts, trace: null, units: [], pages: [{ kind: "page", page_id: p.page_id }], timelines: [], tables: [], anchor: null, quote: null, opened: true }];
+        return [{ id: e.id, author: "learner", text: "", ts: e.ts, trace: null, units: [], pages: [{ kind: "page", page_id: p.page_id }], timelines: [], tables: [], anchor: null, quote: null, opened: true, photos: [] }];
       }
       if (e.type !== "message.added") return [];
       const p = e.payload as { author: "learner" | "tutor"; text: string; cards: { kind: string; text?: string }[]; anchor?: Anchor | null; quote?: Quote | null };
       const trace = p.cards.find((c) => c.kind === "trace" && typeof c.text === "string")?.text ?? null;
       const anchor = p.anchor ? { ...p.anchor } : null;
-      return [{ id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor, quote: p.quote ? { ...p.quote } : null, opened: false }];
+      return [{ id: e.id, author: p.author, text: p.text, ts: e.ts, trace, units: p.cards.filter(isUnitCard), pages: p.cards.filter(isPageCard), timelines: p.cards.filter(isTimelineCard), tables: p.cards.filter(isUnitsTableCard), anchor, quote: p.quote ? { ...p.quote } : null, opened: false, photos: p.cards.filter(isPhotoCard) }];
     }),
   );
   /** The messages alone. */
@@ -250,7 +257,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     const ls = entries();
     if (!r) return ls;
     const anchor = r.anchor ? { ...r.anchor } : null;
-    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor, quote: null, opened: false }];
+    return [...ls, { id: r.id, author: "tutor", text: r.text, ts: ls.at(-1)?.ts ?? Date.now(), trace: null, units: [], pages: [], timelines: [], tables: [], anchor, quote: null, opened: false, photos: [] }];
   });
   const asides = createMemo<Aside[]>(() => {
     pageTick();
@@ -543,7 +550,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     <Show when={p.quote}>{(q) => <blockquote class="myl-aside__quote app-quote">{inline(q().text.replace(/\$\$/g, "$"))}</blockquote>}</Show>
   );
 
-  const send = async (text: string, startedAt: number | null): Promise<boolean> => {
+  const send = async (text: string, startedAt: number | null, photos: SentPhoto[] = []): Promise<boolean> => {
     if (!sync) return false;
     stick = true;
     const answering = lines().at(-1)?.id === shownId;
@@ -555,7 +562,7 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
       await sync.append("message.added", {
         author: "learner",
         text,
-        cards: [],
+        cards: photos.map((ph) => ({ kind: "photo", ...ph })),
         anchor,
         quote: q ? { message_id: q.message_id, text: q.text } : null,
         timing: { shown_at: answering ? shownAt : null, input_started_at: startedAt, sent_at: Date.now() },
@@ -647,6 +654,15 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     }
   };
 
+  /** The photos a learner sent, at the width of their message. */
+  const Photos = (p: { photos: PhotoCard[] | undefined }) => (
+    <Show when={p.photos?.length}>
+      <div class="app-photos">
+        <For each={p.photos ?? []}>{(ph) => <img src={`/api/files/${ph.file}`} width={ph.width} height={ph.height} alt="Your photo" loading="lazy" decoding="async" />}</For>
+      </div>
+    </Show>
+  );
+
   /** The reply in progress has no words yet: the tutor is thinking or using its tools. */
   const thinking = (id: string) => view.reply?.id === id && !view.reply.text;
   const Thinking = () => (
@@ -661,13 +677,14 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
     <span class={{ "myl-aside__who": true, "myl-aside__who--tutor": p.author === "tutor" }}>{p.author === "tutor" ? "Tutor" : "You"}</span>
   );
 
-  const AsideCard = (p: { aside: Aside; messages: { id: string; author: "learner" | "tutor"; text: string }[]; margin?: boolean }) => (
+  const AsideCard = (p: { aside: Aside; messages: { id: string; author: "learner" | "tutor"; text: string; photos?: PhotoCard[] }[]; margin?: boolean }) => (
     <section class="myl-aside" aria-label="Aside" data-aside={p.margin ? p.aside.id : undefined}>
       <blockquote class={{ "myl-aside__quote": true, "myl-aside__quote--asked": p.aside.raised_by === "tutor" }}>{inline(quoteOf(p.aside))}</blockquote>
       <For each={p.messages} keyed={(m) => m.id}>
         {(m) => (
           <div class="myl-aside__message">
             <Who author={m().author} />
+            <Photos photos={m().photos} />
             <Show when={!thinking(m().id)} fallback={<Thinking />}>
               <Body text={m().text} />
             </Show>
@@ -735,10 +752,13 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
                                       <Thinking />
                                     </article>
                                   </Show>
-                                  <Show when={line().text.trim() || line().trace}>
+                                  <Show when={line().text.trim() || line().trace || line().photos.length}>
                                     <article class={{ "myl-message": true, "myl-message--learner": line().author === "learner", "myl-turn": turn() }} data-line={line().id}>
                                       <Quoted quote={line().quote} />
-                                      <Body text={line().text} />
+                                      <Photos photos={line().photos} />
+                                      <Show when={line().text.trim()}>
+                                        <Body text={line().text} />
+                                      </Show>
                                       <Show when={line().trace}>{(t) => <div class="myl-trace">{t()}</div>}</Show>
                                     </article>
                                   </Show>
@@ -838,10 +858,11 @@ function Thread(props: { session: Me; go: (s: Screen) => void }) {
               <For each={recent()} keyed={(l) => l.id}>
                 {(l) => (
                   <>
-                    <Show when={l().text.trim() || thinking(l().id)}>
+                    <Show when={l().text.trim() || thinking(l().id) || l().photos.length}>
                       <div class="myl-aside__message" data-line={l().id}>
                         <Who author={l().author} />
                         <Quoted quote={l().quote} />
+                        <Photos photos={l().photos} />
                         <Show when={!thinking(l().id)} fallback={<Thinking />}>
                           <Body text={l().text} />
                         </Show>
@@ -1075,14 +1096,14 @@ function PageLink(props: { page: PageState; status: string; facts: string; open:
 function Composer(props: {
   connected: boolean;
   lost: boolean;
-  send: (text: string, startedAt: number | null) => Promise<boolean>;
+  send: (text: string, startedAt: number | null, photos: SentPhoto[]) => Promise<boolean>;
   /** The passage the composer is aimed at, and how to leave it. */
   scope?: JSX.Element | null;
   placeholder?: string;
   escape?: () => void;
   /** For an API key: nothing is kept as a draft, and the browser neither suggests nor checks it. */
   secret?: boolean;
-  /** The plus button. Without `page`, where pages cannot be edited, it starts a code block. */
+  /** The plus button: a photo, a code block, and a scratch page where pages can be edited (`page`). */
   plus?: { page: (() => void) | null };
 }) {
   const kept = () => (props.secret ? "" : draft.get());
@@ -1099,6 +1120,58 @@ function Composer(props: {
   let form!: HTMLFormElement;
   let plusButton: HTMLButtonElement | undefined;
   let menuEl: HTMLDivElement | undefined;
+  let picker: HTMLInputElement | undefined;
+
+  /** Photos to go with the message: shown at once, sendable once the server keeps them. */
+  type Pending = SentPhoto & { key: number; url: string; kept: boolean };
+  const [photos, setPhotos] = createSignal<Pending[]>([]);
+  /** Why a photo was not added, until the next thing the learner does. */
+  const [photoNote, setPhotoNote] = createSignal<string | null>(null);
+  let photoKey = 0;
+  const loading = () => photos().some((ph) => !ph.kept);
+  const unload = (gone: Pending[]) => {
+    for (const ph of gone) URL.revokeObjectURL(ph.url);
+    setPhotos((ps) => ps.filter((ph) => !gone.some((g) => g.key === ph.key)));
+  };
+  const addPhotos = async (files: File[]) => {
+    setPhotoNote(null);
+    const images = files.filter((f) => f.type.startsWith("image/") || f.type === "");
+    const room = MAX_PHOTOS - photos().length;
+    if (images.length > room) setPhotoNote(`Up to ${MAX_PHOTOS} photos go with one message.`);
+    await Promise.all(
+      images.slice(0, Math.max(0, room)).map(async (f) => {
+        const key = ++photoKey;
+        setPhotos((ps) => [...ps, { key, url: URL.createObjectURL(f), kept: false, file: "", mime: "image/jpeg", width: 0, height: 0 }]);
+        const fail = (why: string) => {
+          const ph = photos().find((x) => x.key === key);
+          if (ph) unload([ph]);
+          setPhotoNote(why);
+        };
+        let small;
+        try {
+          small = await shrink(f);
+        } catch {
+          return fail("That photo could not be read. Try a JPEG or PNG.");
+        }
+        try {
+          const { id } = await uploadPhoto(small.mime, small.data);
+          const url = URL.createObjectURL(small.blob);
+          setPhotos((ps) =>
+            ps.map((ph) => {
+              if (ph.key !== key) return ph;
+              URL.revokeObjectURL(ph.url);
+              return { ...ph, url, kept: true, file: id, mime: small.mime, width: small.width, height: small.height };
+            }),
+          );
+          // Removed while it was on its way.
+          if (!photos().some((ph) => ph.key === key)) URL.revokeObjectURL(url);
+        } catch (e) {
+          fail(e instanceof SendError ? `That photo was not kept: ${e.message}.` : "That photo did not reach the server. Add it again once connected.");
+        }
+      }),
+    );
+  };
+  const imagesOf = (data: DataTransfer | null) => Array.from(data?.files ?? []).filter((f) => f.type.startsWith("image/"));
   const [menu, setMenu] = createSignal(false);
   const closeMenu = (refocus: boolean) => {
     setMenu(false);
@@ -1118,7 +1191,6 @@ function Composer(props: {
     field.setSelectionRange(e.caret, e.caret);
   };
   const onPlus = () => {
-    if (!props.plus?.page) return code();
     if (menu()) return closeMenu(false);
     setMenu(true);
     requestAnimationFrame(() => menuEl?.querySelector<HTMLButtonElement>("button")?.focus());
@@ -1160,17 +1232,27 @@ function Composer(props: {
   const submit = async (ev: SubmitEvent) => {
     ev.preventDefault();
     const text = field.value.trim();
-    if (!text || !props.connected || sending()) return;
+    const going = photos();
+    if ((!text && going.length === 0) || loading() || !props.connected || sending()) return;
     setSending(true);
+    setPhotoNote(null);
     // The field clears at once, so what is typed while the message goes is the next one.
     const started = startedAt;
     startedAt = null;
     pending = text;
     show("");
-    const sent = await props.send(text, started);
+    setPhotos([]);
+    const sent = await props.send(
+      text,
+      started,
+      going.map(({ file, mime, width, height }) => ({ file, mime, width, height })),
+    );
     pending = null;
-    if (sent) keep(field.value);
-    else {
+    if (sent) {
+      keep(field.value);
+      for (const ph of going) URL.revokeObjectURL(ph.url);
+    } else {
+      setPhotos((ps) => [...going, ...ps]);
       // Not sent: the message comes back, ahead of anything typed since.
       const after = field.value;
       const at = field.selectionStart;
@@ -1199,23 +1281,65 @@ function Composer(props: {
           {props.scope}
         </div>
       </Show>
+      <Show when={!props.lost && photoNote()}>
+        <div class="myl-composer__scope" role="status">
+          {photoNote()}
+        </div>
+      </Show>
       <Show when={menu()}>
         <div class="app-plus-menu" role="menu" aria-label="Add" ref={menuEl} onKeyDown={menuKeys}>
-          <button type="button" role="menuitem" class="myl-icon-button" aria-label="Code block" onClick={code}>
-            <Icon name="code" />
-          </button>
           <button
             type="button"
             role="menuitem"
             class="myl-icon-button"
-            aria-label="Scratch page"
+            aria-label="Photo"
+            disabled={photos().length >= MAX_PHOTOS}
             onClick={() => {
               setMenu(false);
-              props.plus?.page?.();
+              picker?.click();
             }}
           >
-            <Icon name="page" />
+            <Icon name="photo" />
           </button>
+          <button type="button" role="menuitem" class="myl-icon-button" aria-label="Code block" onClick={code}>
+            <Icon name="code" />
+          </button>
+          <Show when={props.plus?.page}>
+            <button
+              type="button"
+              role="menuitem"
+              class="myl-icon-button"
+              aria-label="Scratch page"
+              onClick={() => {
+                setMenu(false);
+                props.plus?.page?.();
+              }}
+            >
+              <Icon name="page" />
+            </button>
+          </Show>
+        </div>
+      </Show>
+      <Show when={props.plus}>
+        <input
+          ref={picker}
+          type="file"
+          accept="image/*"
+          multiple
+          hidden
+          onChange={(e) => {
+            const files = Array.from(e.currentTarget.files ?? []);
+            e.currentTarget.value = "";
+            if (!isTouch()) field.focus();
+            void addPhotos(files);
+          }}
+        />
+      </Show>
+      <Show when={photos().length > 0}>
+        <div class="app-photo-strip" aria-label="Photos to send">
+          <For each={photos()} keyed={(ph) => ph.key}>
+            {(ph) => <img class={{ "app-photo-thumb": true, "app-photo-thumb--loading": !ph().kept }} src={ph().url} alt="Photo to send" />}
+          </For>
         </div>
       </Show>
       <div class="myl-composer__row">
@@ -1224,9 +1348,9 @@ function Composer(props: {
             type="button"
             ref={plusButton}
             class="myl-icon-button app-plus"
-            aria-label={props.plus?.page ? "Add" : "Code block"}
-            aria-haspopup={props.plus?.page ? "menu" : undefined}
-            aria-expanded={props.plus?.page ? (menu() ? "true" : "false") : undefined}
+            aria-label="Add"
+            aria-haspopup="menu"
+            aria-expanded={menu() ? "true" : "false"}
             onClick={onPlus}
           >
             <Icon name="plus" />
@@ -1241,8 +1365,24 @@ function Composer(props: {
           autocomplete={props.secret ? "off" : undefined}
           autocapitalize={props.secret ? "off" : undefined}
           spellcheck={props.secret ? false : undefined}
+          onPaste={(e) => {
+            const images = props.plus ? imagesOf(e.clipboardData) : [];
+            if (images.length === 0) return;
+            e.preventDefault();
+            void addPhotos(images);
+          }}
+          onDragOver={(e) => {
+            if (props.plus && e.dataTransfer?.types.includes("Files")) e.preventDefault();
+          }}
+          onDrop={(e) => {
+            const images = props.plus ? imagesOf(e.dataTransfer) : [];
+            if (images.length === 0) return;
+            e.preventDefault();
+            void addPhotos(images);
+          }}
           onInput={(e) => {
             startedAt ??= Date.now();
+            setPhotoNote(null);
             keep(e.currentTarget.value);
             setEmpty(e.currentTarget.value.trim() === "");
             grow();
@@ -1257,13 +1397,21 @@ function Composer(props: {
               // Inside a code block Enter starts a new line, and Cmd or Ctrl with Enter sends.
               e.preventDefault();
               form.requestSubmit();
+            } else if (e.key === "Backspace" && photos().length > 0 && field.selectionStart === 0 && field.selectionEnd === 0) {
+              // Backspace at the start of the field takes back the last photo.
+              e.preventDefault();
+              unload([photos().at(-1)!]);
             } else if (e.key === "Escape" && props.scope) {
               e.preventDefault();
               props.escape?.();
+            } else if (e.key === "Escape" && photos().length > 0) {
+              e.preventDefault();
+              unload(photos());
+              setPhotoNote(null);
             }
           }}
         />
-        <button type="submit" class="myl-send" aria-label="Send" disabled={empty() || sending() || !props.connected}>
+        <button type="submit" class="myl-send" aria-label="Send" disabled={(empty() && photos().length === 0) || loading() || sending() || !props.connected}>
           <Icon name="send" />
         </button>
       </div>

@@ -46,6 +46,10 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 .app-plus + .myl-composer__field { padding-left: var(--space-1); }
 .app-plus[aria-expanded="true"] { color: var(--ink); background-color: color-mix(in srgb, currentColor 12%, transparent); }
 .app-plus-menu { position: absolute; z-index: 3; left: 0; bottom: calc(100% + var(--space-2)); display: flex; gap: var(--space-1); padding: var(--space-1); background: var(--surface); border: 1px solid var(--line); border-radius: calc(var(--target-min) / 2 + var(--space-1)); box-shadow: var(--elevation-panel); }
+/* Photos waiting to go with the message, above the field. */
+.app-photo-strip { display: flex; gap: var(--space-2); padding: var(--space-2) var(--space-2) var(--space-1); overflow-x: auto; }
+.app-photo-thumb { flex: none; width: calc(var(--target-min) + var(--space-3)); height: calc(var(--target-min) + var(--space-3)); object-fit: cover; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--hover); transition: opacity 120ms; }
+.app-photo-thumb--loading { opacity: 0.5; }
 .myl-send { transition: background-color 120ms, color 120ms; }
 /* Nothing to send is not something to act on, so it is not in accent. */
 .myl-send:disabled { background-color: var(--hover); color: var(--muted); }
@@ -117,6 +121,12 @@ html, body, #app { margin: 0; height: 100%; background: var(--paper); }
 @media (prefers-reduced-motion: reduce) {
   .app-page, .app-margin, .app-sheet { animation: none; }
 }
+
+/* Photos in a message: as wide as the message, above its words. */
+.app-photos { display: grid; gap: var(--space-2); }
+.app-photos + * { margin-top: var(--space-2); }
+/* A tall photo stops at most of the screen's height. */
+.app-photos img { display: block; width: auto; height: auto; max-width: 100%; max-height: 60vh; border-radius: var(--radius-control); background: var(--hover); }
 
 /* The quoted passage in the composer's scope line: one line, cut with an ellipsis. */
 .app-scope-quote { display: inline-block; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }

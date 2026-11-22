@@ -14,6 +14,14 @@ export interface ThreadMessage {
   quote?: { message_id: string; text: string } | null;
   /** When the learner saw the tutor's last message, started typing, and sent. Learner messages only. */
   timing?: { shown_at: number | null; input_started_at: number | null; sent_at: number | null } | null;
+  /** Photos the learner sent with the message, by file hash. */
+  photos?: { file: string; mime: string }[];
+}
+
+/** How a message's photos read in the thread for the tutor. */
+export function photoMarker(m: ThreadMessage): string {
+  const n = m.photos?.length ?? 0;
+  return n === 0 ? "" : n === 1 ? "[sent a photo] " : `[sent ${n} photos] `;
 }
 
 export interface SittingInput {
@@ -196,7 +204,7 @@ export function buildSittingContext({ name, now, state, tail, timeZone, schedule
   for (const m of tail) {
     const when = sameDay(m.ts, now, timeZone) ? formatWhen(m.ts, timeZone, false) : `${formatDate(m.ts, timeZone)} ${formatWhen(m.ts, timeZone, false)}`;
     const where = m.anchor ? `, in an aside ${anchorLabel(state, m.anchor)}` : m.quote ? `, quoting "${m.quote.text}"` : "";
-    lines.push(`[${m.author === "learner" ? "Learner" : "You"}, ${when}${where}] ${m.text}`);
+    lines.push(`[${m.author === "learner" ? "Learner" : "You"}, ${when}${where}] ${photoMarker(m)}${m.text}`.trimEnd());
   }
   if (page) {
     lines.push("", "## The open page", "The learner wrote this; you cannot edit it. Line numbers are for open_aside only. The learner does not see them, so never mention them; quote the words instead.", "", pageText(page));
