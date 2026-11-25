@@ -1,24 +1,52 @@
-// Message text to elements. Only a small, safe subset: paragraphs, line breaks, fenced code,
-// inline code, math, bold and italic. Everything else shows as typed. No HTML is ever parsed; math
-// is KaTeX's own output for the TeX between the dollar signs.
+// Message text to elements: paragraphs, headings, lists, blockquotes, fenced code, multi-line
+// display math ($$...$$), inline math ($...$), inline code, bold and italic. No raw HTML parsed.
 import type { JSX } from "@solidjs/web";
 import { mathHtml } from "./math.js";
 
-type Block = { kind: "p"; text: string } | { kind: "code"; text: string };
+type Block =
+  | { kind: "p"; text: string }
+  | { kind: "code"; text: string }
+  | { kind: "math"; tex: string }
+  | { kind: "h"; text: string }
+  | { kind: "quote"; text: string }
+  | { kind: "ul"; items: string[] }
+  | { kind: "ol"; items: string[] };
 
 export function blocks(text: string): Block[] {
   const out: Block[] = [];
-  const parts = text.split(/^```[^\n]*\n?/m);
-  parts.forEach((part, i) => {
+  // First split fenced code blocks.
+  const fenceParts = text.split(/^```[^\n]*\n?/m);
+  fenceParts.forEach((part, i) => {
     if (i % 2 === 1) {
       const code = part.replace(/\n$/, "");
       if (code) out.push({ kind: "code", text: code });
       return;
     }
-    for (const para of part.split(/\n{2,}/)) {
-      const t = para.trim();
-      if (t) out.push({ kind: "p", text: t });
-    }
+    // Next split multi-line display math blocks ($$ ... $$ on their own lines).
+    const mathParts = part.split(/(?:^|\n)\$\$\n?([\s\S]*?)\n?\$\$(?=\n|$)/);
+    mathParts.forEach((seg, j) => {
+      if (j % 2 === 1) {
+        const tex = seg.trim();
+        if (tex) out.push({ kind: "math", tex });
+        return;
+      }
+      for (const raw of seg.split(/\n{2,}/)) {
+        const t = raw.trim();
+        if (!t) continue;
+        const lines = t.split("\n");
+        if (lines.length === 1 && /^#{1,3}\s+/.test(t)) {
+          out.push({ kind: "h", text: t.replace(/^#{1,3}\s+/, "") });
+        } else if (lines.every((l) => /^>\s?/.test(l.trim()))) {
+          out.push({ kind: "quote", text: lines.map((l) => l.trim().replace(/^>\s?/, "")).join("\n") });
+        } else if (lines.every((l) => /^[-*]\s+/.test(l.trim()))) {
+          out.push({ kind: "ul", items: lines.map((l) => l.trim().replace(/^[-*]\s+/, "")) });
+        } else if (lines.every((l) => /^\d+\.\s+/.test(l.trim()))) {
+          out.push({ kind: "ol", items: lines.map((l) => l.trim().replace(/^\d+\.\s+/, "")) });
+        } else {
+          out.push({ kind: "p", text: t });
+        }
+      }
+    });
   });
   return out;
 }
@@ -37,7 +65,29 @@ export function splitLead(text: string): [string, string] | null {
   return rest ? [lead, rest] : null;
 }
 
-const INLINE = /(`[^`\n]+`|\$\$[^$\n]+?\$\$|\$(?=[^\s$])[^$\n]*?[^\s$\\]\$(?!\d)|\*\*[^*\n]+\*\*|(?<![\w*])\*[^*\s][^*\n]*?\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*?_(?![\w_]))/g;
+export const INLINE = /(`[^`\n]+`|\$\$[^$\n]+?\$\$|\\\$|(?<!\\)\$(?=[^\s$])(?:\\\$|[^$\n])*?(?:\\\$|[^\s$\\])\$(?!\d)|\*\*[^*\n]+\*\*|(?<![\w*])\*[^*\s][^*\n]*?\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*?_(?![\w_]))/g;
+
+const MATH_ONLY = /(\$\$[^$\n]+?\$\$|(?<!\\)\$(?=[^\s$])(?:\\\$|[^$\n])*?(?:\\\$|[^\s$\\])\$(?!\d))/g;
+
+/**
+ * Renders only $...$ and $$...$$ math inside learner-written beats while leaving underscores
+ * (like `x_1`, `1_i`) and asterisks (like `sigma**2`) completely untouched as literal text.
+ */
+export function mathOnly(text: string): JSX.Element[] {
+  const out: JSX.Element[] = [];
+  for (const [i, piece] of text.split(MATH_ONLY).entries()) {
+    if (!piece) continue;
+    if (i % 2 === 0) out.push(piece);
+    else if (piece.startsWith("$$")) {
+      const tex = piece.slice(2, -2).trim();
+      out.push(<span class="myl-math app-math-display" data-tex={tex} innerHTML={mathHtml(tex, true)} />);
+    } else {
+      const tex = piece.slice(1, -1);
+      out.push(<span class="myl-math" data-tex={tex} innerHTML={mathHtml(tex, false)} />);
+    }
+  }
+  return out;
+}
 
 export function inline(text: string): JSX.Element[] {
   const out: JSX.Element[] = [];
@@ -46,10 +96,15 @@ export function inline(text: string): JSX.Element[] {
     for (const [i, piece] of line.split(INLINE).entries()) {
       if (!piece) continue;
       if (i % 2 === 0) out.push(piece);
+      else if (piece === "\\$") out.push("$");
       else if (piece.startsWith("`")) out.push(<code class="app-code">{piece.slice(1, -1)}</code>);
-      else if (piece.startsWith("$$")) out.push(<span class="myl-math app-math-display" innerHTML={mathHtml(piece.slice(2, -2).trim(), true)} />);
-      else if (piece.startsWith("$")) out.push(<span class="myl-math" innerHTML={mathHtml(piece.slice(1, -1), false)} />);
-      else if (piece.startsWith("**")) out.push(<strong>{piece.slice(2, -2)}</strong>);
+      else if (piece.startsWith("$$")) {
+        const tex = piece.slice(2, -2).trim();
+        out.push(<span class="myl-math app-math-display" data-tex={tex} innerHTML={mathHtml(tex, true)} />);
+      } else if (piece.startsWith("$")) {
+        const tex = piece.slice(1, -1);
+        out.push(<span class="myl-math" data-tex={tex} innerHTML={mathHtml(tex, false)} />);
+      } else if (piece.startsWith("**")) out.push(<strong>{piece.slice(2, -2)}</strong>);
       else out.push(<em>{piece.slice(1, -1)}</em>);
     }
   });
@@ -59,15 +114,40 @@ export function inline(text: string): JSX.Element[] {
 export function Body(props: { text: string }) {
   return (
     <>
-      {blocks(props.text).map((b) =>
-        b.kind === "code" ? (
-          <div class="myl-code">
-            <pre>{b.text}</pre>
-          </div>
-        ) : (
-          <p>{inline(b.text)}</p>
-        ),
-      )}
+      {blocks(props.text).map((b) => {
+        switch (b.kind) {
+          case "code":
+            return (
+              <div class="myl-code">
+                <pre>{b.text}</pre>
+              </div>
+            );
+          case "math":
+            return <div class="myl-math app-math-display" data-tex={b.tex} innerHTML={mathHtml(b.tex, true)} />;
+          case "h":
+            return <h3 class="v2-msg-heading">{inline(b.text)}</h3>;
+          case "quote":
+            return <blockquote class="v2-msg-quote">{inline(b.text)}</blockquote>;
+          case "ul":
+            return (
+              <ul class="v2-msg-list">
+                {b.items.map((it) => (
+                  <li>{inline(it)}</li>
+                ))}
+              </ul>
+            );
+          case "ol":
+            return (
+              <ol class="v2-msg-list">
+                {b.items.map((it) => (
+                  <li>{inline(it)}</li>
+                ))}
+              </ol>
+            );
+          default:
+            return <p>{inline(b.text)}</p>;
+        }
+      })}
     </>
   );
 }

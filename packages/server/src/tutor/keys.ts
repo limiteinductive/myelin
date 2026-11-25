@@ -28,7 +28,7 @@ function parseSpec(spec: string): Spec {
   return { spec, provider, id };
 }
 
-const NAMES: Record<string, string> = { google: "Gemini", openai: "OpenAI", deepseek: "DeepSeek", anthropic: "Anthropic", mistral: "Mistral" };
+const NAMES: Record<string, string> = { google: "Gemini", openai: "OpenAI", deepseek: "DeepSeek", anthropic: "Anthropic", mistral: "Mistral", openrouter: "OpenRouter" };
 
 /** How a provider is named to a learner: "Gemini" for google. */
 export function providerName(provider: string): string {

@@ -1,0 +1,558 @@
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { describe, expect, it } from "vitest";
+import { AgyJudgeWorker, extractStreamingJsonMessage, FastJudge, parseJudgeJson } from "../src/judge.js";
+
+describe("FastJudge System 1 (Jev) -> System 2 cascade", () => {
+  it("fast-passes on high-confidence Jev decision without calling System 2", async () => {
+    const calls: string[] = [];
+    const mockFetch: typeof fetch = async (url) => {
+      calls.push(String(url));
+      return new Response(
+        JSON.stringify({
+          model: "typesafe/jev-1.14",
+          answers: {
+            demonstrated: { type: "noul", noul: 0.94 },
+            cot_gap: { type: "noul", noul: 0.12 },
+            clarity: { type: "score", score: 0.85 },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const res = await judge.check({
+      prompt: "Explain when to use ser vs estar.",
+      unitText: "Use ser for defining traits, estar for temporary states.",
+      unitKind: "distinction",
+      depth: "recall",
+      restsOn: [],
+      attempt: "ser is for permanent/inherent traits, estar is for states or conditions",
+      latencyMs: 9000,
+      hintsUsed: 0,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("/decisions");
+    expect(res.ok).toBe(true);
+    expect(res.tier).toBe("system1");
+    expect(res.grade).toBe("easy");
+  });
+
+  it("escalates to System 2 when Jev detects a reasoning gap", async () => {
+    const calls: string[] = [];
+    const mockFetch: typeof fetch = async (url) => {
+      const u = String(url);
+      calls.push(u);
+      if (u.includes("/decisions")) {
+        return new Response(
+          JSON.stringify({
+            model: "typesafe/jev-1.14",
+            answers: {
+              demonstrated: { type: "noul", noul: 0.42 },
+              cot_gap: { type: "noul", noul: 0.88 },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  ok: false,
+                  grade: "again",
+                  diagnosis: "Calling np.exp(x) directly overflows to inf for large values like 1000, yielding NaN.",
+                  next: "Shift x by a constant that leaves the ratio unchanged before exponentiating.",
+                  habit_observed: null,
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const res = await judge.check({
+      prompt: "Write numerically stable softmax.",
+      unitText: "Subtract max(x) before exp to prevent overflow.",
+      unitKind: "move",
+      depth: "use",
+      restsOn: [],
+      attempt: "np.exp(x) / np.sum(np.exp(x))",
+      latencyMs: 12000,
+      hintsUsed: 0,
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(res.ok).toBe(false);
+    expect(res.tier).toBe("system2");
+    expect(res.message).toContain("1000");
+  });
+
+  it("runs System 2 and inline completion via warm persistent agy CLI worker when llmModel is agy/*", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "myelin-agy-judge-test-"));
+    const fakeBin = join(dir, "fake-agy.mjs");
+    writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+let n = 0;
+for await (const line of rl) {
+  if (!line.trim()) continue;
+  n++;
+  const resp = n === 1
+    ? JSON.stringify({
+        ok: false,
+        grade: "again",
+        message: "Clean algebra, but state whether independence is required.",
+        habit_observed: null
+      })
+    : JSON.stringify({
+        ok: true,
+        grade: "good",
+        message: "Clean—no independence needed."
+      });
+  process.stdout.write(JSON.stringify({ event: "result", result: { status: "SUCCESS", response: resp } }) + "\\n");
+}
+`,
+      "utf8",
+    );
+    chmodSync(fakeBin, 0o755);
+
+    const judge = new FastJudge({ apiKey: "", llmModel: "agy/gemini-4-neon-medium", agyBinary: fakeBin });
+    try {
+      const res = await judge.check({
+        prompt: "Derive E[X+Y] and state whether independence is required.",
+        unitText: "Linearity of expectation.",
+        unitKind: "move",
+        depth: "rebuild",
+        restsOn: [],
+        attempt: "E[X+Y] = sum (X+Y)P = E[X] + E[Y]",
+        latencyMs: 20000,
+        hintsUsed: 0,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.tier).toBe("system2");
+      expect(res.message).toContain("independence");
+
+      const done = await judge.continueRep({
+        prompt: "Derive E[X+Y] and state whether independence is required.",
+        unitText: "Linearity of expectation.",
+        unitKind: "move",
+        depth: "rebuild",
+        restsOn: [],
+        attempt: "E[X+Y] = sum (X+Y)P = E[X] + E[Y]",
+        feedback: res.message,
+        turns: [],
+        reply: "clearly we didnt and it doesnt require independence",
+        latencyMs: 28000,
+        hintsUsed: 0,
+      });
+      expect(done.ok).toBe(true);
+      expect(done.grade).toBe("good");
+      expect(done.message).toContain("no independence needed");
+    } finally {
+      judge.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("skips Jev on obvious non-attempts and questions so System 2 starts immediately", async () => {
+    const calls: string[] = [];
+    const mockFetch: typeof fetch = async (url) => {
+      calls.push(String(url));
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  ok: false,
+                  grade: "again",
+                  message: "Start tiny: for two numbers 2 and 6, what is their average?",
+                  habit_observed: null,
+                  missing_prereqs: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    for (const input of ["i have no ideas", "what is p here?"]) {
+      calls.length = 0;
+      const res = await judge.check({
+        prompt: "Why divide by n - 1?",
+        unitText: "Sample variance divides by n - 1.",
+        unitKind: "distinction",
+        depth: "recall",
+        restsOn: [],
+        attempt: input,
+        latencyMs: 5000,
+        hintsUsed: 0,
+      });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).not.toContain("/decisions");
+      expect(res.ok).toBe(false);
+    }
+  });
+
+  it("passes configured resourceDirs via --add-dir to the interactive agy worker only", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "myelin-agy-res-test-"));
+    const notesDir = mkdtempSync(join(tmpdir(), "myelin-notes-"));
+    const fakeBin = join(dir, "fake-agy.mjs");
+    writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+for await (const line of rl) {
+  if (!line.trim()) continue;
+  const resp = JSON.stringify({ message: process.argv.slice(2).join(" "), suggested_units: [] });
+  process.stdout.write(JSON.stringify({ event: "result", result: { status: "SUCCESS", response: resp } }) + "\\n");
+}
+`,
+      "utf8",
+    );
+    chmodSync(fakeBin, 0o755);
+
+    const judge = new FastJudge({ apiKey: "", llmModel: "agy/gemini-4-neon-low", agyBinary: fakeBin, resourceDirs: [notesDir] });
+    try {
+      const res = await judge.explore({ initial: "find my notes", existingUnits: [], activeHabits: [], turns: [] });
+      expect(res.message).toContain(`--add-dir ${notesDir}`);
+    } finally {
+      judge.close();
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(notesDir, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts partial message prose cleanly from streaming JSON without leaking keys or grades", () => {
+    expect(extractStreamingJsonMessage('{"message": "Nice split')).toBe("Nice split");
+    expect(extractStreamingJsonMessage('{"message": "Line 1\\nLine 2 \\"quote\\"',)).toBe('Line 1\nLine 2 "quote"');
+    expect(extractStreamingJsonMessage('{"message": "Done.", "ok": true, "grade": "easy"}')).toBe("Done.");
+    expect(extractStreamingJsonMessage('{"ok": true')).toBeNull();
+  });
+
+  it("survives turn-8 worker rotation even when the retiring child closes late during turn 9", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "myelin-agy-rot-"));
+    const fakeBin = join(dir, "fake-agy.mjs");
+    writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  process.stdout.write(JSON.stringify({ event: "result", result: { status: "SUCCESS", response: "ok:" + process.pid } }) + "\\n");
+});
+// Delay exit after stdin closes so the old child's close event fires AFTER turn 9 has already started on the new child!
+rl.on("close", () => {
+  setTimeout(() => process.exit(0), 60);
+});
+`,
+      "utf8",
+    );
+    chmodSync(fakeBin, 0o755);
+
+    const worker = new AgyJudgeWorker(fakeBin, "gemini-4-neon-medium", false, [], 5000);
+    try {
+      const results: string[] = [];
+      for (let i = 0; i < 10; i++) {
+        results.push(await worker.ask(`turn ${i}`));
+      }
+      expect(results).toHaveLength(10);
+      // Turns 1..8 share the first child PID; turns 9..10 rotated to a new child PID cleanly.
+      expect(results[0]).toBe(results[7]);
+      expect(results[8]).not.toBe(results[7]);
+      expect(results[9]).toBe(results[8]);
+    } finally {
+      worker.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers from a hung child via per-turn timeout and succeeds on the next turn", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "myelin-agy-timeout-"));
+    const fakeBin = join(dir, "fake-agy.mjs");
+    writeFileSync(
+      fakeBin,
+      `#!/usr/bin/env node
+import { createInterface } from "node:readline";
+const rl = createInterface({ input: process.stdin });
+for await (const line of rl) {
+  if (!line.trim()) continue;
+  if (line.includes("hang me")) {
+    // Stay silent until killed by timeout
+    await new Promise(() => {});
+  }
+  process.stdout.write(JSON.stringify({ event: "result", result: { status: "SUCCESS", response: "recovered:" + process.pid } }) + "\\n");
+}
+`,
+      "utf8",
+    );
+    chmodSync(fakeBin, 0o755);
+
+    const worker = new AgyJudgeWorker(fakeBin, "gemini-4-neon-medium", false, [], 1200);
+    try {
+      await expect(worker.ask("hang me")).rejects.toThrow(/timed out/i);
+      const next = await worker.ask("second turn");
+      expect(next).toMatch(/^recovered:\d+$/);
+    } finally {
+      worker.dispose();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never auto-passes when judge is unconfigured or when System 2 fails after borderline Jev", async () => {
+    const unconfigured = new FastJudge({ apiKey: "", llmModel: "" });
+    const r1 = await unconfigured.check({
+      prompt: "Explain X",
+      unitText: "X",
+      unitKind: "move",
+      depth: "recall",
+      restsOn: [],
+      attempt: "my answer",
+      latencyMs: 5000,
+      hintsUsed: 0,
+    });
+    expect(r1.ok).toBe(false);
+    expect(r1.failed).toBe(true);
+    expect(r1.tier).toBe("fallback");
+
+    // Borderline Jev (0.78) + System 2 failure -> must return honest failed=true, NOT ok=true!
+    const mockFetch: typeof fetch = async (url) => {
+      if (String(url).includes("/decisions")) {
+        return new Response(
+          JSON.stringify({
+            model: "typesafe/jev-1.14",
+            answers: {
+              demonstrated: { type: "noul", noul: 0.78 },
+              cot_gap: { type: "noul", noul: 0.35 },
+              clarity: { type: "score", score: 0.7 },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("upstream 503", { status: 503 });
+    };
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const r2 = await judge.check({
+      prompt: "Explain X",
+      unitText: "X",
+      unitKind: "move",
+      depth: "recall",
+      restsOn: [],
+      attempt: "partial answer",
+      latencyMs: 5000,
+      hintsUsed: 0,
+    });
+    expect(r2.ok).toBe(false);
+    expect(r2.failed).toBe(true);
+    expect(r2.tier).toBe("fallback");
+  });
+
+  it("rotates prompt cache by variant and passes priorPrompts + delayedTransfer to prompt writer", async () => {
+    const bodies: string[] = [];
+    let n = 0;
+    const mockFetch: typeof fetch = async (_url, init) => {
+      bodies.push(String(init?.body ?? ""));
+      n++;
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: n === 1 ? "First hat question?" : "Unseen card transfer question?" } }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const unit = { id: "u_lin", text: "Linearity of expectation with indicator variables", kind: "move" };
+
+    const p0 = await judge.promptFor(unit, [], "recall", { variant: 0 });
+    expect(p0).toBe("First hat question?");
+    // Same variant hits cache
+    expect(await judge.promptFor(unit, [], "recall", { variant: 0 })).toBe("First hat question?");
+    expect(bodies).toHaveLength(1);
+
+    // Next variant misses cache and passes priorPrompts + delayedTransfer
+    const p1 = await judge.promptFor(unit, [], "use", {
+      variant: 1,
+      priorPrompts: [p0],
+      delayedTransfer: true,
+    });
+    expect(p1).toBe("Unseen card transfer question?");
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toContain("First hat question?");
+    expect(bodies[1]).toContain("HELD-OUT TRANSFER CHECK");
+  });
+
+  it("validates grounded inline annotations and filters out hallucinated non-matching quotes", async () => {
+    const mockFetch: typeof fetch = async (url) => {
+      if (String(url).includes("/decisions")) {
+        return new Response(
+          JSON.stringify({
+            model: "typesafe/jev-1.14",
+            answers: {
+              demonstrated: { type: "noul", noul: 0.3 },
+              cot_gap: { type: "noul", noul: 0.9 },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  message: "Check the sign on your offset term.",
+                  ok: false,
+                  grade: "again",
+                  annotations: [
+                    { quote: "+ sum_i E[(mu - xbar)**2]", note: "Should this be minus?", kind: "slip" },
+                    { quote: "this quote does not exist in attempt", note: "Hallucinated pin", kind: "question" },
+                  ],
+                  habit_observed: null,
+                  missing_prereqs: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const res = await judge.check({
+      prompt: "Estimate sample variance",
+      unitText: "sum(xi - xbar)^2 = sum(xi - mu)^2 - n(xbar - mu)^2",
+      unitKind: "move",
+      depth: "use",
+      restsOn: [],
+      attempt: "then E[sigmabar] = 1/4(sum_i E[(xi - mu)**2] + sum_i E[(mu - xbar)**2])",
+      latencyMs: 12000,
+      hintsUsed: 0,
+    });
+    expect(res.ok).toBe(false);
+    expect(res.annotations).toEqual([
+      { quote: "+ sum_i E[(mu - xbar)**2]", note: "Should this be minus?", kind: "slip" },
+    ]);
+  });
+
+  it("never caches a transient defaultPrompt fallback when prompt generation fails", async () => {
+    let attempt = 0;
+    const mockFetch: typeof fetch = async () => {
+      attempt++;
+      if (attempt === 1) return new Response("upstream 503", { status: 503 });
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "A real generated prompt?" } }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const unit = { id: "u_retry", text: "Sample variance divides by n - 1 rather than n", kind: "distinction" };
+    const first = await judge.promptFor(unit, [], "use", { variant: 0 });
+    expect(first).toContain("Apply this distinction");
+    const second = await judge.promptFor(unit, [], "use", { variant: 0 });
+    expect(second).toBe("A real generated prompt?");
+  });
+
+  it("repairs unescaped LaTeX backslashes and control-char collisions like \\times inside judge JSON", () => {
+    const raw = '{"message": "Right — $\\bar{x}$ and $d_k \\times d_v$ and $\\mu$, so $\\frac{1}{10}\\sum(x_i - \\bar{x})^2$ is smaller.", "ok": true}';
+    const brokenRaw = raw.replace(/\\\\/g, "\\"); // single backslashes like \mu, \sum, \bar, \frac, \times
+    const parsed = parseJudgeJson<{ message: string; ok: boolean }>(brokenRaw);
+    expect(parsed?.ok).toBe(true);
+    expect(parsed?.message).toContain("\\mu");
+    expect(parsed?.message).toContain("\\sum");
+    expect(parsed?.message).toContain("\\times");
+    expect(parsed?.message).toContain("\\bar{x}");
+    expect(parsed?.message).toContain("\\frac{1}{10}");
+    // Also repair valid JSON where \times silently became <TAB>imes
+    const validJsonWithTab = '{"message": "Shape is $d_k \\times d_v$ and $L \\times L$.", "ok": true}'.replace(/\\\\times/g, "\\times");
+    const parsedTab = parseJudgeJson<{ message: string; ok: boolean }>(validJsonWithTab);
+    expect(parsedTab?.message).toBe("Shape is $d_k \\times d_v$ and $L \\times L$.");
+  });
+
+  it("tidies rough code cosmetically via cheap model and strips accidental markdown fences", async () => {
+    const bodies: string[] = [];
+    const mockFetch: typeof fetch = async (_url, init) => {
+      bodies.push(String(init?.body ?? ""));
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: "```python\ndef rms_norm(x):\n    return x / rms\n```" } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const out = await judge.tidyInput("def rms_norm(x)\n  ret x/rms");
+    expect(out).toEqual({ text: "def rms_norm(x):\n    return x / rms", changed: true });
+    expect(bodies[0]).toContain("google/gemini-2.5-flash-lite");
+    expect(bodies[0]).toContain("NEVER complete unfinished code");
+  });
+
+  it("consolidates learner memory in dream() and injects learnerMemory into check() and promptFor()", async () => {
+    const bodies: string[] = [];
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const body = String(init?.body ?? "");
+      bodies.push(body);
+      if (body.includes("offline memory consolidation")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    memory: "## Baseline & Horizons\n- Strong PyTorch intuition; working toward KDA.\n\n## Active Blind Spots\n- Occasionally flips batch vs feature dims on broadcast.",
+                    summary: "Promoted broadcasting blind spot and graduated softmax gradient scaling.",
+                    promoted: ["Flips batch vs feature dims on broadcast"],
+                    graduated: ["1/sqrt(d_k) variance scaling"],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({ choices: [{ message: { content: "A calibrated prompt?" } }] }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const res = await judge.dream({
+      currentMemory: "",
+      updatedBy: "dream",
+      masteredUnits: [{ text: "1/sqrt(d_k) scaling prevents softmax saturation", p_imm: 0.94, reviews: 3 }],
+      shakyUnits: [{ text: "RMSNorm gamma has shape (d,) not (B,)", p_imm: 0.4, reviews: 1 }],
+      recentAttempts: [],
+      recentExplorations: [],
+      recentOverrides: [],
+    });
+    expect(res.memory).toContain("Baseline & Horizons");
+    expect(res.promoted).toEqual(["Flips batch vs feature dims on broadcast"]);
+    expect(res.graduated).toEqual(["1/sqrt(d_k) variance scaling"]);
+
+    const prompt = await judge.promptFor(
+      { id: "u_mem", text: "RMSNorm learned scale gamma broadcasts across trailing feature dim", kind: "mechanism" },
+      [],
+      "recall",
+      { variant: 0, learnerMemory: res.memory },
+    );
+    expect(prompt).toBe("A calibrated prompt?");
+    expect(bodies[1]).toContain("Strong PyTorch intuition");
+  });
+});

@@ -80,10 +80,15 @@ export class Sync {
   /** A one-off line from the tutor's side, such as a failed reply. It is not part of the record. */
   notice: string | null = null;
   private source: EventSource | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
   private listeners = new Set<Listener>();
   private ids = new Set<string>();
 
-  constructor(readonly session: Me) {}
+  constructor(
+    readonly session: Me,
+    private readonly opts: { passive?: boolean } = {},
+  ) {}
 
   get head(): number {
     return this.events.at(-1)?.seq ?? 0;
@@ -99,9 +104,15 @@ export class Sync {
   }
 
   start(): void {
+    this.stopped = false;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     if (this.source) return;
     // EventSource reconnects by itself and sends Last-Event-ID, so the server resumes after the last seq.
-    const es = new EventSource(`/api/stream?after=${this.head}`);
+    const qs = `after=${this.head}${this.opts.passive ? "&passive=1" : ""}`;
+    const es = new EventSource(`/api/stream?${qs}`);
     this.source = es;
     es.addEventListener("open", () => {
       this.connected = true;
@@ -145,8 +156,10 @@ export class Sync {
 
   private async recover(): Promise<void> {
     this.source = null;
+    if (this.stopped) return;
     try {
       if ((await me()) === null) {
+        if (this.stopped) return;
         this.signedOut = true;
         this.changed();
         return;
@@ -154,10 +167,19 @@ export class Sync {
     } catch {
       /* server unreachable: try again shortly */
     }
-    setTimeout(() => this.start(), 2000);
+    if (this.stopped) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (!this.stopped) this.start();
+    }, 2000);
   }
 
   stop(): void {
+    this.stopped = true;
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     this.source?.close();
     this.source = null;
     this.connected = false;

@@ -35,6 +35,7 @@ import type { Files } from "../files.js";
 import type { Sandbox } from "../sandbox.js";
 import type { Appended, EventStore } from "../store.js";
 import type { Stores } from "../stores.js";
+import { agyComplete, AgySession, type AgyOptions, type SittingSession } from "./agy.js";
 import { anchorLabel, buildSittingContext, formatAgo, newcomerUnit, openPage, probeNote, tailOf, type ThreadMessage } from "./context.js";
 import { changedLines, OBSERVE_PAUSE_MS, observationPrompt, parseVerdict, TRIAGE_SYSTEM, triagePrompt, WORKING_MS, type Verdict } from "./observer.js";
 import { runReport } from "./runs.js";
@@ -65,7 +66,9 @@ export type ModelSource = (userId: string) => Promise<ModelChoice>;
 
 export interface TutorOptions {
   systemPrompt: string;
-  model: ModelSource;
+  model?: ModelSource | undefined;
+  /** Optional Antigravity CLI (`agy`) backend instead of a direct API key. */
+  agy?: AgyOptions | undefined;
   /** Where Pi may keep its files. Nothing of the learner's is written there. */
   agentDir: string;
   thinkingLevel?: CreateAgentSessionOptions["thinkingLevel"];
@@ -98,7 +101,7 @@ export class Tutor {
   private imported = new Set<string>();
   /** The seq of the last learner message the tutor has been given. */
   private answeredThrough = 0;
-  private session: AgentSession | null = null;
+  private session: SittingSession | null = null;
   private sittingSince = 0;
   private lastTurnAt = 0;
   private pending = new Set<Trigger>();
@@ -317,13 +320,24 @@ export class Tutor {
       const page = this.workingPage(now);
       if (page && (await this.thinkingAloud(page, asked))) return;
     }
-    const session = await this.sitting(now, new Set(asked.map((m) => m.id)));
+    let session: SittingSession;
+    try {
+      session = await this.sitting(now, new Set(asked.map((m) => m.id)));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log(`tutor could not start sitting for ${this.userId}: ${msg}`);
+      this.endSitting();
+      const lastAsked = asked.at(-1);
+      const anchor = lastAsked?.anchor ? this.carry(lastAsked.anchor) : null;
+      this.emit({ id: uuidv7(now), text: "", done: true, anchor, error: formatTutorError(msg) });
+      return;
+    }
     const state = this.store.state;
     const events = out.length > 0 ? this.store.read(0, -1) : [];
     const debrief = out.map(
       (r) => `[app: the timed run's clock reached zero. Tell them time is up in a few words, then debrief.]\n\n${runReport(r, events, now)}\n\n[app: ${DEBRIEF}]`,
     );
-    const sees = session.model?.input.includes("image") ?? false;
+    const sees = session.supportsImages;
     const images: ImageContent[] = [];
     let prompt: string;
     if (asked.length > 0) {
@@ -360,32 +374,31 @@ export class Tutor {
     this.emit(draft);
 
     let separate = false;
-    const off = session.subscribe((ev) => {
-      if (ev.type === "message_start" && ev.message.role === "assistant") separate = draft.text.length > 0;
-      if (ev.type === "message_update" && ev.assistantMessageEvent.type === "text_delta") {
-        let d = ev.assistantMessageEvent.delta;
-        if (draft.text === "") d = d.trimStart();
-        else if (separate && d.trim()) {
-          d = `\n\n${d.trimStart()}`;
-          separate = false;
-        }
-        if (!d) return;
-        draft.text += d;
-        this.emit(draft);
-      }
-    });
-
     let error: string | null = null;
     try {
-      await session.prompt(prompt, images.length > 0 ? { images } : undefined);
+      const res = await session.prompt(prompt, {
+        ...(images.length > 0 ? { images } : {}),
+        onNewMessage: () => {
+          separate = draft.text.length > 0;
+        },
+        onDelta: (rawDelta) => {
+          let d = rawDelta;
+          if (draft.text === "") d = d.trimStart();
+          else if (separate && d.trim()) {
+            d = `\n\n${d.trimStart()}`;
+            separate = false;
+          }
+          if (!d) return;
+          draft.text += d;
+          this.emit(draft);
+        },
+      });
+      if (res.error) error = res.error;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      off();
       this.turnInfo = null;
     }
-    const last = session.messages.findLast((m) => m.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
-    if (!error && (last?.stopReason === "error" || last?.stopReason === "aborted")) error = last.errorMessage ?? last.stopReason;
 
     this.current = null;
     if (error) {
@@ -393,7 +406,7 @@ export class Tutor {
       this.endSitting();
       // Units already recorded in this turn still get their cards.
       if (info.cards.length > 0) this.post(draft.id, "", info.cards, anchor);
-      this.emit({ id: draft.id, text: "", done: true, anchor, error: "The tutor could not answer just now. Your message is kept, and it will answer when you next send." });
+      this.emit({ id: draft.id, text: "", done: true, anchor, error: formatTutorError(error) });
       return;
     }
     if (asked.length > 0) this.answeredThrough = Math.max(this.answeredThrough, ...asked.map((m) => m.seq));
@@ -419,7 +432,7 @@ export class Tutor {
   }
 
   /** The session for this sitting. A new sitting starts after a long enough break. */
-  private async sitting(now: number, exclude: Set<string>): Promise<AgentSession> {
+  private async sitting(now: number, exclude: Set<string>): Promise<SittingSession> {
     const last = Math.max(this.lastTurnAt, this.sittingSince);
     if (this.session && now - last < this.gap) return this.session;
     this.endSitting();
@@ -436,13 +449,28 @@ export class Tutor {
       scheduler: this.store.scheduler,
       page,
     });
+    const tools = tutorTools(host);
+
+    if (this.opts.agy) {
+      const agySession = await AgySession.create({
+        agy: this.opts.agy,
+        systemPrompt: this.opts.systemPrompt + APP_NOTE,
+        context,
+        tools,
+      });
+      this.session = agySession;
+      this.sittingSince = now;
+      return agySession;
+    }
+
+    if (!this.opts.model) throw new Error("No tutor model configured.");
     mkdirSync(this.opts.agentDir, { recursive: true });
     const loader = new DefaultResourceLoader({
       cwd: this.opts.agentDir,
       agentDir: this.opts.agentDir,
       extensionFactories: [
         (pi) => {
-          for (const t of tutorTools(host)) pi.registerTool(t);
+          for (const t of tools) pi.registerTool(t);
         },
       ],
       noSkills: true,
@@ -466,9 +494,10 @@ export class Tutor {
       sessionManager: SessionManager.inMemory(this.opts.agentDir),
       settingsManager: SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: retry, maxRetries: 2, baseDelayMs: 1500 } }),
     });
-    this.session = session;
+    const wrapped = wrapPiSession(session);
+    this.session = wrapped;
     this.sittingSince = now;
-    return session;
+    return wrapped;
   }
 
   // --- The quiet observer --------------------------------------------------------------------
@@ -538,14 +567,22 @@ export class Tutor {
     this.remember(page);
     const level = this.opts.thinkingLevel ?? "low";
     try {
-      const { runtime, model } = await (this.opts.triageModel ?? this.opts.model)(this.userId);
-      const res = await runtime.completeSimple(
-        model,
-        { systemPrompt: TRIAGE_SYSTEM, messages: [{ role: "user", content: prompt, timestamp: this.now() }] },
-        level === "off" ? {} : { reasoning: level as never },
-      );
-      if (res.stopReason === "error" || res.stopReason === "aborted") throw new Error(res.errorMessage ?? res.stopReason);
-      const text = res.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+      let text: string;
+      const triageSource = this.opts.triageModel ?? this.opts.model;
+      if (triageSource) {
+        const { runtime, model } = await triageSource(this.userId);
+        const res = await runtime.completeSimple(
+          model,
+          { systemPrompt: TRIAGE_SYSTEM, messages: [{ role: "user", content: prompt, timestamp: this.now() }] },
+          level === "off" ? {} : { reasoning: level as never },
+        );
+        if (res.stopReason === "error" || res.stopReason === "aborted") throw new Error(res.errorMessage ?? res.stopReason);
+        text = res.content.map((c) => (c.type === "text" ? c.text : "")).join("");
+      } else if (this.opts.agy) {
+        text = await agyComplete(this.opts.agy, TRIAGE_SYSTEM, prompt);
+      } else {
+        return null;
+      }
       const v = parseVerdict(text);
       if (!v) throw new Error(`no verdict in ${JSON.stringify(text.slice(0, 200))}`);
       this.log(`observer: page ${page.id} rev ${page.rev}${said.length ? `, ${said.length} said` : ""}: ${JSON.stringify(v)}`);
@@ -573,20 +610,19 @@ export class Tutor {
     this.turnInfo = info;
     const before = this.messages.length;
     let text = "";
-    const off = session.subscribe((ev) => {
-      if (ev.type === "message_update" && ev.assistantMessageEvent.type === "text_delta") text += ev.assistantMessageEvent.delta;
-    });
     let error: string | null = null;
     try {
-      await session.prompt(prompt);
+      const res = await session.prompt(prompt, {
+        onDelta: (d) => {
+          text += d;
+        },
+      });
+      if (res.error) error = res.error;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
-      off();
       this.turnInfo = null;
     }
-    const last = session.messages.findLast((m) => m.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
-    if (!error && (last?.stopReason === "error" || last?.stopReason === "aborted")) error = last.errorMessage ?? last.stopReason;
     if (error) {
       this.log(`observation failed for ${this.userId}: ${error}`);
       this.endSitting();
@@ -736,7 +772,74 @@ export function keyEnvFor(provider: string): string {
   return `${provider.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY`;
 }
 
+/** Wraps a Pi AgentSession into the shared SittingSession interface. */
+function wrapPiSession(session: AgentSession): SittingSession {
+  return {
+    get supportsImages() {
+      return session.model?.input.includes("image") ?? false;
+    },
+    async prompt(text, opts?: { images?: ImageContent[]; onDelta?: (delta: string) => void; onNewMessage?: () => void }) {
+      let out = "";
+      const off = session.subscribe((ev) => {
+        if (ev.type === "message_start" && ev.message.role === "assistant") opts?.onNewMessage?.();
+        if (ev.type === "message_update" && ev.assistantMessageEvent.type === "text_delta") {
+          const d = ev.assistantMessageEvent.delta;
+          out += d;
+          opts?.onDelta?.(d);
+        }
+      });
+      let error: string | undefined;
+      try {
+        await session.prompt(text, opts?.images && opts.images.length > 0 ? { images: opts.images } : undefined);
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
+      } finally {
+        off();
+      }
+      const last = session.messages.findLast((m) => m.role === "assistant") as { stopReason?: string; errorMessage?: string } | undefined;
+      if (!error && (last?.stopReason === "error" || last?.stopReason === "aborted")) {
+        error = last.errorMessage ?? last.stopReason;
+      }
+      return error ? { text: out, error } : { text: out };
+    },
+    abort: () => session.abort(),
+    dispose: () => session.dispose(),
+  };
+}
+
 /** A page as the tutor last saw it: a run changes what it reads without changing its revision. */
 function seenKey(page: PageState): string {
   return `${page.rev}:${page.run?.at ?? 0}`;
+}
+
+/** Turns raw provider JSON/stack errors into a concise, actionable UI message. */
+export function formatTutorError(raw: string): string {
+  let msg = raw.trim();
+  // Unwrap nested provider JSON error payloads (e.g. Google/OpenRouter double-encoded JSON).
+  for (let depth = 0; depth < 3; depth++) {
+    const start = msg.indexOf("{");
+    if (start < 0) break;
+    try {
+      const parsed = JSON.parse(msg.slice(start)) as { error?: { message?: string; code?: number; status?: string }; message?: string };
+      const inner = parsed?.error?.message ?? parsed?.message;
+      if (typeof inner === "string" && inner.trim()) {
+        msg = inner.trim();
+        continue;
+      }
+    } catch {
+      /* not JSON */
+    }
+    break;
+  }
+  const clean = msg.replace(/\s+/g, " ").trim();
+  if (/402|prepayment|credits? (?:are )?depleted|insufficient (?:credits?|balance|quota)|RESOURCE_EXHAUSTED/i.test(raw)) {
+    return `Tutor model error (402 / quota): ${clean.slice(0, 220)}`;
+  }
+  if (/401|403|invalid.*api.?key|unauthorized|authentication/i.test(raw)) {
+    return `Tutor model auth error: ${clean.slice(0, 220)}`;
+  }
+  if (/429|rate limit/i.test(raw)) {
+    return `Tutor rate-limited: ${clean.slice(0, 200)}`;
+  }
+  return `Tutor error: ${(clean || "could not answer just now").slice(0, 220)}`;
 }

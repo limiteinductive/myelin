@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACTIVITIES, importStudyMode, metrics, type Metrics } from "@myelin/core";
-import { keyEnvFor, ModelKeys, providerName, Registry, Stores, startServer, type RunningServer, type SandboxOptions, type TutorOptions, type User } from "@myelin/server";
+import { hostModel, keyEnvFor, ModelKeys, providerName, Registry, Stores, startServer, type RunningServer, type SandboxOptions, type TutorOptions, type User } from "@myelin/server";
 
 export const DEFAULT_PORT = 4317;
 
@@ -34,13 +34,35 @@ export const providerOf = (spec: string) => spec.split("/")[0] ?? "";
  * The tutor and whose key it runs on. The first user runs on the host's key, if it is set; everyone
  * else brings their own. Never logs a key.
  */
-export async function tutorFromEnv(dir: string, registry: Registry, log: (s: string) => void): Promise<{ tutor: TutorOptions; keys: ModelKeys }> {
+export async function tutorFromEnv(dir: string, registry: Registry, log: (s: string) => void): Promise<{ tutor: TutorOptions; keys?: ModelKeys | undefined }> {
   const spec = modelSpec();
   const provider = providerOf(spec);
-  const keyName = keyEnvFor(provider);
-  const hostKey = process.env[keyName] || undefined;
   const agentDir = join(dir, "pi");
   const triage = process.env.MYELIN_TRIAGE_MODEL;
+  const pause = Number(process.env.MYELIN_OBSERVE_PAUSE_MS);
+
+  // Local Antigravity CLI backend: MYELIN_MODEL=agy or MYELIN_MODEL=agy/<model-slug>
+  if (provider === "agy") {
+    const model = spec.includes("/") ? spec.slice(spec.indexOf("/") + 1).trim() || undefined : undefined;
+    let triageModel: TutorOptions["triageModel"];
+    if (triage && providerOf(triage) !== "agy") {
+      const tKey = process.env[keyEnvFor(providerOf(triage))];
+      if (tKey) triageModel = await hostModel({ spec: triage, apiKey: tKey, agentDir });
+    }
+    log(`The tutor is Antigravity CLI (agy${model ? `, model ${model}` : ", default model"})${triageModel ? `, with ${triage} for triage` : ""}.`);
+    const tutor: TutorOptions = {
+      systemPrompt: readFileSync(promptPath(), "utf8"),
+      agy: { binary: process.env.MYELIN_AGY_BIN || undefined, model, effort: process.env.MYELIN_AGY_EFFORT || undefined },
+      triageModel,
+      agentDir,
+      timeZone: process.env.TZ || undefined,
+    };
+    if (pause > 0) tutor.observePauseMs = pause;
+    return { tutor, keys: undefined };
+  }
+
+  const keyName = keyEnvFor(provider);
+  const hostKey = process.env[keyName] || undefined;
   const keys = await ModelKeys.create({
     registry,
     agentDir,
@@ -52,7 +74,6 @@ export async function tutorFromEnv(dir: string, registry: Registry, log: (s: str
   const name = providerName(provider);
   log(hostKey ? `You run on ${keyName}. Each friend brings their own ${name} key.` : `${keyName} is not set, so every learner, you too, brings their own ${name} key.`);
   const tutor: TutorOptions = { systemPrompt: readFileSync(promptPath(), "utf8"), model: keys.model, triageModel: keys.triage, agentDir, timeZone: process.env.TZ || undefined };
-  const pause = Number(process.env.MYELIN_OBSERVE_PAUSE_MS);
   if (pause > 0) tutor.observePauseMs = pause;
   return { tutor, keys };
 }
@@ -121,7 +142,7 @@ export function invite(name: string, opts: { data?: string; url?: string }): { u
     const base = opts.url ?? process.env.MYELIN_URL ?? `http://localhost:${DEFAULT_PORT}`;
     const provider = providerOf(modelSpec());
     const owner = registry.users()[0]?.id === user.id;
-    const hasKey = registry.modelKey(user.id, provider) !== undefined || (owner && !!process.env[keyEnvFor(provider)]);
+    const hasKey = provider === "agy" || registry.modelKey(user.id, provider) !== undefined || (owner && !!process.env[keyEnvFor(provider)]);
     return { user, created, link: linkFor(base, registry.issueLink(user.id)), bringsKey: hasKey ? null : providerName(provider) };
   } finally {
     registry.close();

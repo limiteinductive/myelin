@@ -68,11 +68,18 @@ const succeeded = (grade: string | null) => grade !== null && grade !== "again";
 
 function useProbes(state: State): { at: number; unit: Unit; ok: boolean }[] {
   const out: { at: number; unit: Unit; ok: boolean }[] = [];
-  for (const ev of Object.values(state.evidence)) {
-    if (ev.source !== "probe" || ev.depth !== "use" || ev.grade === null || ev.slot === "imported") continue;
-    const unit = state.units[ev.unit_id];
-    if (!unit || ev.at - unit.found_at < USE_AFTER_MS) continue;
-    out.push({ at: ev.at, unit, ok: succeeded(ev.grade) });
+  for (const unit of Object.values(state.units)) {
+    const probes = unit.evidence
+      .map((id) => state.evidence[id])
+      .filter((ev): ev is Evidence => ev !== undefined && ev.source === "probe" && ev.grade !== null)
+      .sort((a, b) => a.at - b.at || a.seq - b.seq);
+    let lastExposure = unit.found_at;
+    for (const ev of probes) {
+      if (ev.depth === "use" && ev.slot !== "imported" && ev.at - lastExposure >= USE_AFTER_MS) {
+        out.push({ at: ev.at, unit, ok: succeeded(ev.grade) });
+      }
+      if (ev.at > lastExposure) lastExposure = ev.at;
+    }
   }
   return out;
 }

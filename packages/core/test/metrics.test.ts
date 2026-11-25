@@ -51,21 +51,34 @@ describe("metrics", () => {
       ev("unit.found", { unit_id: unit, text: "A", kind: "fact", origin: "derived" }, -30 * D, "server:tutor"),
       ev("unit.found", { unit_id: late, text: "B", kind: "fact", origin: "hint" }, -2 * D, "server:tutor"),
       ev("unit.found", { unit_id: uuidv7(T0 - 40 * D), text: "C", kind: "fact", origin: "imported" }, -2 * D, "server:tutor"),
-      probe(unit, "use", "good", -3 * D),
+      // 19 days after found -> qualifies (>= 7d since previous exposure)
+      probe(unit, "use", "good", -11 * D),
+      // 10 days after the -11d probe -> qualifies (>= 7d since previous exposure)
       probe(unit, "use", "again", -D),
+      // Same day as -D -> too soon since last exposure, and recall anyway
       probe(unit, "recall", "good", -D),
+      // Only 1 day after late was found -> does NOT qualify
       probe(late, "use", "good", -D),
     ]);
 
-  it("counts use probes a week or more after the unit was found", () => {
+  it("counts use probes a week or more after the unit's previous exposure", () => {
     const events = log();
     const m = metrics(events, replay(events, fsrsScheduler()), T0, "UTC");
     expect(m.use).toEqual({ probes: 2, succeeded: 1, units: 1 });
     const week = m.weeks.find((w) => w.week === "2026-11-16")!;
     expect(week.units_found).toBe(1);
     expect(week.use).toEqual({ probes: 1, succeeded: 0 });
-    // Three days before a Wednesday is the Sunday of the week before.
-    expect(m.weeks.find((w) => w.week === "2026-11-09")!.use).toEqual({ probes: 1, succeeded: 1 });
+    // 11 days before Wednesday Nov 18 is Saturday Nov 7 (week of Mon Nov 2).
+    expect(m.weeks.find((w) => w.week === "2026-11-02")!.use).toEqual({ probes: 1, succeeded: 1 });
+
+    // A second use probe only 2 days after the previous exposure does NOT count even when found_at is 30d ago.
+    const recentEvents = seqd([
+      ev("unit.found", { unit_id: unit, text: "A", kind: "fact", origin: "derived" }, -30 * D, "server:tutor"),
+      probe(unit, "use", "good", -3 * D),
+      probe(unit, "use", "again", -D),
+    ]);
+    const recentM = metrics(recentEvents, replay(recentEvents, fsrsScheduler()), T0, "UTC");
+    expect(recentM.use).toEqual({ probes: 1, succeeded: 1, units: 1 });
   });
 
   it("sets predicted recall against recall and rebuild outcomes, once there is a review to predict from", () => {
