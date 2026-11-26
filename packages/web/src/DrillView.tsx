@@ -265,9 +265,6 @@ export function DrillView() {
   const [pinningMap, setPinningMap] = createSignal(false);
   const [pinnedMap, setPinnedMap] = createSignal(false);
   const [manualAddedIds, setManualAddedIds] = createSignal<string[]>([]);
-  const [wrapDismissed, setWrapDismissed] = createSignal(false);
-
-  const EXPLORE_WRAP_THRESHOLD = 6;
 
   // Active stage accessors backed directly by PracticeStore (fine-grained, single source of truth).
   const isExplore = () => practice.state.stage.kind === "explore";
@@ -309,7 +306,6 @@ export function DrillView() {
       (u) => u.due && !practice.state.sittingCompletedIds[u.unit_id] && ids.has(u.unit_id),
     );
   });
-  const firstDueForBatch = () => dueFromExplore()[0] ?? null;
 
   // Mutators targeting the current stage (or an explicitly captured ownerKey for async requests).
   const setDraftFor = (key: string, value: string) => {
@@ -496,7 +492,6 @@ export function DrillView() {
     setPinnedMap(false);
     setBumpOpen(false);
     setManualAddedIds([]);
-    setWrapDismissed(false);
     setError(null);
     clearSketch();
   };
@@ -2596,43 +2591,6 @@ export function DrillView() {
               </Show>
             </form>
           </div>
-        </Show>
-
-        {/* Warm overload nudge once an exploration has accumulated a batch of still-unpracticed due units */}
-        <Show when={isExploreMode() && dueFromExplore().length >= EXPLORE_WRAP_THRESHOLD && !wrapDismissed() && firstDueForBatch()}>
-          {(target) => {
-            const batchCount = () => dueFromExplore().length;
-            return (
-              <div class="v2-wrap-nudge" role="status">
-                <div class="v2-wrap-nudge-copy">
-                  <span class="v2-wrap-nudge-title">
-                    {batchCount()} cards ready to practice
-                  </span>
-                  <span class="v2-wrap-nudge-sub">
-                    This thread stays saved in the sidebar.
-                  </span>
-                </div>
-                <div class="v2-wrap-nudge-actions">
-                  <button
-                    type="button"
-                    class="v2-wrap-nudge-btn is-primary"
-                    onClick={() => practice.selectUnit(target().unit_id)}
-                  >
-                    Practice {batchCount()}
-                  </button>
-                  <button
-                    type="button"
-                    class="v2-wrap-nudge-dismiss"
-                    aria-label="Keep exploring for now"
-                    data-tip="Keep exploring for now"
-                    onClick={() => setWrapDismissed(true)}
-                  >
-                    ×
-                  </button>
-                </div>
-              </div>
-            );
-          }}
         </Show>
 
         {/* Explicit active question card in Explore mode: quiet header + 1-click Tell me */}
