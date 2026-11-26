@@ -1768,14 +1768,24 @@ body,
   padding: 4px 0;
   user-select: none;
 }
+.v2-post-coach-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 6px;
+  border-top: 1px solid var(--v2-border);
+}
 .v2-post-promote {
   appearance: none;
   border: 0;
   background: transparent;
   color: var(--v2-muted);
-  font: 500 12px/1 var(--v2-font-sans);
-  padding: 5px 8px;
-  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: 500 11.5px/1 var(--v2-font-sans);
+  padding: 4px 7px;
+  margin-right: -7px;
+  border-radius: 6px;
   cursor: pointer;
   white-space: nowrap;
   flex: none;
@@ -1783,7 +1793,7 @@ body,
 }
 .v2-post-promote:hover {
   color: var(--v2-fg);
-  background: var(--v2-surface-2);
+  background: var(--v2-quiet-fill);
 }
 
 .v2-interval-btn {

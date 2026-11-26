@@ -59,6 +59,7 @@ export interface ExploreResponse {
   demonstrated_cruxes?: number[];
   frontier?: Frontier;
   exploration?: { id: string; title: string };
+  sidecar_pending?: boolean;
   rep_fix_applied?: {
     changes: string[];
     grade?: Grade;
@@ -316,6 +317,16 @@ export function fetchExplorations(
 ): Promise<{ explorations: SavedExploration[]; archived?: SavedExploration[] }> {
   return req<{ explorations: SavedExploration[]; archived?: SavedExploration[] }>(
     "/api/explorations",
+    signal ? { signal } : undefined,
+  );
+}
+
+export function waitExplorationSidecar(
+  id: string,
+  signal?: AbortSignal,
+): Promise<{ exploration_id: string; turn_index?: number; title?: string; added_units: AddedUnit[] }> {
+  return req<{ exploration_id: string; turn_index?: number; title?: string; added_units: AddedUnit[] }>(
+    `/api/explorations/${encodeURIComponent(id)}/sidecar`,
     signal ? { signal } : undefined,
   );
 }

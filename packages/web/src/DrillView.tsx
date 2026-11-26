@@ -22,6 +22,7 @@ import {
   respondFrontier,
   saveExploration,
   tidyDraft,
+  waitExplorationSidecar,
   type AddedUnit,
   type CheckDrillResponse,
   type Frontier,
@@ -926,6 +927,7 @@ export function DrillView() {
         added: AddedUnit[];
         frontier?: Frontier;
         exploration?: { id: string; title: string };
+        sidecarPending?: boolean;
         demonstratedCruxes?: number[];
         failed: boolean;
       }
@@ -962,6 +964,7 @@ export function DrillView() {
         added: res.added_units,
         frontier: res.frontier,
         exploration: res.exploration,
+        ...(res.sidecar_pending ? { sidecarPending: true } : {}),
         failed: Boolean(res.failed),
       };
     }
@@ -1185,6 +1188,20 @@ export function DrillView() {
         practice.updateFrontierDemonstrated(frontier.id, out.demonstratedCruxes);
       }
       if (added && added.length > 0) void practice.refreshQueue({ preserveOrder: true });
+      if (out.kind === "explore" && out.sidecarPending && !failed) {
+        const expIdForSidecar = out.exploration?.id ?? savedExp?.id;
+        if (expIdForSidecar) {
+          void waitExplorationSidecar(expIdForSidecar)
+            .then((meta) => {
+              if (disposed) return;
+              if (meta.title || meta.added_units.length > 0) {
+                void practice.refreshExplorations();
+                if (meta.added_units.length > 0) void practice.refreshQueue({ preserveOrder: true });
+              }
+            })
+            .catch(() => {});
+        }
+      }
       requestAnimationFrame(() => {
         autoGrow();
         scrollPadIntoView();
@@ -1329,6 +1346,20 @@ export function DrillView() {
         practice.updateFrontierDemonstrated(frontier.id, out.demonstratedCruxes);
       }
       if (added && added.length > 0) void practice.refreshQueue({ preserveOrder: true });
+      if (out.kind === "explore" && out.sidecarPending && !failed) {
+        const expIdForSidecar = out.exploration?.id ?? savedExp?.id;
+        if (expIdForSidecar) {
+          void waitExplorationSidecar(expIdForSidecar)
+            .then((meta) => {
+              if (disposed) return;
+              if (meta.title || meta.added_units.length > 0) {
+                void practice.refreshExplorations();
+                if (meta.added_units.length > 0) void practice.refreshQueue({ preserveOrder: true });
+              }
+            })
+            .catch(() => {});
+        }
+      }
       requestAnimationFrame(() => {
         autoGrow();
         scrollPadIntoView();
@@ -2552,6 +2583,21 @@ export function DrillView() {
                           </div>
                         </Show>
                         <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
+                        <Show when={!postBusy() && idx() === postBeats().length - 1 && !beat.pending && !failed()}>
+                          <div class="v2-post-coach-foot">
+                            <button
+                              type="button"
+                              class="v2-post-promote"
+                              data-tip="Continue this thread as a full exploration"
+                              onClick={() => void openPostAsExploration()}
+                            >
+                              <span>Open as exploration</span>
+                              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                <path d="M3.5 8.5l5-5M4.75 3.5H8.5v3.75" />
+                              </svg>
+                            </button>
+                          </div>
+                        </Show>
                       </div>
                     </div>
                   );
@@ -2584,16 +2630,6 @@ export function DrillView() {
                   <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
                   </svg>
-                </button>
-              </Show>
-              <Show when={!postBusy() && postBeats().some((b) => !b.pending && !isFailedBeat(b)) && !postInput().trim()}>
-                <button
-                  type="button"
-                  class="v2-post-promote"
-                  data-tip="Continue as a full exploration"
-                  onClick={() => void openPostAsExploration()}
-                >
-                  Open as exploration ↗
                 </button>
               </Show>
             </form>

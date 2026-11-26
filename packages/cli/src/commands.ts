@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACTIVITIES, importStudyMode, metrics, type Metrics } from "@myelin/core";
-import { hostModel, keyEnvFor, ModelKeys, providerName, Registry, Stores, startServer, type RunningServer, type SandboxOptions, type TutorOptions, type User } from "@myelin/server";
+import { hostModel, keyEnvFor, ModelKeys, providerName, readPerfRecords, Registry, Stores, startServer, summarizePerf, type RunningServer, type SandboxOptions, type TutorOptions, type User } from "@myelin/server";
 
 export const DEFAULT_PORT = 4317;
 
@@ -166,6 +166,57 @@ export function importStudyModeFile(path: string, opts: { data?: string; user?: 
     stores.close();
     registry.close();
   }
+}
+
+export function perfReport(opts: { data?: string; last?: number } = {}): { file: string; count: number; text: string } {
+  const dir = dataDir(opts.data);
+  const file = join(dir, "perf.jsonl");
+  const records = readPerfRecords(file, opts.last);
+  let quality: { probes: number; overrides: number; units_found: number; units_undone_5m: number } | undefined;
+  try {
+    const registry = new Registry(dir);
+    const stores = new Stores(dir);
+    try {
+      const users = registry.users();
+      let probes = 0;
+      let overrides = 0;
+      let units_found = 0;
+      let units_undone_5m = 0;
+      for (const u of users) {
+        const store = stores.get(u.id);
+        const events = store.read(0, -1);
+        const foundAt = new Map<string, number>();
+        for (const ev of events) {
+          if (ev.type === "unit.probed") {
+            const p = ev.payload as { corrects?: string | null };
+            if (p.corrects) overrides++;
+            else probes++;
+          } else if (ev.type === "unit.found") {
+            const p = ev.payload as { unit_id?: string };
+            if (p.unit_id) {
+              units_found++;
+              foundAt.set(p.unit_id, ev.ts);
+            }
+          } else if (ev.type === "unit.retired") {
+            const p = ev.payload as { unit_id?: string };
+            const tFound = p.unit_id ? foundAt.get(p.unit_id) : undefined;
+            if (tFound !== undefined && ev.ts - tFound <= 5 * 60_000) {
+              units_undone_5m++;
+            }
+          }
+        }
+      }
+      if (probes > 0 || units_found > 0) {
+        quality = { probes, overrides, units_found, units_undone_5m };
+      }
+    } finally {
+      stores.close();
+      registry.close();
+    }
+  } catch {
+    /* ignore missing/uninitialized DB when running perf on standalone logs */
+  }
+  return { file, count: records.length, text: summarizePerf(records, quality) };
 }
 
 /**

@@ -48,7 +48,7 @@ Put environment variables in `.env` (never committed):
 
 - **Option 1 — Local Antigravity CLI subscription (no API key needed):**
   - `MYELIN_MODEL=agy`
-  - `MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low` (or `agy/gemini-4-neon-medium`)
+  - `MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low` (Explorations stay on `gemini-4-neon-low`; fast Drill checks auto-route to `gemini-4-hydrogen-low`; override with `MYELIN_EXPLORE_MODEL` / `MYELIN_DRILL_MODEL`)
 - **Option 2 — OpenRouter API:**
   - `OPENROUTER_API_KEY=...`
   - `MYELIN_JUDGE_MODEL=...` (optional model override)
@@ -79,5 +79,6 @@ npm test
 node packages/cli/dist/main.js up [--port 4317] [--host 127.0.0.1] [--data DIR]
 node packages/cli/dist/main.js invite <name> [--url URL]
 node packages/cli/dist/main.js metrics [name]
+node packages/cli/dist/main.js perf [--data DIR] [--last N]   # or `npm run perf`
 node packages/cli/dist/main.js deploy <ssh-host> [--domain D]
 ```

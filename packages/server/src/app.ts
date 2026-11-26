@@ -11,6 +11,7 @@ import { streamSSE } from "hono/streaming";
 import { FileError, type Files } from "./files.js";
 import { FrontierStore, type Frontier } from "./frontiers.js";
 import { FastJudge } from "./judge.js";
+import { formatServerTiming, PerfLog, type PerfOp, type PerfRecord } from "./perf.js";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
 import { pickDrillDepth, RwkvInstantEngine, unitExposureStats, type RwkvUnitScore } from "./rwkv.js";
 import type { Sandbox } from "./sandbox.js";
@@ -49,6 +50,8 @@ export interface AppOptions {
   rwkv?: RwkvInstantEngine | null | undefined;
   /** Fast System 1 (Jev) -> System 2 (LLM) cascade judge for live micro-production reps. */
   judge?: FastJudge | undefined;
+  /** Optional passive latency log (`perf.jsonl`). */
+  perf?: PerfLog | undefined;
   /** Optional data directory for persisting chapter/source frontiers. */
   dataDir?: string | undefined;
 }
@@ -96,8 +99,9 @@ export function missingPhoto(e: { type?: unknown; payload?: unknown }, kept: (id
 
 const isHttps = (c: Context) => (c.req.header("x-forwarded-proto") ?? new URL(c.req.url).protocol.replace(":", "")) === "https";
 
-export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, files, rwkv, judge = new FastJudge(), dataDir }: AppOptions): Hono<Env> {
+export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, files, rwkv, judge = new FastJudge(), perf, dataDir }: AppOptions): Hono<Env> {
   const app = new Hono<Env>();
+  const perfLog = perf ?? (dataDir ? new PerfLog(join(dataDir, "perf.jsonl")) : undefined);
   const frontiers = new FrontierStore(dataDir ? join(dataDir, "frontiers.json") : undefined);
   const dreamingUsers = new Set<string>();
   const idleDreamTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -569,6 +573,28 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     });
   }
 
+  const normUnitText = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]+/g, " ").replace(/\s+/g, " ").trim();
+  const unitTokens = (s: string) => new Set(normUnitText(s).split(" ").filter((w) => w.length > 2));
+  const isNearDuplicate = (candidate: string, existingTexts: Iterable<string>): boolean => {
+    const nc = normUnitText(candidate);
+    if (!nc) return true;
+    const tc = unitTokens(candidate);
+    for (const ex of existingTexts) {
+      const ne = normUnitText(ex);
+      if (ne === nc) return true;
+      if (tc.size >= 4) {
+        const te = unitTokens(ex);
+        if (te.size >= 4) {
+          let inter = 0;
+          for (const w of tc) if (te.has(w)) inter++;
+          const union = tc.size + te.size - inter;
+          if (union > 0 && inter / union >= 0.75) return true;
+        }
+      }
+    }
+    return false;
+  };
+
   function autoAddPrereqs(
     store: ReturnType<Stores["get"]>,
     targetUnit: Unit,
@@ -576,18 +602,21 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     now: number,
   ): { unit_id: string; text: string; kind: string; observe_only: boolean }[] {
     if (!prereqs || prereqs.length === 0) return [];
-    const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim();
     const state = store.state;
     const byNorm = new Map<string, Unit>();
+    const activeTexts: string[] = [];
     for (const u of Object.values(state.units)) {
-      if (u.status === "active") byNorm.set(norm(u.text), u);
+      if (u.status === "active") {
+        byNorm.set(normUnitText(u.text), u);
+        activeTexts.push(u.text);
+      }
     }
     const added: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
     const nextRestsOn = new Set(targetUnit.rests_on);
     let linkedChanged = false;
     for (const [idx, p] of prereqs.entries()) {
-      const key = norm(p.text);
-      if (!key || key === norm(targetUnit.text)) continue;
+      const key = normUnitText(p.text);
+      if (!key || key === normUnitText(targetUnit.text)) continue;
       const existing = byNorm.get(key);
       if (existing) {
         if (existing.id !== targetUnit.id && !existing.observe_only && !nextRestsOn.has(existing.id)) {
@@ -596,6 +625,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
         continue;
       }
+      if (isNearDuplicate(p.text, activeTexts)) continue;
       const unit_id = uuidv7(now + 10 + idx);
       const ev = makeEvent(
         "unit.found",
@@ -615,6 +645,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       store.append([ev]);
       const created = store.state.units[unit_id];
       if (created) byNorm.set(key, created);
+      activeTexts.push(p.text);
       nextRestsOn.add(unit_id);
       linkedChanged = true;
       added.push({ unit_id, text: p.text, kind: p.kind || "definition", observe_only: false });
@@ -671,36 +702,100 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     };
   }
 
+  interface PendingExploreSidecar {
+    exploration_id: string;
+    turn_index: number;
+    title?: string | undefined;
+    added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[];
+  }
+  const pendingExploreSidecars = new Map<string, Promise<PendingExploreSidecar>>();
+
   /**
    * Streams live coach prose over SSE when `?stream=1` is passed (emitting `delta` text updates
    * followed by one final `done` JSON payload), or returns regular JSON for non-streaming callers.
+   * Wires real `AbortSignal` propagation so client cancel immediately aborts the LLM turn and skips
+   * stale SQLite mutations, merges LLM + post-LLM timing into `perf.jsonl`, and sets `Server-Timing`.
    */
-  function respondMaybeStream<T>(c: Context, work: (onText?: (partial: string) => void) => Promise<T>) {
+  function respondMaybeStream<T>(
+    c: Context,
+    work: (onText?: (partial: string) => void, onPerf?: (rec: PerfRecord) => void, signal?: AbortSignal) => Promise<T>,
+    op?: PerfOp,
+  ) {
+    const reqStart = Date.now();
+    let llmRec: PerfRecord | undefined;
+    let abortedAtMs: number | undefined;
+    const capturePerf = op ? (rec: PerfRecord) => { llmRec = rec; } : undefined;
+    const finalizePerf = (ok: boolean, aborted: boolean, errMsg?: string): PerfRecord | undefined => {
+      if (!op || !perfLog) return undefined;
+      const totalMs = Math.max(0, Date.now() - reqStart);
+      const base = llmRec;
+      const llmSpan = base?.total_ms ?? base?.llm_ms;
+      const postMs = llmSpan !== undefined ? Math.max(0, totalMs - llmSpan) : undefined;
+      const merged: PerfRecord = {
+        ...(base ?? { ts: reqStart, op, ok }),
+        ts: base?.ts ?? reqStart,
+        op,
+        ok: ok && (base ? base.ok : true),
+        ...(aborted ? { aborted: true, ...(abortedAtMs !== undefined ? { aborted_at_ms: abortedAtMs } : {}) } : {}),
+        ...(postMs !== undefined ? { post_ms: postMs } : {}),
+        total_ms: totalMs,
+        ...(errMsg && !base?.error ? { error: errMsg } : {}),
+      };
+      perfLog.record(merged);
+      return merged;
+    };
+
     if (c.req.query("stream") !== "1") {
-      return work(undefined).then((res) => c.json(res));
+      return work(undefined, capturePerf, c.req.raw.signal).then(
+        (res) => {
+          const rec = finalizePerf(true, false);
+          if (rec) c.header("Server-Timing", formatServerTiming(rec));
+          return c.json(res);
+        },
+        (err) => {
+          const aborted = Boolean(c.req.raw.signal?.aborted) || (err instanceof Error && err.name === "AbortError");
+          finalizePerf(false, aborted, err instanceof Error ? err.message : String(err));
+          throw err;
+        },
+      );
     }
     return streamSSE(c, async (stream) => {
+      const ac = new AbortController();
+      const triggerAbort = () => {
+        if (abortedAtMs === undefined) abortedAtMs = Math.max(0, Date.now() - reqStart);
+        if (!ac.signal.aborted) ac.abort();
+      };
+      stream.onAbort(triggerAbort);
+      if (c.req.raw.signal) {
+        if (c.req.raw.signal.aborted) triggerAbort();
+        else c.req.raw.signal.addEventListener("abort", triggerAbort, { once: true });
+      }
       let lastSent = "";
       let sendChain: Promise<void> = Promise.resolve();
       const onText = (partial: string) => {
-        if (stream.aborted || !partial || partial === lastSent) return;
+        if (stream.aborted || ac.signal.aborted || !partial || partial === lastSent) return;
         lastSent = partial;
         sendChain = sendChain.then(() =>
-          stream.aborted ? undefined : stream.writeSSE({ event: "delta", data: JSON.stringify({ text: partial }) }),
+          stream.aborted || ac.signal.aborted ? undefined : stream.writeSSE({ event: "delta", data: JSON.stringify({ text: partial }) }),
         );
       };
       try {
-        const final = await work(onText);
+        const final = await work(onText, capturePerf, ac.signal);
         await sendChain;
-        if (!stream.aborted) {
+        const wasAborted = stream.aborted || ac.signal.aborted;
+        finalizePerf(!wasAborted, wasAborted);
+        if (!wasAborted) {
           await stream.writeSSE({ event: "done", data: JSON.stringify(final) });
         }
       } catch (err) {
         await sendChain;
-        if (!stream.aborted) {
+        const wasAborted = stream.aborted || ac.signal.aborted || (err instanceof Error && err.name === "AbortError");
+        const msg = err instanceof Error ? err.message : "stream failed";
+        finalizePerf(false, wasAborted, msg);
+        if (!wasAborted) {
           await stream.writeSSE({
             event: "error",
-            data: JSON.stringify({ error: err instanceof Error ? err.message : "stream failed" }),
+            data: JSON.stringify({ error: msg }),
           });
         }
       }
@@ -748,7 +843,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       return reviews === 0 || (nextIn !== null ? nextIn <= 0 : (s?.p_imm ?? 0) < 0.85);
     });
     judge.warmPrompts(
-      (toWarm.length > 0 ? toWarm : candidates).slice(0, 8).map((u) => {
+      (toWarm.length > 0 ? toWarm : candidates).slice(0, 12).map((u) => {
         const depth = pickDrillDepth(u, state);
         const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
         const stats = unitExposureStats(state, u.id, depth, now);
@@ -872,6 +967,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const store = stores.get(user.id);
     const id = c.req.param("id");
     store.archiveExploration(id, true);
+    judge.closeSession(`explore:${id}`);
     return c.json({ ok: true, id });
   });
 
@@ -888,19 +984,42 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const store = stores.get(user.id);
     const id = c.req.param("id");
     store.deleteExploration(id);
+    judge.closeSession(`explore:${id}`);
+    pendingExploreSidecars.delete(id);
     return c.json({ ok: true, id });
   });
 
+  app.get("/api/explorations/:id/sidecar", async (c) => {
+    const id = c.req.param("id");
+    const pending = pendingExploreSidecars.get(id);
+    if (!pending) return c.json({ exploration_id: id, added_units: [] });
+    try {
+      const res = await pending;
+      return c.json(res);
+    } catch {
+      return c.json({ exploration_id: id, added_units: [] });
+    }
+  });
+
   app.post("/api/drill/tidy", async (c) => {
+    const t0 = Date.now();
     const body = (await c.req.json().catch(() => null)) as { text?: string } | null;
     const text = typeof body?.text === "string" ? body.text : "";
     if (!text.trim()) return c.json({ text, changed: false });
     if (text.length > 8000) return c.json({ error: "draft too long to tidy" }, 400);
+    let rec: PerfRecord | undefined;
     try {
-      const res = await judge.tidyInput(text);
+      const res = await judge.tidyInput(text, (r) => {
+        rec = r;
+      });
+      const finalRec: PerfRecord = { ...(rec ?? { ts: t0, op: "tidy", ok: true }), total_ms: Date.now() - t0 };
+      perfLog?.record(finalRec);
+      c.header("Server-Timing", formatServerTiming(finalRec));
       return c.json(res);
     } catch (e) {
-      return c.json({ error: e instanceof Error ? e.message : "Could not format draft." }, 502);
+      const msg = e instanceof Error ? e.message : "Could not format draft.";
+      perfLog?.record({ ts: t0, op: "tidy", ok: false, total_ms: Date.now() - t0, error: msg });
+      return c.json({ error: msg }, 502);
     }
   });
 
@@ -942,29 +1061,38 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           const s = scores.get(u.id);
           return { text: u.text, p_imm: s?.p_imm ?? 0, reviews: s?.reviews ?? 0 };
         });
-      return respondMaybeStream(c, async () => {
-        const planned = await judge.planFrontier({
-          request: initial,
-          existingUnits: existingWithStrength,
-          learnerMemory: learnerMemoryOf(store),
-        });
-        const record: BriefingRecord = {
-          id: uuidv7(now),
-          title: planned.title,
-          source: initial,
-          body: planned.body,
-          skipped_known: planned.skipped_known,
-          cruxes: planned.cruxes,
-          demonstrated_cruxes: [],
-          turns: [],
-          created_at: now,
-          updated_at: now,
-        };
-        store.saveBriefing(record);
-        return { message: "", added_units: [], frontier: briefingToFrontier(record) };
-      });
+      return respondMaybeStream(
+        c,
+        async (_onText, onPerf, signal) => {
+          const planned = await judge.planFrontier(
+            {
+              request: initial,
+              existingUnits: existingWithStrength,
+              learnerMemory: learnerMemoryOf(store),
+            },
+            onPerf,
+            signal,
+          );
+          if (signal?.aborted) return { message: "", added_units: [] };
+          const record: BriefingRecord = {
+            id: uuidv7(now),
+            title: planned.title,
+            source: initial,
+            body: planned.body,
+            skipped_known: planned.skipped_known,
+            cruxes: planned.cruxes,
+            demonstrated_cruxes: [],
+            turns: [],
+            created_at: now,
+            updated_at: now,
+          };
+          store.saveBriefing(record);
+          return { message: "", added_units: [], frontier: briefingToFrontier(record) };
+        },
+        "briefing-plan",
+      );
     }
-    return respondMaybeStream(c, async (onText) => {
+    return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const repUnit = body?.rep_context?.unit_id ? resolveUnit(state, body.rep_context.unit_id) : null;
       const repDepth: Depth =
         body?.rep_context?.depth && ["recall", "rebuild", "explain", "use"].includes(body.rep_context.depth)
@@ -976,8 +1104,20 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         body?.rep_context?.grade && ["again", "hard", "good", "easy"].includes(body.rep_context.grade)
           ? body.rep_context.grade
           : "good";
+
+      const isStandaloneExploration = !initial.startsWith("Completed practice on:");
+      const preNow = Date.now();
+      const standaloneExpId = isStandaloneExploration
+        ? typeof body?.exploration_id === "string" && body.exploration_id.trim()
+          ? body.exploration_id.trim()
+          : uuidv7(preNow)
+        : null;
+      const decoupleMeta = isStandaloneExploration && !repUnit;
+
       const res = await judge.explore(
         {
+          sessionKey: standaloneExpId ? `explore:${standaloneExpId}` : undefined,
+          decoupleMeta,
           initial,
           sketchDataUrl: sketch,
           turns,
@@ -997,7 +1137,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             : {}),
         },
         onText,
+        onPerf,
+        signal,
       );
+
+      if (signal?.aborted) {
+        return { message: "", added_units: [] };
+      }
 
       // Apply any self-healing rep fixes when the learner gave meta-feedback on a completed drill.
       let rep_fix_applied:
@@ -1063,16 +1209,14 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
       }
 
-      const isStandaloneExploration = !initial.startsWith("Completed practice on:");
       const willPromotePostFollowUp =
         !isStandaloneExploration && Boolean(body?.promote_on_unit) && !res.failed && res.suggested_units.length > 0;
       const now = Date.now();
-      const expId =
-        isStandaloneExploration && typeof body?.exploration_id === "string" && body.exploration_id.trim()
-          ? body.exploration_id.trim()
-          : isStandaloneExploration || willPromotePostFollowUp
-            ? uuidv7(now)
-            : null;
+      const expId = isStandaloneExploration
+        ? standaloneExpId
+        : willPromotePostFollowUp
+          ? uuidv7(now)
+          : null;
       const existingExp = isStandaloneExploration && expId ? store.getExploration(expId) : null;
       const explorationTitle = isStandaloneExploration
         ? existingExp?.title || res.title || fallbackExplorationTitle(initial)
@@ -1080,18 +1224,14 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           ? res.title || fallbackExplorationTitle(res.suggested_units[0]?.text || body?.reply || initial)
           : null;
 
-      // Optimistically auto-add crystallized units (with duplicate guard); learner can undo with Remove.
-      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim();
-      const existingNorm = new Set(
-        Object.values(state.units)
-          .filter((u) => u.status === "active")
-          .map((u) => norm(u.text)),
-      );
+      // Optimistically auto-add crystallized units (exact + near-duplicate guard); learner can undo with Remove.
+      const activeUnitTexts = Object.values(store.state.units)
+        .filter((u) => u.status === "active")
+        .map((u) => u.text);
       const added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
       for (const [idx, u] of res.suggested_units.entries()) {
-        const key = norm(u.text);
-        if (!key || existingNorm.has(key)) continue;
-        existingNorm.add(key);
+        if (isNearDuplicate(u.text, activeUnitTexts)) continue;
+        activeUnitTexts.push(u.text);
         const unit_id = uuidv7(now + idx);
         const ev = makeEvent(
           "unit.found",
@@ -1125,8 +1265,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       // Persist standalone explorations, or auto-promote a post-pass drill follow-up once it adds a map unit.
       let exploration: ExplorationRecord | undefined;
+      let savedTurnIndex = 0;
+      const userText = (body?.reply?.trim() || initial || "(sketch)").trim();
       if (!res.failed && expId && explorationTitle && (isStandaloneExploration || (willPromotePostFollowUp && added_units.length > 0))) {
-        const userText = (body?.reply?.trim() || initial || "(sketch)").trim();
         let nextTurns: ExplorationRecord["turns"];
         if (isStandaloneExploration) {
           const prevTurns = existingExp?.turns ?? [];
@@ -1139,6 +1280,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               ...(added_units.length > 0 ? { added: added_units } : {}),
             },
           ].slice(-60);
+          savedTurnIndex = nextTurns.length - 1;
         } else {
           const priorPost = Array.isArray(body?.prior_post_turns)
             ? body.prior_post_turns
@@ -1163,6 +1305,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             rawTurns[0] = { ...rawTurns[0], user: `> ${origin.replace(/\n+/g, " ")}\n${rawTurns[0].user}` };
           }
           nextTurns = rawTurns.slice(-60);
+          savedTurnIndex = nextTurns.length - 1;
         }
         exploration = {
           id: expId,
@@ -1173,6 +1316,98 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         };
         store.saveExploration(exploration);
       }
+
+      // Fire non-blocking post-turn sidecar for standalone explorations so unit crystallization & title
+      // refinement add 0ms to foreground TTFT and stream smoothly onto the saved beat once ready.
+      let sidecarPending = false;
+      if (decoupleMeta && !res.failed && expId && exploration) {
+        sidecarPending = true;
+        const needsTitle = !existingExp;
+        const fallbackTitleUsed = exploration.title;
+        const sidecarPromise: Promise<PendingExploreSidecar> = (async () => {
+          try {
+            const meta = await judge.extractExploreMeta({
+              userText,
+              coachMessage: res.message,
+              coachQuestion: res.question,
+              priorTurns: turns,
+              existingUnits,
+              activeHabits: habits,
+              needsTitle,
+            });
+            const sNow = Date.now();
+            const liveExp = store.getExploration(expId);
+            const finalTitle =
+              needsTitle && meta.title && liveExp && liveExp.title === fallbackTitleUsed ? meta.title : liveExp?.title ?? fallbackTitleUsed;
+
+            const currentActiveTexts = Object.values(store.state.units)
+              .filter((u) => u.status === "active")
+              .map((u) => u.text);
+            const sidecarAdded: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
+            for (const [idx, u] of meta.suggested_units.entries()) {
+              if (isNearDuplicate(u.text, currentActiveTexts)) continue;
+              currentActiveTexts.push(u.text);
+              const unit_id = uuidv7(sNow + idx);
+              store.append([
+                makeEvent(
+                  "unit.found",
+                  {
+                    unit_id,
+                    text: u.text,
+                    kind: u.kind || (u.observe_only ? "thinking move" : "move"),
+                    topic: finalTitle,
+                    rests_on: [],
+                    origin: u.observe_only ? "observed" : "need",
+                    told: Boolean(u.told),
+                    observe_only: u.observe_only,
+                    message_id: null,
+                  },
+                  { id: uuidv7(sNow + idx), device_id: DRILL_DEVICE, ts: sNow + idx },
+                ),
+              ]);
+              sidecarAdded.push({ unit_id, text: u.text, kind: u.kind, observe_only: u.observe_only });
+            }
+            if (sidecarAdded.length > 0) {
+              judge.warmPrompts(
+                sidecarAdded
+                  .filter((u) => !u.observe_only)
+                  .map((u) => ({
+                    unit: { id: u.unit_id, text: u.text, kind: u.kind, topic: finalTitle },
+                    restsOn: [],
+                    depth: "recall" as Depth,
+                  })),
+              );
+            }
+            if (liveExp && (sidecarAdded.length > 0 || finalTitle !== liveExp.title)) {
+              const updatedTurns = liveExp.turns.map((t, i) =>
+                i === savedTurnIndex && sidecarAdded.length > 0
+                  ? { ...t, added: [...(t.added ?? []), ...sidecarAdded] }
+                  : t,
+              );
+              store.saveExploration({
+                ...liveExp,
+                title: finalTitle,
+                turns: updatedTurns,
+                updated_at: sNow,
+              });
+            }
+            return {
+              exploration_id: expId,
+              turn_index: savedTurnIndex,
+              ...(finalTitle !== fallbackTitleUsed ? { title: finalTitle } : {}),
+              added_units: sidecarAdded,
+            };
+          } catch {
+            return { exploration_id: expId, turn_index: savedTurnIndex, added_units: [] };
+          } finally {
+            setTimeout(() => {
+              if (pendingExploreSidecars.get(expId) === sidecarPromise) pendingExploreSidecars.delete(expId);
+            }, 30_000);
+          }
+        })();
+        pendingExploreSidecars.set(expId, sidecarPromise);
+      }
+
       if (!res.failed) scheduleIdleDream(user.id, store);
 
       return {
@@ -1180,13 +1415,15 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ...(res.question ? { question: res.question } : {}),
         added_units,
         ...(exploration ? { exploration: { id: exploration.id, title: exploration.title } } : {}),
+        ...(sidecarPending ? { sidecar_pending: true } : {}),
         ...(rep_fix_applied ? { rep_fix_applied } : {}),
         ...(res.failed ? { failed: true } : {}),
       };
-    });
+    }, "explore");
   });
 
   app.get("/api/drill/next", async (c) => {
+    const t0 = Date.now();
     const { user } = c.get("session");
     const store = stores.get(user.id);
     store.catchUp();
@@ -1222,6 +1459,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const depth = pickDrillDepth(picked, state);
     const restsOn = picked.rests_on.map((id) => state.units[id]?.text ?? id);
     const stats = unitExposureStats(state, picked.id, depth, now);
+    const cacheHit = judge.peekPrompt(picked, depth, restsOn, stats.depthPasses) !== null;
     const prompt = await judge.promptFor(picked, restsOn, depth, {
       variant: stats.depthPasses,
       priorPrompts: stats.priorPrompts,
@@ -1229,6 +1467,40 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       learnerMemory: learnerMemoryOf(store),
     });
     const trend = latencyTrend(state, picked);
+    const nextRec: PerfRecord = {
+      ts: t0,
+      op: "next",
+      worker: cacheHit ? "cache" : "prompt",
+      cache_hit: cacheHit,
+      ok: true,
+      total_ms: Date.now() - t0,
+    };
+    perfLog?.record(nextRec);
+    c.header("Server-Timing", formatServerTiming(nextRec));
+
+    // Eagerly prefetch the next 4 upcoming cards while the learner works on this one.
+    const upcoming = rankDrillCandidates(
+      candidates.filter((u) => u.id !== picked.id),
+      state,
+      scores,
+    ).slice(0, 4);
+    if (upcoming.length > 0) {
+      judge.warmPrompts(
+        upcoming.map((u) => {
+          const d = pickDrillDepth(u, state);
+          const ro = u.rests_on.map((id) => state.units[id]?.text ?? id);
+          const st = unitExposureStats(state, u.id, d, now);
+          return {
+            unit: u,
+            restsOn: ro,
+            depth: d,
+            variant: st.depthPasses,
+            priorPrompts: st.priorPrompts,
+            delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
+          };
+        }),
+      );
+    }
 
     return c.json({
       scheduler,
@@ -1278,13 +1550,23 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const prompt = body.prompt?.trim() || (await judge.promptFor(u, restsOn, depth));
 
     if (body.hint_only) {
-      const h = await judge.hint({
-        prompt,
-        unitText: u.text,
-        restsOn,
-        attempt: body.attempt ?? "",
-        rung: body.rung ?? 1,
-      });
+      const t0 = Date.now();
+      let hintRec: PerfRecord | undefined;
+      const h = await judge.hint(
+        {
+          prompt,
+          unitText: u.text,
+          restsOn,
+          attempt: body.attempt ?? "",
+          rung: body.rung ?? 1,
+        },
+        (r) => {
+          hintRec = r;
+        },
+      );
+      const finalRec: PerfRecord = { ...(hintRec ?? { ts: t0, op: "hint", ok: true }), total_ms: Date.now() - t0 };
+      perfLog?.record(finalRec);
+      c.header("Server-Timing", formatServerTiming(finalRec));
       return c.json(h);
     }
 
@@ -1316,9 +1598,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       .filter((u2) => u2.status === "active" && !u2.observe_only)
       .map((u2) => u2.text);
 
-    return respondMaybeStream(c, async (onText) => {
+    return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.check(
         {
+          sessionKey: `drill:${attemptId}`,
           prompt,
           unitText: u.text,
           unitKind: u.kind,
@@ -1334,7 +1617,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           hintsUsed,
         },
         onText,
+        onPerf,
+        signal,
       );
+
+      if (signal?.aborted) {
+        return { ...verdict, attempt_id: attemptId, added_units: [], probe_id: null, latency_ms: latencyMs, prev_latency_ms: trend.prev_ms, next_in_ms: null, scheduler };
+      }
 
       const addedUnits = autoAddPrereqs(store, u, verdict.missing_prereqs, now);
 
@@ -1377,6 +1666,30 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
         const after = scoreAll(store.state, store.scheduler, now + 2);
         nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
+        // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
+        const postState = store.state;
+        const refreshedU = postState.units[u.id] ?? u;
+        const postCandidates = rankDrillCandidates(
+          Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only && x.id !== u.id),
+          postState,
+          after.scores,
+        ).slice(0, 3);
+        const warmTargets = [refreshedU, ...postCandidates];
+        judge.warmPrompts(
+          warmTargets.map((item) => {
+            const d = pickDrillDepth(item, postState);
+            const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
+            const st = unitExposureStats(postState, item.id, d, now + 2);
+            return {
+              unit: item,
+              restsOn: ro,
+              depth: d,
+              variant: st.depthPasses,
+              priorPrompts: st.priorPrompts,
+              delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
+            };
+          }),
+        );
         scheduleIdleDream(user.id, store);
       }
 
@@ -1418,7 +1731,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       });
 
       return payload;
-    });
+    }, "check");
   });
 
   app.post("/api/drill/followup", async (c) => {
@@ -1469,9 +1782,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
     const questionText = (body.question ?? "").trim();
 
-    return respondMaybeStream(c, async (onText) => {
+    return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.continueRep(
         {
+          sessionKey: `drill:${attemptId}`,
           prompt: body.prompt ?? "",
           unitText: u.text,
           unitKind: u.kind,
@@ -1490,7 +1804,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           hintsUsed: assistanceCount,
         },
         onText,
+        onPerf,
+        signal,
       );
+
+      if (signal?.aborted) {
+        return { ...verdict, attempt_id: attemptId, added_units: [], probe_id: null, latency_ms: latencyMs, prev_latency_ms: trend.prev_ms, next_in_ms: null, scheduler };
+      }
 
       const addedUnits = autoAddPrereqs(store, u, verdict.missing_prereqs, now);
 
@@ -1530,6 +1850,30 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
         const after = scoreAll(store.state, store.scheduler, now + 2);
         nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
+        // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
+        const postState = store.state;
+        const refreshedU = postState.units[u.id] ?? u;
+        const postCandidates = rankDrillCandidates(
+          Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only && x.id !== u.id),
+          postState,
+          after.scores,
+        ).slice(0, 3);
+        const warmTargets = [refreshedU, ...postCandidates];
+        judge.warmPrompts(
+          warmTargets.map((item) => {
+            const d = pickDrillDepth(item, postState);
+            const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
+            const st = unitExposureStats(postState, item.id, d, now + 2);
+            return {
+              unit: item,
+              restsOn: ro,
+              depth: d,
+              variant: st.depthPasses,
+              priorPrompts: st.priorPrompts,
+              delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
+            };
+          }),
+        );
         scheduleIdleDream(user.id, store);
       }
 
@@ -1576,7 +1920,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       });
 
       return payload;
-    });
+    }, "follow-up");
   });
 
   app.post("/api/drill/attempts/:id/abandon", (c) => {
@@ -1587,6 +1931,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     if (existing && existing.status === "active") {
       store.upsertAttempt({ ...existing, status: "abandoned", updated_at: Date.now() });
     }
+    judge.closeSession(`drill:${id}`);
     return c.json({ ok: true, attempt_id: id });
   });
 
@@ -1675,17 +2020,24 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       .filter((x) => x.status === "active" && !x.observe_only)
       .map((x) => x.text);
 
+    const t0 = Date.now();
+    let auditRec: PerfRecord | undefined;
     try {
-      const audit = await judge.auditRep({
-        unitText: u.text,
-        unitKind: u.kind,
-        depth,
-        prompt: (body.prompt ?? "").trim(),
-        grade,
-        beats,
-        existingUnits,
-        learnerMemory: learnerMemoryOf(store),
-      });
+      const audit = await judge.auditRep(
+        {
+          unitText: u.text,
+          unitKind: u.kind,
+          depth,
+          prompt: (body.prompt ?? "").trim(),
+          grade,
+          beats,
+          existingUnits,
+          learnerMemory: learnerMemoryOf(store),
+        },
+        (r) => {
+          auditRec = r;
+        },
+      );
 
       const now = Date.now();
       const changes: string[] = [];
@@ -1740,6 +2092,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
       scheduleIdleDream(user.id, store);
 
+      const finalRec: PerfRecord = { ...(auditRec ?? { ts: t0, op: "audit", ok: true }), total_ms: Date.now() - t0 };
+      perfLog?.record(finalRec);
+      c.header("Server-Timing", formatServerTiming(finalRec));
+
       return c.json({
         analysis: audit.analysis,
         changes,
@@ -1750,7 +2106,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ...(audit.improved_prompt ? { improved_prompt: audit.improved_prompt } : {}),
       });
     } catch (e) {
-      return c.json({ error: e instanceof Error ? e.message : "Could not audit this rep." }, 502);
+      const msg = e instanceof Error ? e.message : "Could not audit this rep.";
+      perfLog?.record({ ...(auditRec ?? { ts: t0, op: "audit", ok: false }), ok: false, total_ms: Date.now() - t0, error: msg });
+      return c.json({ error: msg }, 502);
     }
   });
 
@@ -1940,12 +2298,20 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         return { text: u.text, p_imm: s?.p_imm ?? 0, reviews: s?.reviews ?? 0 };
       });
 
+    const t0 = Date.now();
+    let planRec: PerfRecord | undefined;
     try {
-      const planned = await judge.planFrontier({
-        request,
-        existingUnits,
-        learnerMemory: learnerMemoryOf(store),
-      });
+      const planned = await judge.planFrontier(
+        {
+          request,
+          existingUnits,
+          learnerMemory: learnerMemoryOf(store),
+        },
+        (r) => {
+          planRec = r;
+        },
+        c.req.raw.signal,
+      );
       const record: BriefingRecord = {
         id: uuidv7(now),
         title: planned.title,
@@ -1959,9 +2325,14 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         updated_at: now,
       };
       store.saveBriefing(record);
+      const finalRec: PerfRecord = { ...(planRec ?? { ts: t0, op: "briefing-plan", ok: true }), total_ms: Date.now() - t0 };
+      perfLog?.record(finalRec);
+      c.header("Server-Timing", formatServerTiming(finalRec));
       return c.json({ frontier: briefingToFrontier(record) });
     } catch (e) {
-      return c.json({ error: e instanceof Error ? e.message : "Could not generate briefing." }, 502);
+      const msg = e instanceof Error ? e.message : "Could not generate briefing.";
+      perfLog?.record({ ...(planRec ?? { ts: t0, op: "briefing-plan", ok: false }), ok: false, total_ms: Date.now() - t0, error: msg });
+      return c.json({ error: msg }, 502);
     }
   });
 
@@ -1972,6 +2343,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const id = c.req.param("id");
     store.deleteBriefing(id);
     frontiers.remove(user.id, id);
+    judge.closeSession(`briefing:${id}`);
     return c.json({ ok: true, id });
   });
 
@@ -2004,86 +2376,93 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       .map((u) => u.text);
     const habits = activeHabits(state).map((h) => h.text);
 
-    return respondMaybeStream(c, async (onText) => {
-      const res = await judge.discussBriefing(
-        {
-          title: frontier.title,
-          source: frontier.source,
-          body: frontier.body,
-          cruxes: frontier.cruxes,
-          demonstratedCruxes: frontier.demonstrated_cruxes,
-          turns,
-          reply,
-          testMe: Boolean(body?.test_me),
-          sketchDataUrl: sketch,
-          existingUnits,
-          activeHabits: habits,
-          learnerMemory: learnerMemoryOf(store),
-        },
-        onText,
-      );
-
-      const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim();
-      const existingNorm = new Set(
-        Object.values(state.units)
-          .filter((u) => u.status === "active")
-          .map((u) => norm(u.text)),
-      );
-      const added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
-      const now = Date.now();
-      for (const [idx, u] of res.suggested_units.entries()) {
-        const key = norm(u.text);
-        if (!key || existingNorm.has(key)) continue;
-        existingNorm.add(key);
-        const unit_id = uuidv7(now + idx);
-        store.append([
-          makeEvent(
-            "unit.found",
-            {
-              unit_id,
-              text: u.text,
-              kind: u.kind || (u.observe_only ? "thinking move" : "result"),
-              topic: frontier.title,
-              rests_on: [],
-              origin: u.observe_only ? "observed" : "need",
-              told: !Boolean(body?.test_me) && res.demonstrated_crux_index == null,
-              observe_only: u.observe_only,
-              message_id: null,
-            },
-            { id: uuidv7(now + idx), device_id: DRILL_DEVICE, ts: now + idx },
-          ),
-        ]);
-        added_units.push({ unit_id, text: u.text, kind: u.kind, observe_only: u.observe_only });
-      }
-      if (added_units.length > 0) {
-        judge.warmPrompts(
-          added_units
-            .filter((u) => !u.observe_only)
-            .map((u) => ({ unit: { id: u.unit_id, text: u.text, kind: u.kind, topic: frontier.title }, restsOn: [], depth: "recall" as Depth })),
+    return respondMaybeStream(
+      c,
+      async (onText, onPerf, signal) => {
+        const res = await judge.discussBriefing(
+          {
+            sessionKey: `briefing:${frontier.id}`,
+            title: frontier.title,
+            source: frontier.source,
+            body: frontier.body,
+            cruxes: frontier.cruxes,
+            demonstratedCruxes: frontier.demonstrated_cruxes,
+            turns,
+            reply,
+            testMe: Boolean(body?.test_me),
+            sketchDataUrl: sketch,
+            existingUnits,
+            activeHabits: habits,
+            learnerMemory: learnerMemoryOf(store),
+          },
+          onText,
+          onPerf,
+          signal,
         );
-      }
 
-      const nextDemo = new Set(frontier.demonstrated_cruxes);
-      if (typeof res.demonstrated_crux_index === "number") nextDemo.add(res.demonstrated_crux_index);
-      const nextTurns = res.failed
-        ? frontier.turns
-        : [
-            ...frontier.turns,
-            {
-              user: body?.test_me ? "Test me" : reply,
-              coach: res.message,
-              ...(added_units.length > 0 ? { added: added_units } : {}),
-            },
-          ].slice(-40);
-      store.updateBriefingProgress(frontier.id, nextTurns, [...nextDemo].sort((a, b) => a - b), now);
+        if (signal?.aborted) {
+          return { message: "", added_units: [], demonstrated_cruxes: frontier.demonstrated_cruxes };
+        }
 
-      return {
-        message: res.message,
-        added_units,
-        demonstrated_cruxes: [...nextDemo].sort((a, b) => a - b),
-        ...(res.failed ? { failed: true } : {}),
-      };
-    });
+        const activeUnitTexts = Object.values(store.state.units)
+          .filter((u) => u.status === "active")
+          .map((u) => u.text);
+        const added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
+        const now = Date.now();
+        for (const [idx, u] of res.suggested_units.entries()) {
+          if (isNearDuplicate(u.text, activeUnitTexts)) continue;
+          activeUnitTexts.push(u.text);
+          const unit_id = uuidv7(now + idx);
+          store.append([
+            makeEvent(
+              "unit.found",
+              {
+                unit_id,
+                text: u.text,
+                kind: u.kind || (u.observe_only ? "thinking move" : "result"),
+                topic: frontier.title,
+                rests_on: [],
+                origin: u.observe_only ? "observed" : "need",
+                told: !Boolean(body?.test_me) && res.demonstrated_crux_index == null,
+                observe_only: u.observe_only,
+                message_id: null,
+              },
+              { id: uuidv7(now + idx), device_id: DRILL_DEVICE, ts: now + idx },
+            ),
+          ]);
+          added_units.push({ unit_id, text: u.text, kind: u.kind, observe_only: u.observe_only });
+        }
+        if (added_units.length > 0) {
+          judge.warmPrompts(
+            added_units
+              .filter((u) => !u.observe_only)
+              .map((u) => ({ unit: { id: u.unit_id, text: u.text, kind: u.kind, topic: frontier.title }, restsOn: [], depth: "recall" as Depth })),
+          );
+        }
+
+        const nextDemo = new Set(frontier.demonstrated_cruxes);
+        if (typeof res.demonstrated_crux_index === "number") nextDemo.add(res.demonstrated_crux_index);
+        const nextTurns = res.failed
+          ? frontier.turns
+          : [
+              ...frontier.turns,
+              {
+                user: body?.test_me ? "Test me" : reply,
+                coach: res.message,
+                ...(added_units.length > 0 ? { added: added_units } : {}),
+              },
+            ].slice(-40);
+        store.updateBriefingProgress(frontier.id, nextTurns, [...nextDemo].sort((a, b) => a - b), now);
+
+        return {
+          message: res.message,
+          added_units,
+          demonstrated_cruxes: [...nextDemo].sort((a, b) => a - b),
+          ...(res.failed ? { failed: true } : {}),
+        };
+      },
+      "briefing",
+    );
   });
 
   app.all("/api/*", (c) => c.json({ error: "not found" }, 404));

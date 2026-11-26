@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { parseArgs } from "node:util";
-import { DEFAULT_PORT, importStudyModeFile, invite, loadEnv, metricsReport, up } from "./commands.js";
+import { DEFAULT_PORT, importStudyModeFile, invite, loadEnv, metricsReport, perfReport, up } from "./commands.js";
 import { deploy, onHost } from "./deploy.js";
 
 const HELP = `myelin <command>
@@ -16,6 +16,7 @@ const HELP = `myelin <command>
                                  Import a study-mode memory.jsonl
   metrics [name] [--data DIR]    Use after a week, predicted against actual recall, and active time
                                  per week, for one learner. For the person running the server.
+  perf [--data DIR] [--last N]   Show passive p50/p90 latency waterfalls from perf.jsonl
 
 invite and metrics take --on <ssh-host> to run on a deployed server.
 
@@ -39,6 +40,7 @@ async function main(argv: string[]): Promise<number> {
       user: { type: "string" },
       domain: { type: "string" },
       on: { type: "string" },
+      last: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
   });
@@ -86,6 +88,12 @@ async function main(argv: string[]): Promise<number> {
     }
     case "metrics": {
       const r = metricsReport({ data: values.data, user: rest.join(" ") || values.user });
+      console.log(r.text);
+      return 0;
+    }
+    case "perf": {
+      const last = values.last ? Number(values.last) : undefined;
+      const r = perfReport({ data: values.data, last: last && Number.isFinite(last) ? last : undefined });
       console.log(r.text);
       return 0;
     }

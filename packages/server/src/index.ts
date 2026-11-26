@@ -11,4 +11,6 @@ export * from "./tutor/tools.js";
 export * from "./tutor/observer.js";
 export * from "./sandbox.js";
 export * from "./rwkv.js";
+export * from "./perf.js";
+export * from "./agy-acp.js";
 export * from "./judge.js";

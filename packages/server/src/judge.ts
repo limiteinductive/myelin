@@ -11,7 +11,12 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import type { Depth, Grade } from "@myelin/core";
+import { AgyAcpClient, type AgyAcpAskOptions, type AgyTurnTrace } from "./agy-acp.js";
+import { PerfLog, type PerfOp, type PerfRecord, type PerfWorker } from "./perf.js";
 import { resolveAgyBinary } from "./tutor/agy.js";
+
+export type { AgyTurnTrace };
+export { AgyAcpClient };
 
 export interface JudgeHistoryItem {
   attempt: string;
@@ -19,6 +24,8 @@ export interface JudgeHistoryItem {
 }
 
 export interface JudgeInput {
+  /** Optional stable drill attempt ID used as KV-cached ACP session key (`drill:<attemptId>`). */
+  sessionKey?: string | undefined;
   prompt: string;
   unitText: string;
   unitKind: string;
@@ -31,7 +38,7 @@ export interface JudgeInput {
   history?: JudgeHistoryItem[] | undefined;
   /** Active personal Thinking Moves (meta-cognitive habits) being trained by this learner. */
   activeHabits?: string[];
-  /** Existing active units in the learner's Map so missing prerequisite suggestions don't duplicate them. */
+  /** Existing active units in the learner's Map (used for server-side dedup, not dumped into drill prompts). */
   existingUnits?: string[];
   /** Lean always-loaded learner memory profile (learner.md) built by offline Dreaming. */
   learnerMemory?: string | null | undefined;
@@ -163,18 +170,33 @@ export interface PlannedFrontier {
   cruxes: PlannedBriefingCrux[];
 }
 
+export interface ExploreSidecarResult {
+  title?: string | undefined;
+  suggested_units: ExploreUnitSuggestion[];
+}
+
 export interface JudgeOptions {
   apiKey?: string | undefined;
   jevModel?: string | undefined;
   llmModel?: string | undefined;
+  /** Optional dedicated fast model for Drill check/follow-up/hint/tidy (also via MYELIN_DRILL_MODEL). */
+  drillModel?: string | undefined;
+  /** Optional dedicated model for Explorations/Briefings (also via MYELIN_EXPLORE_MODEL). */
+  exploreModel?: string | undefined;
   /** Reasoning effort for System 2 (e.g. "low" | "medium" | "high"). Default "medium". */
   llmEffort?: string | undefined;
   /** Path to `agy` binary when `llmModel` starts with `agy` (e.g. `agy/gemini-4-neon-low`). */
   agyBinary?: string | undefined;
+  /** Transport for `agy`: `"acp"` (default persistent multiplexed daemon) or `"stream-json"`. */
+  agyTransport?: "acp" | "stream-json" | undefined;
+  /** Explicitly enable/disable OpenRouter Jev gate (defaults to off on `agy`, on for OpenRouter). */
+  enableJev?: boolean | undefined;
   /** Optional local directories exposed read-only to the interactive coach (also via MYELIN_RESOURCE_DIRS). */
   resourceDirs?: string[] | undefined;
   /** Optional JSON file path to persist generated prompts across restarts. */
   cachePath?: string | undefined;
+  /** Optional passive latency logger (`perf.jsonl`). */
+  perf?: PerfLog | undefined;
   /** Minimum Jev P(demonstrated) to auto-pass without System 2. Default 0.88. */
   passThreshold?: number | undefined;
   /** Maximum Jev P(cot_gap) to auto-pass without System 2. Default 0.30. */
@@ -264,17 +286,17 @@ function safeTempBase(): string {
 }
 
 /**
- * Extracts the partial `"message": "..."` string from an in-flight JSON response stream
- * so the UI can stream coach prose live without ever showing raw JSON or unvalidated grades.
+ * Extracts the partial `"message": "..."` string AND whether the JSON string value has closed
+ * from an in-flight JSON response stream, so callers can stream prose live and measure `tail_json_ms`.
  */
-export function extractStreamingJsonMessage(raw: string): string | null {
+export function extractStreamingJsonMessageState(raw: string): { text: string; closed: boolean } | null {
   const keyMatch = /"message"\s*:\s*"/.exec(raw);
   if (!keyMatch) return null;
   let i = keyMatch.index + keyMatch[0].length;
   let out = "";
   while (i < raw.length) {
     const ch = raw[i]!;
-    if (ch === '"') return out;
+    if (ch === '"') return { text: out, closed: true };
     if (ch === "\\") {
       if (i + 1 >= raw.length) break; // incomplete escape at chunk boundary
       const next = raw[i + 1]!;
@@ -303,16 +325,69 @@ export function extractStreamingJsonMessage(raw: string): string | null {
     out += ch;
     i++;
   }
-  return out;
+  return { text: out, closed: false };
+}
+
+/**
+ * Extracts the partial `"message": "..."` string from an in-flight JSON response stream
+ * so the UI can stream coach prose live without ever showing raw JSON or unvalidated grades.
+ */
+export function extractStreamingJsonMessage(raw: string): string | null {
+  return extractStreamingJsonMessageState(raw)?.text ?? null;
+}
+
+function trimLearnerMemory(mem: string | null | undefined, maxChars = 1600): string {
+  const clean = (mem ?? "").trim();
+  if (!clean) return "";
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, maxChars).trimEnd()}…`;
+}
+
+function isAbortError(err: unknown): boolean {
+  return Boolean(err && typeof err === "object" && (err as { name?: string }).name === "AbortError");
+}
+
+function stripAgyPrefix(spec: string): string | undefined {
+  if (!spec.startsWith("agy/")) return undefined;
+  return spec.slice(4).trim() || undefined;
 }
 
 interface WorkerTurn {
   text: string;
   proc: ChildProcessWithoutNullStreams;
   timer: ReturnType<typeof setTimeout>;
+  writtenAt: number;
+  firstEventAt?: number;
+  firstThinkAt?: number;
+  firstDeltaAt?: number;
+  initMs?: number;
+  toolsCount?: number;
+  inputTokens?: number;
+  cacheReadTokens?: number;
+  thinkingTokens?: number;
+  outputTokens?: number;
+  toolCalls: number;
+  stepTypes: Set<string>;
+  meta: {
+    cold_spawn: boolean;
+    spawn_ms: number;
+    turn_in_proc: number;
+    queue_wait_ms: number;
+    prompt_chars: number;
+  };
   onDelta?: ((delta: string) => void) | undefined;
+  onTrace?: ((trace: AgyTurnTrace) => void) | undefined;
   resolve: (s: string) => void;
   reject: (e: Error) => void;
+}
+
+interface SpawnedChild {
+  proc: ChildProcessWithoutNullStreams;
+  workDir: string;
+  spawnedAt: number;
+  spawnMs: number;
+  initMs?: number;
+  toolsCount?: number;
 }
 
 /**
@@ -321,11 +396,15 @@ interface WorkerTurn {
  *
  * Lifecycle-safe: every process event listener is bound to its specific child instance so rotating
  * after 8 turns never lets an old child's async `close` corrupt a newly spawned child or active turn,
- * and every turn enforces a hard timeout so a silent child can never wedge the serial queue.
+ * pre-spawns a standby child at turn N-1 to hide the 4.5s cold boot, and enforces hard timeouts +
+ * AbortSignal cancellation so a silent or cancelled child never wedges the serial queue.
  */
 export class AgyJudgeWorker {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private workDir: string | null = null;
+  private procInitMs: number | undefined;
+  private procToolsCount: number | undefined;
+  private standby: SpawnedChild | null = null;
   private turns = 0;
   private queue: Promise<unknown> = Promise.resolve();
   private active: WorkerTurn | null = null;
@@ -337,7 +416,19 @@ export class AgyJudgeWorker {
     private readonly resourceDirs: string[] = [],
     private readonly turnTimeoutMs = 55_000,
     private readonly maxTurnsPerProc = 8,
+    private readonly effort?: string | undefined,
   ) {}
+
+  /** Eagerly spawns a warm `agy` process in the background (0 LLM tokens) so Turn 1 skips cold init. */
+  warmUp(): void {
+    if (this.proc && !this.proc.killed) return;
+    if (this.standby && !this.standby.proc.killed) return;
+    try {
+      this.standby = this.spawnChild();
+    } catch {
+      /* ignore eager warmup errors; next ask() will report clearly */
+    }
+  }
 
   private retireProc(targetProc: ChildProcessWithoutNullStreams | null, targetDir: string | null): void {
     if (targetProc) {
@@ -369,16 +460,46 @@ export class AgyJudgeWorker {
     if (this.active !== turn) return;
     this.active = null;
     clearTimeout(turn.timer);
+    const now = Date.now();
+    const firstEventMs = turn.firstEventAt !== undefined ? Math.max(0, turn.firstEventAt - turn.writtenAt) : undefined;
+    const ttftRawMs = turn.firstDeltaAt !== undefined ? Math.max(0, turn.firstDeltaAt - turn.writtenAt) : undefined;
+    const thinkingMs =
+      turn.firstDeltaAt !== undefined
+        ? Math.max(0, turn.firstDeltaAt - (turn.firstThinkAt ?? turn.firstEventAt ?? turn.writtenAt))
+        : turn.firstThinkAt !== undefined
+          ? Math.max(0, now - turn.firstThinkAt)
+          : undefined;
+    try {
+      turn.onTrace?.({
+        transport: "stream-json",
+        cold_spawn: turn.meta.cold_spawn,
+        spawn_ms: turn.meta.spawn_ms,
+        init_ms: turn.initMs ?? this.procInitMs,
+        turn_in_proc: turn.meta.turn_in_proc,
+        queue_wait_ms: turn.meta.queue_wait_ms,
+        first_event_ms: firstEventMs,
+        thinking_ms: thinkingMs,
+        ttft_raw_ms: ttftRawMs,
+        llm_ms: Math.max(0, now - turn.writtenAt),
+        prompt_chars: turn.meta.prompt_chars,
+        output_chars: outcome.ok ? outcome.value.length : turn.text.length,
+        input_tokens: turn.inputTokens,
+        cache_read_tokens: turn.cacheReadTokens,
+        thinking_tokens: turn.thinkingTokens,
+        output_tokens: turn.outputTokens,
+        tools_count: turn.toolsCount ?? this.procToolsCount,
+        tool_calls: turn.toolCalls,
+        step_types: Array.from(turn.stepTypes),
+      });
+    } catch {
+      /* ignore trace subscriber errors */
+    }
     if (outcome.ok) turn.resolve(outcome.value);
     else turn.reject(outcome.error);
   }
 
-  private ensureProc(): { proc: ChildProcessWithoutNullStreams; workDir: string } {
-    if (this.proc && !this.proc.killed && this.workDir && this.turns < this.maxTurnsPerProc) {
-      return { proc: this.proc, workDir: this.workDir };
-    }
-    // Retire the old child cleanly without touching any future child's state.
-    this.retireProc(this.proc, this.workDir);
+  private spawnChild(): SpawnedChild {
+    const tSpawn = Date.now();
     const workDir = mkdtempSync(join(safeTempBase(), "myelin-agy-judge-"));
     const resourceNote = this.allowLocalResources
       ? [
@@ -405,10 +526,14 @@ export class AgyJudgeWorker {
       "--dangerously-skip-permissions",
     ];
     if (this.modelSlug && this.modelSlug !== "default") args.push("--model", this.modelSlug);
+    if (this.effort && (!this.modelSlug || !/-(low|medium|high|xhigh|max)$/.test(this.modelSlug))) {
+      args.push("--effort", this.effort);
+    }
     if (this.allowLocalResources) {
       for (const dir of this.resourceDirs) args.push("--add-dir", dir);
     }
     const child = spawn(bin, args, { cwd: workDir, stdio: ["pipe", "pipe", "pipe"] });
+    const entry: SpawnedChild = { proc: child, workDir, spawnedAt: tSpawn, spawnMs: Date.now() - tSpawn };
     let childStderr = "";
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (d: string) => {
@@ -416,19 +541,65 @@ export class AgyJudgeWorker {
     });
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
     rl.on("line", (line) => {
-      // Ignore any late output from a retired child.
-      if (this.proc !== child) return;
       const t = line.trim();
       if (!t || !t.startsWith("{")) return;
-      let ev: { event?: string; step_update?: { step_type?: string; text_delta?: string }; result?: { status?: string; response?: string; error?: string } };
+      let ev: {
+        event?: string;
+        init?: { tools?: unknown[] };
+        step_update?: {
+          step_type?: string;
+          text_delta?: string;
+          usage?: { input_tokens?: number; output_tokens?: number; thinking_tokens?: number; cache_read_tokens?: number };
+        };
+        result?: {
+          status?: string;
+          response?: string;
+          error?: string;
+          usage?: { input_tokens?: number; output_tokens?: number; thinking_tokens?: number; cache_read_tokens?: number };
+        };
+      };
       try {
         ev = JSON.parse(t);
       } catch {
         return;
       }
+      if (ev.event === "init") {
+        entry.initMs = Date.now() - entry.spawnedAt;
+        if (Array.isArray(ev.init?.tools)) entry.toolsCount = ev.init.tools.length;
+        if (this.proc === child) {
+          this.procInitMs = entry.initMs;
+          this.procToolsCount = entry.toolsCount;
+        }
+        if (this.active?.proc === child) {
+          this.active.initMs = entry.initMs;
+          this.active.toolsCount = entry.toolsCount;
+        }
+        return;
+      }
+      // Ignore any late output from a retired child.
+      if (this.proc !== child) return;
       const cur = this.active;
       if (!cur || cur.proc !== child) return;
-      if (ev.event === "step_update" && ev.step_update?.step_type === "agent_response" && ev.step_update.text_delta) {
+      const nowEv = Date.now();
+      if (cur.firstEventAt === undefined) cur.firstEventAt = nowEv;
+      const u = ev.step_update?.usage ?? ev.result?.usage;
+      if (u) {
+        if (typeof u.input_tokens === "number") cur.inputTokens = u.input_tokens;
+        if (typeof u.cache_read_tokens === "number") cur.cacheReadTokens = u.cache_read_tokens;
+        if (typeof u.thinking_tokens === "number") cur.thinkingTokens = u.thinking_tokens;
+        if (typeof u.output_tokens === "number") cur.outputTokens = u.output_tokens;
+      }
+      const st = ev.step_update?.step_type;
+      if (st) {
+        cur.stepTypes.add(st);
+        if (/tool|function|call|command|search|file/i.test(st)) {
+          cur.toolCalls++;
+        } else if (st !== "agent_response" && cur.firstThinkAt === undefined) {
+          cur.firstThinkAt = nowEv;
+        }
+      }
+      if (ev.event === "step_update" && st === "agent_response" && ev.step_update?.text_delta) {
+        if (cur.firstDeltaAt === undefined) cur.firstDeltaAt = nowEv;
         cur.text += ev.step_update.text_delta;
         try {
           cur.onDelta?.(ev.step_update.text_delta);
@@ -448,6 +619,7 @@ export class AgyJudgeWorker {
         this.settleActive(this.active, { ok: false, error: err });
       }
       if (this.proc === child) this.proc = null;
+      if (this.standby?.proc === child) this.standby = null;
     });
     child.on("close", (code) => {
       rl.close();
@@ -455,17 +627,68 @@ export class AgyJudgeWorker {
         this.settleActive(this.active, { ok: false, error: new Error(childStderr.trim() || `agy exited (${code})`) });
       }
       if (this.proc === child) this.proc = null;
+      if (this.standby?.proc === child) this.standby = null;
     });
-    this.proc = child;
-    this.workDir = workDir;
-    this.turns = 0;
-    return { proc: child, workDir };
+    return entry;
   }
 
-  ask(prompt: string, sketchDataUrl?: string | null, onDelta?: (delta: string) => void): Promise<string> {
+  private ensureProc(): { proc: ChildProcessWithoutNullStreams; workDir: string; coldSpawn: boolean; spawnMs: number } {
+    if (this.proc && !this.proc.killed && this.workDir && this.turns < this.maxTurnsPerProc) {
+      return { proc: this.proc, workDir: this.workDir, coldSpawn: false, spawnMs: 0 };
+    }
+    // Retire the old child cleanly without touching any future child's state.
+    this.retireProc(this.proc, this.workDir);
+    if (this.standby && !this.standby.proc.killed) {
+      const next = this.standby;
+      this.standby = null;
+      this.proc = next.proc;
+      this.workDir = next.workDir;
+      this.procInitMs = next.initMs;
+      this.procToolsCount = next.toolsCount;
+      this.turns = 0;
+      const prewarmedLongEnough = Date.now() - next.spawnedAt >= 3500;
+      return { proc: next.proc, workDir: next.workDir, coldSpawn: !prewarmedLongEnough, spawnMs: prewarmedLongEnough ? 0 : next.spawnMs };
+    }
+    const fresh = this.spawnChild();
+    this.proc = fresh.proc;
+    this.workDir = fresh.workDir;
+    this.procInitMs = fresh.initMs;
+    this.procToolsCount = fresh.toolsCount;
+    this.turns = 0;
+    return { proc: fresh.proc, workDir: fresh.workDir, coldSpawn: true, spawnMs: fresh.spawnMs };
+  }
+
+  ask(
+    prompt: string,
+    sketchDataUrl?: string | null,
+    onDelta?: (delta: string) => void,
+    onTrace?: (trace: AgyTurnTrace) => void,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    if (signal?.aborted) {
+      const err = new Error("Request aborted");
+      err.name = "AbortError";
+      return Promise.reject(err);
+    }
+    const enqueuedAt = Date.now();
     const run = async (): Promise<string> => {
-      const { proc, workDir } = this.ensureProc();
+      if (signal?.aborted) {
+        const err = new Error("Request aborted");
+        err.name = "AbortError";
+        throw err;
+      }
+      const queueWaitMs = Math.max(0, Date.now() - enqueuedAt);
+      const { proc, workDir, coldSpawn, spawnMs } = this.ensureProc();
       this.turns++;
+      const turnInProc = this.turns;
+      // Overlap-spawn the replacement worker on the penultimate turn so Turn N+1 never eats a 4.5s cold boot.
+      if (this.turns >= this.maxTurnsPerProc - 1 && !this.standby) {
+        try {
+          this.standby = this.spawnChild();
+        } catch {
+          /* ignore standby spawn errors */
+        }
+      }
       let fullPrompt = prompt;
       if (sketchDataUrl) {
         const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/.exec(sketchDataUrl);
@@ -477,10 +700,24 @@ export class AgyJudgeWorker {
         }
       }
       return new Promise<string>((resolve, reject) => {
+        const writtenAt = Date.now();
         const turn: WorkerTurn = {
           text: "",
           proc,
+          writtenAt,
+          initMs: this.procInitMs,
+          toolsCount: this.procToolsCount,
+          toolCalls: 0,
+          stepTypes: new Set<string>(),
+          meta: {
+            cold_spawn: coldSpawn,
+            spawn_ms: spawnMs,
+            turn_in_proc: turnInProc,
+            queue_wait_ms: queueWaitMs,
+            prompt_chars: fullPrompt.length,
+          },
           onDelta,
+          onTrace,
           resolve,
           reject,
           timer: setTimeout(() => {
@@ -489,6 +726,26 @@ export class AgyJudgeWorker {
             this.retireProc(proc, workDir);
           }, this.turnTimeoutMs),
         };
+        const onAbort = () => {
+          if (this.active !== turn) return;
+          const err = new Error("Request aborted");
+          err.name = "AbortError";
+          this.settleActive(turn, { ok: false, error: err });
+          this.retireProc(proc, workDir);
+        };
+        if (signal) {
+          signal.addEventListener("abort", onAbort, { once: true });
+          const origResolve = turn.resolve;
+          const origReject = turn.reject;
+          turn.resolve = (s) => {
+            signal.removeEventListener("abort", onAbort);
+            origResolve(s);
+          };
+          turn.reject = (e) => {
+            signal.removeEventListener("abort", onAbort);
+            origReject(e);
+          };
+        }
         this.active = turn;
         const payload = JSON.stringify({ event: "user", message: { content: fullPrompt } }) + "\n";
         proc.stdin.write(payload, (err) => {
@@ -509,6 +766,10 @@ export class AgyJudgeWorker {
       this.settleActive(this.active, { ok: false, error: new Error("disposed") });
     }
     this.retireProc(this.proc, this.workDir);
+    if (this.standby) {
+      this.retireProc(this.standby.proc, this.standby.workDir);
+      this.standby = null;
+    }
   }
 }
 
@@ -523,26 +784,89 @@ export function isLikelyNonAttempt(raw: string): boolean {
   const t = raw.trim().toLowerCase();
   if (!t) return true;
   if (t.endsWith("?")) return true;
-  if (/^(i\s+(have\s+)?no\s+ideas?|no\s+ideas?|i\s+don'?t\s+know|idk|dunno|not\s+sure|lost|confused|help|stuck|blank|skip|pass)[\s.!?]*$/.test(t)) {
-    return true;
-  }
+  const nonAttemptRe =
+    /^(i\s+(have\s+)?no\s+ideas?|no\s+ideas?|i\s+don'?t\s+know|i\s+dont\s+know|idk|dunno|not\s+sure|lost|confused|help|stuck|blank|skip|pass)[\s.!?]*$/;
+  if (nonAttemptRe.test(t)) return true;
+  const firstLine = t.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
+  if (nonAttemptRe.test(firstLine)) return true;
   return false;
 }
+
+const DRILL_COACH_SYSTEM = `You are a sharp, domain-agnostic learning partner inside Myelin (any subject: math, coding, systems, science, languages, writing, etc.).
+Your goal is genuine human understanding as fast as possible—NOT exam proctoring. Adapt smoothly between two gears:
+
+1. CHECK GEAR (the learner wrote a real attempt and is close, made a slip, or missed one nuance):
+- Accept messy shorthand, typos, unfinished thoughts, and valid alternative routes. Never be pedantic about formatting.
+- NEVER pass a circular restatement/tautology, vague hand-waving, or an uncertain guess ending in "?".
+- If what they wrote genuinely demonstrates understanding of the unit, pass right away: set ok=true and write a crisp confirmation (at most 10 words, no extra commentary).
+- If there is a single crack, slip, or missing justification, set ok=false and point directly at that one crack with ONE short question (max 35 words).
+
+2. BUILD GEAR (the learner says "i have no ideas", "i don't know", seems blank, or shows foundational confusion):
+- STOP hinting at the high-level answer! Do NOT give a multi-concept intuition riddle or a 2-part question.
+- Drop immediately to the lowest concrete ground-floor building block underneath this unit and ask ONE tiny, 15-second question (e.g. a basic definition/distinction or a tiny concrete 2-element example) so they get fast feedback and climb one atomic rung at a time.
+- NEVER Socratic-quiz an arbitrary convention, symbol, or definition they clearly don't know—state it cleanly in 1 short sentence, then ask ONE tiny concrete check using it.
+
+Follow-up & grading rules:
+- ALWAYS speak directly in second person ("You..."). Never say "The learner..." or "The attempt...". Stay strictly on-topic—no tangents, no lecturing.
+- ONE tiny atom and ONE question per turn (max 40 words). NEVER pack two questions or multiple unfamiliar concepts into one beat.
+- NEVER TELEGRAPH THE ANSWER IN YOUR HINT: Never print the missing variable names, symbols, or answer fragment inside the very question asking for them. Point to the role or constraint instead.
+- If climbing an atomic staircase (Build gear), move up ONE small rung at a time. The moment the learner lands the final rung of the target unit, finish right away (ok=true, grade="again")—NEVER tack on a forced recap or meta-summary quiz.
+- Decouple ok (rep complete) from grade (cold-retrieval memory rating for spaced repetition):
+  - On turn 1 clean pass: grade="good"|"easy"|"hard" (if hesitant).
+  - On follow-up pass: grade="again" if turn 1 missed the core concept cold or needed Build gear / 2+ nudges; grade="hard" if turn 1 had the core idea and only fixed one minor slip on 1 quick nudge; grade="good" ONLY if turn 1 was purely a clarifying/notation question and they solved the whole unit cleanly.
+  - When ok=false, set grade="again".
+- annotations: OPTIONAL array of AT MOST 1–2 grounded inline pins anchored onto exact verbatim substrings of the learner's latest text (kind="slip"|"question"|"move", note max 22 words). Leave [] on short 1-line answers, "no idea" replies, or when message alone is already clear.
+- missing_prereqs: ONLY when a genuinely missing, reusable atomic prerequisite underneath this unit appears; include at most 1 crisp one-sentence unit, otherwise [].
+- Use $...$ for inline math only when needed. No praise fluff, no exclamation marks. Answer directly with ZERO tool calls.
+- Return ONLY valid JSON with "message" FIRST so prose can stream cleanly: {"message": string, "ok": boolean, "grade": "again"|"hard"|"good"|"easy", "annotations": [{"quote": string, "note": string, "kind": "slip"|"question"|"move"}], "habit_observed": string|null, "missing_prereqs": [{"text": string, "kind": string}]}`;
+
+const EXPLORE_HOT_SYSTEM = `You are Myelin's sharp, peer-level reasoning partner inside a focused exploration (any domain: math, coding, systems, science, papers, writing).
+
+Role of Explore vs. Drills:
+- Explore is for building a real mental model and surfacing gaps so spaced-repetition Drills can verify retention later. Do NOT turn Explore into a tedious mini-drill.
+- Speak like a brilliant colleague at a whiteboard—direct, concise, zero robotic filler. NEVER open with "You're correct that...", "You've correctly identified...", "You're on the right track.", or "You're thinking about...". Start straight with the substance.
+- SEPARATE EXPLANATION ("message") FROM QUESTION ("question"):
+  - Put ONLY your explanation, feedback, math, or code in "message" (2-4 crisp sentences, or a tiny code/math block; use $...$ for inline math with double-escaped backslashes in JSON like \\\\times, \\\\frac; no fluff, no exclamation marks).
+  - Put your single forward-moving question (when there is one) in the separate "question" field so the UI displays it distinctly above the learner's composer—NEVER duplicate the question at the end of "message".
+  - Set "question": null on quick clarifications/sanity checks, when the learner flagged "[I don't understand this]" quotes and you just unpacked them without needing to re-ask a quiz, or when no question is needed.
+- HANDLE "[I don't understand this]" ANNOTATIONS & BATCHED REPLIES FIRST: Address each quoted block and follow-up cleanly in order inside "message". If they skipped your previous question to ask something else, follow their new thread directly—never nag about the skipped question.
+- FOLLOW THE LEARNER'S ACTIVE FOCUS: Always prioritize what the learner just asked to understand over earlier topics.
+- NEVER QUIZ ON WHAT YOU ALREADY TOLD THEM: Never put "why X?" in "question" if you already gave the reason for X in "message" or an earlier turn. Either withhold the reason before asking, or ask about a genuinely new consequence, concrete case, or next design choice.
+- NO VERBATIM QUESTION REPEATS: On a quick clarification or sanity check, answer cleanly in 1-2 sentences with "question": null instead of re-pasting your previous open question.
+- ZERO NOTATION OR SYNTAX PEDANTRY: Accept rough shorthand and pseudocode immediately. Only flag mistakes that actually change semantics (wrong axis/shape, missing keepdim, wrong sign, missing factor).
+- FIX AND KEEP MOVING (NO MINI-DRILLING): When the learner makes specific slips or says "i have no idea" / "Walk me through this directly", give the clean corrected answer/code directly in 1-3 lines inside "message", and put the next forward step in "question". NEVER quiz them on a trivial fill-in-the-blank of a fix you just explained.
+- ONE STEP AT A TIME (DON'T SPRINT PAST CONFUSION): Never stack two brand-new mechanisms into one reply. If the learner asks a clarifying question or says "not sure I understand", stay on the current step until clear.
+- For normal turns, answer directly with ZERO tool calls. You MAY inspect local files read-only ONLY if the learner explicitly asks you to find or read a local file, paper, note, or codebase.
+- Return ONLY valid JSON with "message" FIRST so prose streams immediately: {"message": string, "question": string|null}`;
 
 export class FastJudge {
   private readonly apiKey: string | undefined;
   private readonly jevModel: string;
+  private readonly jevEnabled: boolean;
   private readonly llmModel: string;
+  private readonly isAgy: boolean;
+  private readonly drillModel: string;
+  private readonly exploreModel: string;
+  private readonly promptModel: string;
+  private readonly sidecarModel: string;
+  private readonly drillSlug: string | undefined;
+  private readonly exploreSlug: string | undefined;
+  private readonly promptSlug: string | undefined;
+  private readonly sidecarSlug: string | undefined;
   private readonly llmEffort: string;
+  private readonly acpClient: AgyAcpClient | null;
   private readonly agyWorker: AgyJudgeWorker | null;
+  private readonly drillWorker: AgyJudgeWorker | null;
   private readonly promptWorker: AgyJudgeWorker | null;
   private readonly plannerWorker: AgyJudgeWorker | null;
+  private readonly sidecarWorker: AgyJudgeWorker | null;
   private readonly cachePath: string | undefined;
+  private readonly perf: PerfLog | undefined;
   private readonly passThreshold: number;
   private readonly gapCeiling: number;
   private readonly fetchFn: typeof fetch;
   private readonly promptCache = new Map<string, string>();
-  private readonly inflightPrompts = new Map<string, Promise<string>>();
+  private readonly inflightPrompts = new Map<string, { promise: Promise<string>; background: boolean }>();
   private activeForegroundPrompts = 0;
 
   constructor(opts: JudgeOptions = {}) {
@@ -550,23 +874,66 @@ export class FastJudge {
     this.jevModel = opts.jevModel ?? process.env.MYELIN_JEV_MODEL ?? DEFAULT_JEV;
     this.llmModel = opts.llmModel ?? process.env.MYELIN_JUDGE_MODEL ?? DEFAULT_LLM;
     this.llmEffort = opts.llmEffort ?? process.env.MYELIN_JUDGE_EFFORT ?? DEFAULT_EFFORT;
-    const isAgy = this.llmModel === "agy" || this.llmModel.startsWith("agy/");
-    const agySlug = isAgy ? (this.llmModel.includes("/") ? this.llmModel.slice(this.llmModel.indexOf("/") + 1).trim() || undefined : undefined) : undefined;
+    this.isAgy = this.llmModel === "agy" || this.llmModel.startsWith("agy/");
+    this.jevEnabled =
+      opts.enableJev ?? (process.env.MYELIN_ENABLE_JEV === "1" ? true : !this.isAgy && Boolean(this.apiKey));
+
+    const baseSlug = this.isAgy ? stripAgyPrefix(this.llmModel) : undefined;
+    // Explorations stay on a strong reasoning model (e.g. gemini-4-neon-low) unless explicitly overridden.
+    this.exploreModel = opts.exploreModel ?? process.env.MYELIN_EXPLORE_MODEL?.trim() ?? this.llmModel;
+    this.exploreSlug = this.isAgy ? stripAgyPrefix(this.exploreModel) ?? baseSlug : undefined;
+
+    // Fast rubric-guided Drill checks/follow-ups/hints/tidy default to gemini-4-hydrogen-low on agy
+    // (when llmModel is agy or agy/gemini-4-neon-*) while preserving explicit user overrides.
+    const explicitDrill = opts.drillModel ?? process.env.MYELIN_DRILL_MODEL?.trim();
+    if (explicitDrill) {
+      this.drillModel = explicitDrill;
+    } else if (this.isAgy && (!baseSlug || /^gemini-4-neon-/.test(baseSlug))) {
+      this.drillModel = "agy/gemini-4-hydrogen-low";
+    } else {
+      this.drillModel = this.llmModel;
+    }
+    this.drillSlug = this.isAgy ? stripAgyPrefix(this.drillModel) ?? baseSlug : undefined;
+
+    // Background prompt generation, briefings, and Dream consolidation keep high reasoning.
+    const promptModelEnv = process.env.MYELIN_PROMPT_MODEL?.trim();
+    const derivedPromptSlug = promptModelEnv?.startsWith("agy/")
+      ? stripAgyPrefix(promptModelEnv)
+      : this.exploreSlug
+        ? this.exploreSlug.replace(/-(minimal|low|medium)$/, "-high")
+        : undefined;
+    this.promptSlug = this.isAgy ? derivedPromptSlug : undefined;
+    this.promptModel = this.isAgy ? (derivedPromptSlug ? `agy/${derivedPromptSlug}` : this.exploreModel) : promptModelEnv || this.llmModel;
+
+    // Async Explore unit-crystallization & title sidecar (runs off the hot path).
+    const sidecarEnv = process.env.MYELIN_SIDECAR_MODEL?.trim();
+    this.sidecarModel = sidecarEnv || (this.isAgy ? "agy/gemini-4-hydrogen-medium" : this.exploreModel);
+    this.sidecarSlug = this.isAgy ? stripAgyPrefix(this.sidecarModel) ?? this.drillSlug : undefined;
+
     const agyBin = opts.agyBinary ?? process.env.MYELIN_AGY_BIN;
     const resourceDirs = parseResourceDirs(opts.resourceDirs);
-    this.agyWorker = isAgy ? new AgyJudgeWorker(agyBin, agySlug, true, resourceDirs, 55_000) : null;
-    // Dedicated higher-reasoning worker for async background prompt generation (isolated with
-    // no local filesystem search; cached to disk so extra thinking costs 0ms on card load).
-    const promptModelEnv = process.env.MYELIN_PROMPT_MODEL?.trim();
-    const promptSlug = promptModelEnv?.startsWith("agy/")
-      ? promptModelEnv.slice(4).trim() || undefined
-      : agySlug
-        ? agySlug.replace(/-(minimal|low|medium)$/, "-high")
-        : undefined;
-    this.promptWorker = isAgy ? new AgyJudgeWorker(agyBin, promptSlug, false, [], 55_000) : null;
-    // Dedicated high-reasoning worker with read-only local access for planning chapter/source frontiers.
-    this.plannerWorker = isAgy ? new AgyJudgeWorker(agyBin, promptSlug, true, resourceDirs, 120_000) : null;
+    const transport = opts.agyTransport ?? (process.env.MYELIN_AGY_TRANSPORT === "stream-json" ? "stream-json" : "acp");
+
+    this.acpClient = this.isAgy && transport === "acp" ? new AgyAcpClient({ binary: agyBin, resourceDirs }) : null;
+    this.agyWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.exploreSlug, true, resourceDirs, 55_000, 8, this.llmEffort) : null;
+    this.drillWorker =
+      this.isAgy && this.drillSlug !== this.exploreSlug
+        ? new AgyJudgeWorker(agyBin, this.drillSlug, true, resourceDirs, 55_000, 8, this.llmEffort)
+        : this.agyWorker;
+    this.promptWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.promptSlug, false, [], 55_000, 8) : null;
+    this.plannerWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.promptSlug, true, resourceDirs, 120_000, 8) : null;
+    this.sidecarWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.sidecarSlug, false, [], 45_000, 8) : null;
+
+    // Eagerly pre-warm the active transport in the background (0 LLM tokens) so Turn 1 skips cold init.
+    if (this.acpClient) {
+      void this.acpClient.warmUp();
+    } else if (this.isAgy && transport === "stream-json") {
+      this.drillWorker?.warmUp();
+      if (this.agyWorker && this.agyWorker !== this.drillWorker) this.agyWorker.warmUp();
+    }
+
     this.cachePath = opts.cachePath;
+    this.perf = opts.perf;
     this.passThreshold = opts.passThreshold ?? 0.88;
     this.gapCeiling = opts.gapCeiling ?? 0.3;
     this.fetchFn = opts.fetchFn ?? fetch;
@@ -596,13 +963,190 @@ export class FastJudge {
   }
 
   get enabled(): boolean {
-    return Boolean(this.apiKey || this.agyWorker);
+    return Boolean(this.apiKey || this.isAgy);
+  }
+
+  /** Closes a cached stateful ACP session (e.g. when a drill rep finishes or exploration is deleted). */
+  closeSession(sessionKey: string): void {
+    this.acpClient?.closeSession(sessionKey);
   }
 
   close(): void {
+    this.acpClient?.dispose();
     this.agyWorker?.dispose();
+    if (this.drillWorker && this.drillWorker !== this.agyWorker) this.drillWorker.dispose();
     this.promptWorker?.dispose();
     this.plannerWorker?.dispose();
+    this.sidecarWorker?.dispose();
+  }
+
+  private buildPerf(
+    t0: number,
+    op: PerfOp,
+    model: string,
+    worker: PerfWorker,
+    ok: boolean,
+    opts: {
+      background?: boolean | undefined;
+      cacheHit?: boolean | undefined;
+      jevMs?: number | undefined;
+      jevPass?: boolean | undefined;
+      trace?: AgyTurnTrace | undefined;
+      ttftProseMs?: number | undefined;
+      proseMs?: number | undefined;
+      tailJsonMs?: number | undefined;
+      llmStart?: number | undefined;
+      outputChars?: number | undefined;
+      promptChars?: number | undefined;
+      error?: string | undefined;
+      aborted?: boolean | undefined;
+    } = {},
+  ): PerfRecord {
+    const tr = opts.trace;
+    return {
+      ts: t0,
+      op,
+      model,
+      worker,
+      transport: tr?.transport ?? (worker === "openrouter" ? "openrouter" : worker === "jev" ? "jev" : worker === "cache" ? "cache" : undefined),
+      ok,
+      ...(opts.aborted ? { aborted: true } : {}),
+      ...(opts.background ? { background: true } : {}),
+      ...(opts.cacheHit !== undefined ? { cache_hit: opts.cacheHit } : {}),
+      ...(opts.jevMs !== undefined ? { jev_ms: opts.jevMs } : {}),
+      ...(opts.jevPass !== undefined ? { jev_pass: opts.jevPass } : {}),
+      cold_spawn: tr?.cold_spawn,
+      session_reused: tr?.session_reused,
+      spawn_ms: tr?.spawn_ms,
+      init_ms: tr?.init_ms,
+      turn_in_proc: tr?.turn_in_proc,
+      queue_wait_ms: tr?.queue_wait_ms,
+      first_event_ms: tr?.first_event_ms,
+      thinking_ms: tr?.thinking_ms,
+      ttft_raw_ms: tr?.ttft_raw_ms,
+      ttft_prose_ms: opts.ttftProseMs,
+      prose_ms: opts.proseMs,
+      tail_json_ms: opts.tailJsonMs,
+      llm_ms: tr?.llm_ms ?? (opts.llmStart !== undefined ? Date.now() - opts.llmStart : Date.now() - t0),
+      prompt_chars: tr?.prompt_chars ?? opts.promptChars,
+      output_chars: tr?.output_chars ?? opts.outputChars,
+      input_tokens: tr?.input_tokens,
+      cache_read_tokens: tr?.cache_read_tokens,
+      thinking_tokens: tr?.thinking_tokens,
+      output_tokens: tr?.output_tokens,
+      tools_count: tr?.tools_count,
+      tool_calls: tr?.tool_calls,
+      step_types: tr?.step_types,
+      total_ms: Date.now() - t0,
+      ...(opts.error ? { error: opts.error } : {}),
+    };
+  }
+
+  /**
+   * Executes a turn on `agy`, preferring the persistent multiplexed `AgyAcpClient` daemon
+   * (with stateful KV-cached sessions and native `session/cancel`) and transparently falling back
+   * to the `stream-json` `AgyJudgeWorker` only if ACP is unsupported by the configured binary.
+   */
+  private async askAgy(params: {
+    fallbackWorker: AgyJudgeWorker;
+    fallbackWorkerName: PerfWorker;
+    modelId: string | undefined;
+    systemPrompt: string;
+    userPrompt: string;
+    /** Optional lean delta prompt used when the ACP session is already warm for `sessionKey`. */
+    deltaPrompt?: string | undefined;
+    sessionKey?: string | undefined;
+    expectedPriorTurns?: number | undefined;
+    sketchDataUrl?: string | null | undefined;
+    timeoutMs?: number | undefined;
+    signal?: AbortSignal | undefined;
+    onDelta?: ((delta: string) => void) | undefined;
+    onTrace?: ((trace: AgyTurnTrace) => void) | undefined;
+  }): Promise<{ raw: string; worker: PerfWorker }> {
+    if (this.acpClient && !this.acpClient.isUnsupported) {
+      const canDelta =
+        Boolean(params.sessionKey && params.deltaPrompt) &&
+        this.acpClient.isSessionWarm(params.sessionKey!, params.modelId, params.systemPrompt, params.expectedPriorTurns);
+      const acpOpts: AgyAcpAskOptions = {
+        modelId: params.modelId,
+        sessionKey: params.sessionKey,
+        systemPrompt: params.systemPrompt,
+        expectedPriorTurns: canDelta ? params.expectedPriorTurns : undefined,
+        sketchDataUrl: params.sketchDataUrl,
+        timeoutMs: params.timeoutMs,
+        signal: params.signal,
+        onDelta: params.onDelta,
+        onTrace: params.onTrace,
+      };
+      try {
+        const raw = await this.acpClient.ask(canDelta ? params.deltaPrompt! : params.userPrompt, acpOpts);
+        return { raw, worker: "acp" };
+      } catch (err) {
+        if (isAbortError(err) || !this.acpClient.isUnsupported) throw err;
+        // Binary does not speak ACP (e.g. legacy stream-json fake binary); fall through cleanly.
+      }
+    }
+    const combined = params.systemPrompt ? `${params.systemPrompt}\n\n---\n\n${params.userPrompt}` : params.userPrompt;
+    const raw = await params.fallbackWorker.ask(combined, params.sketchDataUrl, params.onDelta, params.onTrace, params.signal);
+    return { raw, worker: params.fallbackWorkerName };
+  }
+
+  private async askJsonWithTrace(params: {
+    fallbackWorker: AgyJudgeWorker;
+    fallbackWorkerName: PerfWorker;
+    modelId: string | undefined;
+    systemPrompt: string;
+    userPrompt: string;
+    deltaPrompt?: string | undefined;
+    sessionKey?: string | undefined;
+    expectedPriorTurns?: number | undefined;
+    sketchDataUrl?: string | null | undefined;
+    timeoutMs?: number | undefined;
+    signal?: AbortSignal | undefined;
+    onText?: ((partialMessage: string) => void) | undefined;
+  }): Promise<{ raw: string; trace: AgyTurnTrace | undefined; ttftProseMs?: number; proseMs?: number; tailJsonMs?: number; worker: PerfWorker }> {
+    let streamed = "";
+    let firstProseAt: number | undefined;
+    let proseClosedAt: number | undefined;
+    let trace: AgyTurnTrace | undefined;
+    const tCall = Date.now();
+    const { raw, worker } = await this.askAgy({
+      fallbackWorker: params.fallbackWorker,
+      fallbackWorkerName: params.fallbackWorkerName,
+      modelId: params.modelId,
+      systemPrompt: params.systemPrompt,
+      userPrompt: params.userPrompt,
+      deltaPrompt: params.deltaPrompt,
+      sessionKey: params.sessionKey,
+      expectedPriorTurns: params.expectedPriorTurns,
+      sketchDataUrl: params.sketchDataUrl,
+      timeoutMs: params.timeoutMs,
+      signal: params.signal,
+      onDelta: (delta) => {
+        streamed += delta;
+        const st = extractStreamingJsonMessageState(streamed);
+        if (st) {
+          const now = Date.now();
+          if (st.text.length > 0 && firstProseAt === undefined) firstProseAt = now;
+          if (st.closed && proseClosedAt === undefined) proseClosedAt = now;
+          if (st.text) params.onText?.(st.text);
+        }
+      },
+      onTrace: (t) => {
+        trace = t;
+      },
+    });
+    const tEnd = Date.now();
+    const llmStart = trace ? tEnd - trace.llm_ms : tCall;
+    const ttftProseMs = firstProseAt !== undefined ? Math.max(0, firstProseAt - llmStart) : undefined;
+    const proseMs =
+      firstProseAt !== undefined && proseClosedAt !== undefined
+        ? Math.max(0, proseClosedAt - firstProseAt)
+        : firstProseAt !== undefined
+          ? Math.max(0, tEnd - firstProseAt)
+          : undefined;
+    const tailJsonMs = proseClosedAt !== undefined ? Math.max(0, tEnd - proseClosedAt) : undefined;
+    return { raw, trace, ttftProseMs, proseMs, tailJsonMs, worker };
   }
 
   /** System 1: ultra-fast calibrated decision call via TypeSafe Jev on OpenRouter. */
@@ -704,9 +1248,20 @@ export class FastJudge {
     }
   }
 
-  /** Full cascade: Jev System 1 fast-pass gate -> System 2 LLM (OpenRouter or Antigravity CLI) on gaps, low confidence, or sketches. */
-  async check(input: JudgeInput, onText?: (partialMessage: string) => void): Promise<JudgeResult> {
-    if (!this.apiKey && !this.agyWorker) {
+  private emitPerf(rec: PerfRecord, onPerf?: (rec: PerfRecord) => void): void {
+    if (onPerf) onPerf(rec);
+    else this.perf?.record(rec);
+  }
+
+  /** Full cascade: Jev System 1 fast-pass gate (OpenRouter only) -> System 2 LLM (ACP/agy or OpenRouter). */
+  async check(
+    input: JudgeInput,
+    onText?: (partialMessage: string) => void,
+    onPerf?: (rec: PerfRecord) => void,
+    signal?: AbortSignal,
+  ): Promise<JudgeResult> {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) {
       return {
         ok: false,
         grade: "again",
@@ -717,15 +1272,23 @@ export class FastJudge {
     }
 
     const hasSketch = Boolean(input.sketchDataUrl);
-    // Run Jev fast-pass gate only on real text attempts without sketches (skip on obvious
-    // questions or "i have no ideas" so System 2 starts immediately with zero dead-weight latency).
-    const jev = !hasSketch && !isLikelyNonAttempt(input.attempt) ? await this.runJev(input) : null;
+    let jev: JevSignals | null = null;
+    let jevMs: number | undefined;
+    if (this.jevEnabled && !hasSketch && !isLikelyNonAttempt(input.attempt)) {
+      const tJev = Date.now();
+      jev = await this.runJev(input);
+      jevMs = jev?.latency_ms ?? Date.now() - tJev;
+    }
 
     // System 1 fast-pass: high-confidence clean text rep with no sketch to inspect visually.
     if (jev && !hasSketch && jev.demonstrated >= this.passThreshold && jev.cot_gap <= this.gapCeiling) {
       const grade = inferGrade(input.latencyMs, input.hintsUsed, jev.clarity);
       const verb = input.depth === "rebuild" ? "Clean rebuild" : input.depth === "explain" ? "Clear explanation" : input.depth === "use" ? "Applied cleanly" : "Solid recall";
       const habitBit = jev.habit_applied ? ` · move spotted: ${jev.habit_applied}` : "";
+      this.emitPerf(
+        this.buildPerf(t0, "check", jev.model, "jev", true, { jevMs, jevPass: true }),
+        onPerf,
+      );
       return {
         ok: true,
         grade,
@@ -737,7 +1300,7 @@ export class FastJudge {
     }
 
     // System 2: fast generative LLM for surgical CoT gap questions, ambiguous passes, or sketches.
-    return this.runSystem2(input, jev, onText);
+    return this.runSystem2(input, jev, jevMs, onText, onPerf, t0, signal);
   }
 
   private parsePrereqs(raw: unknown): ExploreUnitSuggestion[] {
@@ -778,31 +1341,15 @@ export class FastJudge {
     return out;
   }
 
-  private async runSystem2(input: JudgeInput, jev: JevSignals | null, onText?: (partialMessage: string) => void): Promise<JudgeResult> {
-    const system = `You are a sharp, domain-agnostic learning partner inside Myelin (any subject: math, coding, systems, science, languages, writing, etc.).
-Your goal is genuine human understanding as fast as possible—NOT exam proctoring. Adapt smoothly between two gears:
-
-1. CHECK GEAR (the learner wrote a real attempt and is close, made a slip, or missed one nuance):
-- Accept messy shorthand, typos, unfinished thoughts, and valid alternative routes. Never be pedantic about formatting.
-- NEVER pass a circular restatement/tautology, vague hand-waving, or an uncertain guess ending in "?".
-- If what they wrote genuinely demonstrates understanding of the unit, pass right away: set ok=true and write a crisp confirmation (at most 10 words, no extra commentary).
-- If there is a single crack, slip, or missing justification, set ok=false and point directly at that one crack with ONE short question (max 35 words).
-
-2. BUILD GEAR (the learner says "i have no ideas", "i don't know", seems blank, or shows foundational confusion):
-- STOP hinting at the high-level answer! Do NOT give a multi-concept intuition riddle or a 2-part question.
-- Drop immediately to the lowest concrete ground-floor building block underneath this unit and ask ONE tiny, 15-second question (e.g. a basic definition/distinction or a tiny concrete 2-element example) so they get fast feedback and climb one atomic rung at a time.
-- NEVER Socratic-quiz an arbitrary convention, symbol, or definition they clearly don't know—state it cleanly in 1 short sentence, then ask ONE tiny concrete check using it.
-
-General rules:
-- ALWAYS speak directly in second person ("You..."). Never say "The learner..." or "The attempt...".
-- ONE question per turn, max 40 words total. Use $...$ for inline math only when needed. No praise fluff, no exclamation marks.
-- annotations: OPTIONAL array of AT MOST 1–2 grounded inline pins anchored directly onto the learner's text:
-  - Use ONLY when pointing at an exact verbatim expression/phrase in their attempt makes feedback noticeably clearer (a specific sign/factor/logic slip with kind="slip", an unstated step with kind="question", or a strong meta-move like estimating bounds/testing a small case with kind="move").
-  - "quote" MUST be copied character-for-character verbatim from Current learner attempt (a short phrase/expression, NOT the entire attempt). "note" is max 22 words.
-  - Leave annotations: [] on short 1-line answers, Build-gear "no idea" replies, or when message alone is already clear. Never duplicate the exact same text in both note and message if a single pin says it all—keep message concise.
-- missing_prereqs: ONLY when a specific, reusable atomic prerequisite underneath this unit is clearly missing (and NOT already in Existing units), include 1 crisp one-sentence unit; otherwise [].
-- Return ONLY valid JSON with "message" FIRST so prose can stream cleanly: {"message": string, "ok": boolean, "grade": "again"|"hard"|"good"|"easy", "annotations": [{"quote": string, "note": string, "kind": "slip"|"question"|"move"}], "habit_observed": string|null, "missing_prereqs": [{"text": string, "kind": string}]}`;
-
+  private async runSystem2(
+    input: JudgeInput,
+    jev: JevSignals | null,
+    jevMs: number | undefined,
+    onText?: (partialMessage: string) => void,
+    onPerf?: (rec: PerfRecord) => void,
+    t0 = Date.now(),
+    signal?: AbortSignal,
+  ): Promise<JudgeResult> {
     const historyBlock =
       input.history && input.history.length > 0
         ? `Earlier tries on this rep:\n${input.history
@@ -811,34 +1358,52 @@ General rules:
             .join("\n")}`
         : "";
 
+    const mem = trimLearnerMemory(input.learnerMemory);
     const metaLines = [
-      input.learnerMemory?.trim() ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${input.learnerMemory.trim()}` : "",
+      mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
       `Prompt asked: ${input.prompt}`,
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
-      input.existingUnits?.length ? `Existing units (do not duplicate in missing_prereqs):\n- ${input.existingUnits.slice(0, 35).join("\n- ")}` : "",
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
       jev ? `System-1 quick check: P(demonstrated)=${jev.demonstrated.toFixed(2)}, P(cot_gap)=${jev.cot_gap.toFixed(2)}` : "",
       historyBlock,
       `Current learner attempt:\n${input.attempt.trim() || "(see attached sketch)"}`,
     ].filter(Boolean);
 
+    const userText = metaLines.join("\n");
     const userContent: unknown = input.sketchDataUrl
       ? [
-          { type: "text", text: metaLines.join("\n") },
+          { type: "text", text: userText },
           { type: "image_url", image_url: { url: input.sketchDataUrl } },
         ]
-      : metaLines.join("\n");
+      : userText;
 
+    const tLlmStart = Date.now();
+    let agyTrace: AgyTurnTrace | undefined;
+    let ttftProseMs: number | undefined;
+    let proseMs: number | undefined;
+    let tailJsonMs: number | undefined;
+    let workerKind: PerfWorker = "openrouter";
     try {
       let raw = "";
-      if (this.agyWorker) {
-        let streamed = "";
-        raw = await this.agyWorker.ask(`${system}\n\n---\n\n${metaLines.join("\n")}`, input.sketchDataUrl, onText ? (delta) => {
-          streamed += delta;
-          const partial = extractStreamingJsonMessage(streamed);
-          if (partial) onText(partial);
-        } : undefined);
+      if (this.drillWorker) {
+        const out = await this.askJsonWithTrace({
+          fallbackWorker: this.drillWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.drillSlug,
+          systemPrompt: DRILL_COACH_SYSTEM,
+          userPrompt: userText,
+          sessionKey: input.sessionKey,
+          sketchDataUrl: input.sketchDataUrl,
+          signal,
+          onText,
+        });
+        raw = out.raw;
+        agyTrace = out.trace;
+        ttftProseMs = out.ttftProseMs;
+        proseMs = out.proseMs;
+        tailJsonMs = out.tailJsonMs;
+        workerKind = out.worker;
       } else {
         const res = await this.fetchFn(CHAT_URL, {
           method: "POST",
@@ -846,14 +1411,15 @@ General rules:
             Authorization: `Bearer ${this.apiKey}`,
             "Content-Type": "application/json",
           },
+          signal,
           body: JSON.stringify({
-            model: this.llmModel,
+            model: this.drillModel,
             reasoning: { effort: this.llmEffort },
             temperature: 0.1,
             max_tokens: 1600,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: system },
+              { role: "system", content: DRILL_COACH_SYSTEM },
               { role: "user", content: userContent },
             ],
           }),
@@ -884,6 +1450,21 @@ General rules:
         : "again";
       const missingPrereqs = this.parsePrereqs(parsed.missing_prereqs);
       const annotations = this.parseAnnotations(parsed.annotations, input.attempt);
+      if (parsed.ok && input.sessionKey) this.closeSession(input.sessionKey);
+      this.emitPerf(
+        this.buildPerf(t0, "check", this.drillModel, workerKind, true, {
+          jevMs,
+          jevPass: jevMs !== undefined ? false : undefined,
+          trace: agyTrace,
+          ttftProseMs,
+          proseMs,
+          tailJsonMs,
+          llmStart: tLlmStart,
+          outputChars: raw.length,
+          promptChars: userText.length,
+        }),
+        onPerf,
+      );
       return {
         ok: parsed.ok,
         grade,
@@ -895,7 +1476,30 @@ General rules:
         jev: jev ?? undefined,
       };
     } catch (err) {
-      console.error("[judge] runSystem2 failed:", err instanceof Error ? err.message : err);
+      if (isAbortError(err) || signal?.aborted) {
+        this.emitPerf(
+          this.buildPerf(t0, "check", this.drillModel, workerKind, false, {
+            jevMs,
+            jevPass: jevMs !== undefined ? false : undefined,
+            trace: agyTrace,
+            aborted: true,
+            error: "aborted",
+          }),
+          onPerf,
+        );
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[judge] runSystem2 failed:", msg);
+      this.emitPerf(
+        this.buildPerf(t0, "check", this.drillModel, workerKind, false, {
+          jevMs,
+          jevPass: jevMs !== undefined ? false : undefined,
+          trace: agyTrace,
+          error: msg,
+        }),
+        onPerf,
+      );
       // Honest ungraded outcome on System 2 outage—never silently relax Jev thresholds into a fake pass.
       return {
         ok: false,
@@ -909,11 +1513,12 @@ General rules:
   }
 
   /**
-   * Evaluates an inline reply right inside Drill. If the learner's initial attempt PLUS their
-   * reply now completes the rep, marks ok=true with a <=12-word confirmation (zero tangents).
+   * Evaluates an inline reply right inside Drill. Reuses the warm KV-cached ACP session from `check()`
+   * so follow-up beats send only the new learner reply (~30-100 tokens instead of ~4.5k tokens).
    */
   async continueRep(
     input: {
+      sessionKey?: string | undefined;
       prompt: string;
       unitText: string;
       unitKind: string;
@@ -932,48 +1537,30 @@ General rules:
       hintsUsed: number;
     },
     onText?: (partialMessage: string) => void,
+    onPerf?: (rec: PerfRecord) => void,
+    signal?: AbortSignal,
   ): Promise<JudgeResult> {
-    if (!this.apiKey && !this.agyWorker) {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) {
       return {
         ok: false,
         grade: "again",
-        message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL=agy/gemini-4-neon-medium for inline replies.",
+        message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low for inline replies.",
         tier: "fallback",
         failed: true,
       };
     }
-    const sys = `You are a sharp, domain-agnostic learning partner in an organic back-and-forth during a practice rep.
-Your goal is fast, genuine human understanding—switching smoothly between Check gear (tight follow-up on a near-miss) and Build gear (atomic ground-floor scaffolding when the learner is stuck or confused).
-
-Rules:
-- ALWAYS speak directly in second person ("You..."). Stay crisp and strictly on-topic—no tangents, no lecturing.
-- The learner may either reply conversationally OR edit & resubmit their full derivation in place; judge the latest beat on its full merit.
-- ONE tiny atom and ONE question per turn (max 45 words). NEVER pack two questions or multiple unfamiliar concepts into one beat.
-- NEVER TELEGRAPH THE ANSWER IN YOUR HINT: Never print the missing variable names, symbols, or answer fragment inside the very question asking for them (e.g. NEVER write "...so $\\phi(\\cdot)\\phi(\\cdot)^T$ replaces $\\text{softmax}(QK^T)$?" right after asking "which two tensors?"). Point to the role or constraint instead.
-- If the learner says "i don't know" / "no idea" to a definition, symbol, or convention: do NOT keep quizzing it. Give the definition cleanly in 1 short sentence, then immediately ask ONE tiny concrete check (10–20s to answer) so they get fast feedback.
-- If we are climbing an atomic staircase (Build gear): move up ONE small rung at a time. The moment the learner lands the final rung of the target unit, finish right away (ok=true, grade="again")—NEVER tack on a forced recap, "put it together in one sentence", or meta-summary quiz; spaced repetition will test cold recall later.
-- NEVER pass a circular restatement/tautology, hand-waving, or a short tentative guess ending in "?" (like "Q and K?"). If they guess tentatively with "?", either ask ONE crisp 1-line "why?" check (ok=false) so they confirm the reason, or if they already proved the full idea earlier, grade="again".
-- Decouple ok (rep complete, ready to move on) from grade (cold-retrieval memory rating for spaced repetition):
-  - When the learner now understands the target unit (and isn't asking an open question), set ok=true and write AT MOST 10 WORDS confirming they got it (no extra commentary):
-    - grade="again": their initial attempt missed the core concept cold (wrong answer, "i have no ideas", needed 2+ nudges / Build gear, or guessed tentatively like "i guess..." / "X?"). The rep is done, and spaced repetition should bring it back soon.
-    - grade="hard": they had the core idea on turn 1 and only fixed one minor slip/edge case on a single quick nudge without guessing.
-    - grade="good": ONLY if turn 1 was purely a clarifying/notation question and they solved the whole unit cleanly on their own.
-- Otherwise set ok=false, grade="again", and give the next single atomic step or direct answer.
-- annotations: OPTIONAL array of AT MOST 1–2 grounded inline pins anchored onto verbatim substrings of the Learner latest beat (ONLY when pointing to a specific slip/question/good move inside a multi-step reply makes feedback noticeably clearer; leave [] otherwise).
-- missing_prereqs: ONLY when this exchange reveals a genuinely missing, reusable atomic prerequisite underneath the target unit (and NOT already in Existing units), include 1 crisp one-sentence unit; otherwise [].
-- Use $...$ for inline math only when needed. No praise fluff, no exclamation marks.
-- Return ONLY valid JSON with "message" FIRST so prose can stream cleanly: {"message": string, "ok": boolean, "grade": "again"|"hard"|"good"|"easy", "annotations": [{"quote": string, "note": string, "kind": "slip"|"question"|"move"}], "habit_observed": string|null, "missing_prereqs": [{"text": string, "kind": string}]}`;
 
     const thread = input.turns
       .slice(-20)
       .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
       .join("\n");
-    const user = [
-      input.learnerMemory?.trim() ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${input.learnerMemory.trim()}` : "",
+    const mem = trimLearnerMemory(input.learnerMemory);
+    const fullUser = [
+      mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
       `Prompt asked: ${input.prompt}`,
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "",
-      input.existingUnits?.length ? `Existing units (do not duplicate in missing_prereqs):\n- ${input.existingUnits.slice(0, 35).join("\n- ")}` : "",
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
       `Learner initial beat:\n${input.attempt.trim() || "(empty)"}`,
       `Initial coach response: ${input.feedback}`,
@@ -983,28 +1570,43 @@ Rules:
       .filter(Boolean)
       .join("\n");
 
+    const deltaUser = `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || "(see attached sketch)"}`;
+    const expectedPriorTurns = 1 + Math.floor(input.turns.length / 2);
+
     const userContent: unknown = input.sketchDataUrl
       ? [
-          { type: "text", text: user },
+          { type: "text", text: fullUser },
           { type: "image_url", image_url: { url: input.sketchDataUrl } },
         ]
-      : user;
+      : fullUser;
 
+    let agyTrace: AgyTurnTrace | undefined;
+    let ttftProseMs: number | undefined;
+    let proseMs: number | undefined;
+    let tailJsonMs: number | undefined;
+    let workerKind: PerfWorker = "openrouter";
     try {
       let raw = "";
-      if (this.agyWorker) {
-        let streamed = "";
-        raw = await this.agyWorker.ask(
-          `${sys}\n\n---\n\n${user}`,
-          input.sketchDataUrl,
-          onText
-            ? (delta) => {
-                streamed += delta;
-                const partial = extractStreamingJsonMessage(streamed);
-                if (partial) onText(partial);
-              }
-            : undefined,
-        );
+      if (this.drillWorker) {
+        const out = await this.askJsonWithTrace({
+          fallbackWorker: this.drillWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.drillSlug,
+          systemPrompt: DRILL_COACH_SYSTEM,
+          userPrompt: fullUser,
+          deltaPrompt: deltaUser,
+          sessionKey: input.sessionKey,
+          expectedPriorTurns,
+          sketchDataUrl: input.sketchDataUrl,
+          signal,
+          onText,
+        });
+        raw = out.raw;
+        agyTrace = out.trace;
+        ttftProseMs = out.ttftProseMs;
+        proseMs = out.proseMs;
+        tailJsonMs = out.tailJsonMs;
+        workerKind = out.worker;
       } else {
         const res = await this.fetchFn(CHAT_URL, {
           method: "POST",
@@ -1012,14 +1614,15 @@ Rules:
             Authorization: `Bearer ${this.apiKey}`,
             "Content-Type": "application/json",
           },
+          signal,
           body: JSON.stringify({
-            model: this.llmModel,
+            model: this.drillModel,
             reasoning: { effort: this.llmEffort },
             temperature: 0.1,
             max_tokens: 1400,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: sys },
+              { role: "system", content: DRILL_COACH_SYSTEM },
               { role: "user", content: userContent },
             ],
           }),
@@ -1049,6 +1652,18 @@ Rules:
         }
         const missingPrereqs = this.parsePrereqs(parsed.missing_prereqs);
         const annotations = this.parseAnnotations(parsed.annotations, input.reply);
+        if (parsed.ok && input.sessionKey) this.closeSession(input.sessionKey);
+        this.emitPerf(
+          this.buildPerf(t0, "follow-up", this.drillModel, workerKind, true, {
+            trace: agyTrace,
+            ttftProseMs,
+            proseMs,
+            tailJsonMs,
+            outputChars: raw.length,
+            promptChars: fullUser.length,
+          }),
+          onPerf,
+        );
         return {
           ok: parsed.ok,
           grade,
@@ -1060,8 +1675,15 @@ Rules:
         };
       }
       console.error("[judge] continueRep invalid JSON:", raw.slice(0, 180));
+      this.emitPerf(this.buildPerf(t0, "follow-up", this.drillModel, workerKind, false, { trace: agyTrace, error: "invalid JSON" }), onPerf);
     } catch (err) {
-      console.error("[judge] continueRep failed:", err instanceof Error ? err.message : err);
+      if (isAbortError(err) || signal?.aborted) {
+        this.emitPerf(this.buildPerf(t0, "follow-up", this.drillModel, workerKind, false, { trace: agyTrace, aborted: true, error: "aborted" }), onPerf);
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[judge] continueRep failed:", msg);
+      this.emitPerf(this.buildPerf(t0, "follow-up", this.drillModel, workerKind, false, { trace: agyTrace, error: msg }), onPerf);
     }
     return {
       ok: false,
@@ -1074,10 +1696,16 @@ Rules:
 
   /**
    * Ephemeral blank-drill ("+") exploration coach: helps the learner actively work through a new
-   * idea or problem in place, and crystallizes durable Units / Thinking Moves when real insights land.
+   * idea or problem in place on a strong reasoning model (`exploreModel`, e.g. gemini-4-neon-low).
+   * For standalone explorations (`decoupleMeta: true`), keeps the hot path laser-focused on
+   * streaming `"message"` + `"question"` with stateful KV-cached sessions (Turns 2+ send only the
+   * learner's new reply), while `extractExploreMeta()` crystallizes units & titles asynchronously.
    */
   async explore(
     input: {
+      sessionKey?: string | undefined;
+      /** When true (and no repContext), omits unit-crystallization & title rules from the hot path. */
+      decoupleMeta?: boolean | undefined;
       initial: string;
       sketchDataUrl?: string | null | undefined;
       turns: { role: "user" | "assistant"; text: string }[];
@@ -1088,14 +1716,19 @@ Rules:
       repContext?: { unitText: string; depth: Depth; prompt: string; grade: Grade } | undefined;
     },
     onText?: (partialMessage: string) => void,
+    onPerf?: (rec: PerfRecord) => void,
+    signal?: AbortSignal,
   ): Promise<ExploreResult> {
-    if (!this.apiKey && !this.agyWorker) {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) {
       return {
-        message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL=agy/gemini-4-neon-medium to run explorations.",
+        message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low to run explorations.",
         suggested_units: [],
         failed: true,
       };
     }
+
+    const hotOnly = Boolean(input.decoupleMeta) && !input.repContext;
 
     const repMetaRule = input.repContext
       ? `\n\nMETA-FEEDBACK ON THE COMPLETED REP (self-healing):
@@ -1111,63 +1744,73 @@ Rules:
       ? `{"message": string, "question": string|null, "title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}], "rep_fix": {"reworded_unit": string|null, "improved_prompt": string|null, "recommended_grade": "again"|"hard"|"good"|"easy"|null}|null}`
       : `{"message": string, "question": string|null, "title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}]}`;
 
-    const sys = `You are Myelin's sharp, peer-level reasoning partner inside a focused exploration (any domain: math, coding, systems, science, papers, writing).
-
-Role of Explore vs. Drills:
-- Explore is for building a real mental model, surfacing gaps, and crystallizing them onto the learner's Map so spaced-repetition Drills can verify retention later. Do NOT turn Explore into a tedious mini-drill.
-- Speak like a brilliant colleague at a whiteboard—direct, concise, zero robotic filler. NEVER open with "You're correct that...", "You've correctly identified...", "You're on the right track.", or "You're thinking about...". Start straight with the substance.
-- SEPARATE EXPLANATION ("message") FROM QUESTION ("question"):
-  - Put ONLY your explanation, feedback, math, or code in "message" (2-4 crisp sentences, or a tiny code/math block; use $...$ for inline math with double-escaped backslashes in JSON like \\\\times, \\\\frac; no fluff, no exclamation marks).
-  - Put your single forward-moving question (when there is one) in the separate "question" field so the UI displays it distinctly above the learner's composer—NEVER duplicate the question at the end of "message".
-  - Set "question": null on quick clarifications/sanity checks, when the learner flagged "[I don't understand this]" quotes and you just unpacked them without needing to re-ask a quiz, or when no question is needed.
-- HANDLE "[I don't understand this]" ANNOTATIONS & BATCHED REPLIES FIRST: The learner may attach one or more "> quote\n[I don't understand this]" blocks, a quoted answer to your previous question, and/or a separate follow-up in the same message. Address each piece cleanly in order inside "message". If they skipped your previous question to ask a different follow-up instead, follow their new thread directly—never nag them about the skipped question.
-- FOLLOW THE LEARNER'S ACTIVE FOCUS: Always prioritize what the learner just asked to understand over whatever was mentioned in the opening turn. Never abruptly pivot back to an earlier topic or paper until the learner is done with the current one or asks to switch.
-- NEVER QUIZ ON WHAT YOU ALREADY TOLD THEM: Never put "why X?" in "question" if you already gave the reason for X in "message" or an earlier turn (that becomes reading comprehension, not thinking). Either withhold the reason before asking, or ask about a genuinely new consequence, concrete case, or next design choice.
-- NO VERBATIM QUESTION REPEATS: On a quick clarification or sanity check (e.g. confirming a term or symbol), just answer cleanly in 1-2 sentences with "question": null instead of re-pasting your previous open question word-for-word.
-- ZERO NOTATION OR SYNTAX PEDANTRY: Accept rough shorthand and pseudocode-ish code immediately (e.g. "*value" means "@ V", "xbar" means $\\bar{x}$, minor typos, missing imports/colons/types, or rough indentation). NEVER waste a turn asking the learner to fix syntax, formatting, or variable names—only flag mistakes that actually change semantics (e.g. wrong axis/shape, missing keepdim, wrong sign, missing factor).
-- FIX, CRYSTALLIZE, AND KEEP MOVING (NO MINI-DRILLING): When the learner tries a step and makes specific slips (e.g. wrong parameter shape, missing eps, wrong broadcast) OR says "i have no idea" / "Walk me through this directly", give the clean corrected answer/code directly in 1-3 lines inside "message", crystallize the underlying conceptual gap(s) into "suggested_units" (with "told": true so Drills will test it later), and put the next forward step in "question". NEVER quiz them on a trivial fill-in-the-blank of a fix you just explained!
-- ONE STEP AT A TIME (DON'T SPRINT PAST CONFUSION): Treat a distant target (e.g. a SOTA variant) as a horizon, not a checklist to dump in one message. Never stack two brand-new mechanisms into one reply. If the learner explicitly asks a clarifying question or says "not sure I understand", stay on the current step until that piece is clear before introducing the next one.
-
-Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
+    const fullSys = `${EXPLORE_HOT_SYSTEM.replace(
+      'Return ONLY valid JSON with "message" FIRST so prose streams immediately: {"message": string, "question": string|null}',
+      `Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
 - HARD ANTI-SPOILER RULE: NEVER emit a unit that reveals the answer to the open "question" you are asking on this turn.
-- NEVER ADD WHAT THEY ALREADY KNEW COLD: If the learner answers your question cleanly and directly because they already know the concept (e.g. standard ML/math/coding knowledge they stated smoothly without hesitation or correction), emit "suggested_units": []. Do NOT add a card just to confirm a correct answer!
-- ONLY CRYSTALLIZE WHAT WAS ACTUALLY NEW OR SHAKY (1-2 max when earned; [] on already-known answers, broad overviews, quick sanity checks, or stalls): emit a unit ONLY when (a) you just taught/explained a genuinely new concept, mechanism, or vocabulary term the learner asked about or didn't know ("told": true), (b) you just fixed a concrete mistake/slip the learner made ("told": true), or (c) the learner just worked through a genuinely non-obvious new synthesis/derivation they had NOT known beforehand ("told": false).
-- DURABLE CONCEPTS ONLY (NO PAPER TRIVIA): NEVER emit paper-specific trivia (like exact layer counts, parameter counts, or benchmark claims of a specific paper) and NEVER smuggle framing from a side topic the learner didn't ask to learn. Skip duplicates of Existing units.
-- Write each unit "text" as one crisp, standalone, self-contained statement (1-2 sentences, with TeX math or short code if helpful) that will make a great future recall/application drill.
-- Set observe_only=true ONLY for a meta-cognitive Thinking Move / reasoning reflex; false for knowledge/skill units to drill.
-- "title": on the opening turn (when there is no Exchange so far), OR whenever you emit any suggested_units during a post-practice follow-up, include a crisp 2-5 word title for this exploration (e.g. "Linear attention & KDA", "QK-Norm & logit bounds"); otherwise omit or null.${repMetaRule}
-- Return ONLY valid JSON with "message" FIRST so prose streams immediately: ${jsonShape}`;
+- NEVER ADD WHAT THEY ALREADY KNEW COLD: If the learner answers your question cleanly and directly because they already know the concept, emit "suggested_units": [].
+- ONLY CRYSTALLIZE WHAT WAS ACTUALLY NEW OR SHAKY (1-2 max when earned; [] on already-known answers, broad overviews, quick sanity checks, or stalls): emit a unit ONLY when (a) you just taught/explained a genuinely new concept/term they didn't know ("told": true), (b) you just fixed a concrete mistake ("told": true), or (c) they worked through a genuinely non-obvious new synthesis ("told": false).
+- DURABLE CONCEPTS ONLY (NO PAPER TRIVIA): Write each unit "text" as one crisp, standalone, self-contained statement (1-2 sentences). Set observe_only=true ONLY for a meta-cognitive Thinking Move; false for knowledge/skill units.
+- "title": on the opening turn or whenever emitting suggested_units during a post-practice follow-up, include a crisp 2-5 word title; otherwise null.${repMetaRule}
+- Return ONLY valid JSON with "message" FIRST so prose streams immediately: ${jsonShape}`,
+    )}`;
+
+    const sys = hotOnly ? EXPLORE_HOT_SYSTEM : fullSys;
 
     const thread = input.turns
       .slice(-20)
       .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
       .join("\n");
 
+    const mem = trimLearnerMemory(input.learnerMemory);
     const lines = [
-      input.learnerMemory?.trim() ? `Learner memory (use this to calibrate level, pacing, analogies, and blind spots):\n${input.learnerMemory.trim()}` : "",
-      input.existingUnits.length ? `Existing units (do not duplicate):\n- ${input.existingUnits.slice(0, 35).join("\n- ")}` : "",
+      mem ? `Learner memory (use this to calibrate level, pacing, analogies, and blind spots):\n${mem}` : "",
       input.activeHabits.length ? `Active thinking moves:\n- ${input.activeHabits.slice(0, 8).join("\n- ")}` : "",
       `Learner opening prompt/attempt:\n${input.initial.trim() || "(see attached sketch)"}`,
       thread ? `Exchange so far:\n${thread}` : "",
       input.reply?.trim() ? `Learner latest reply:\n${input.reply.trim()}` : "",
     ].filter(Boolean);
 
+    const fullUser = lines.join("\n\n");
+    const deltaUser = input.reply?.trim()
+      ? `Learner latest reply:\n${input.reply.trim()}`
+      : `Learner latest reply:\n${input.initial.trim() || "(see attached sketch)"}`;
+    const expectedPriorTurns = Math.ceil(input.turns.length / 2);
+
     const userContent: unknown = input.sketchDataUrl
       ? [
-          { type: "text", text: lines.join("\n\n") },
+          { type: "text", text: fullUser },
           { type: "image_url", image_url: { url: input.sketchDataUrl } },
         ]
-      : lines.join("\n\n");
+      : fullUser;
 
+    let agyTrace: AgyTurnTrace | undefined;
+    let ttftProseMs: number | undefined;
+    let proseMs: number | undefined;
+    let tailJsonMs: number | undefined;
+    let workerKind: PerfWorker = "openrouter";
     try {
       let raw = "";
       if (this.agyWorker) {
-        let streamed = "";
-        raw = await this.agyWorker.ask(`${sys}\n\n---\n\n${lines.join("\n\n")}`, input.sketchDataUrl, onText ? (delta) => {
-          streamed += delta;
-          const partial = extractStreamingJsonMessage(streamed);
-          if (partial) onText(partial);
-        } : undefined);
+        const out = await this.askJsonWithTrace({
+          fallbackWorker: this.agyWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.exploreSlug,
+          systemPrompt: sys,
+          userPrompt: fullUser,
+          deltaPrompt: input.turns.length > 0 ? deltaUser : undefined,
+          sessionKey: input.sessionKey,
+          expectedPriorTurns: input.turns.length > 0 ? expectedPriorTurns : undefined,
+          sketchDataUrl: input.sketchDataUrl,
+          signal,
+          onText,
+        });
+        raw = out.raw;
+        agyTrace = out.trace;
+        ttftProseMs = out.ttftProseMs;
+        proseMs = out.proseMs;
+        tailJsonMs = out.tailJsonMs;
+        workerKind = out.worker;
       } else {
         const res = await this.fetchFn(CHAT_URL, {
           method: "POST",
@@ -1175,8 +1818,9 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
             Authorization: `Bearer ${this.apiKey}`,
             "Content-Type": "application/json",
           },
+          signal,
           body: JSON.stringify({
-            model: this.llmModel,
+            model: this.exploreModel,
             reasoning: { effort: this.llmEffort },
             temperature: 0.2,
             max_tokens: 1800,
@@ -1199,21 +1843,22 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
         rep_fix?: { reworded_unit?: string | null; improved_prompt?: string | null; recommended_grade?: string | null } | null;
       }>(raw);
       if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
-        const suggested = Array.isArray(parsed.suggested_units)
-          ? parsed.suggested_units
-              .filter(
-                (u): u is { text: string; kind?: string; observe_only?: boolean; told?: boolean } =>
-                  typeof u?.text === "string" && u.text.trim().length > 4,
-              )
-              .slice(0, 2)
-              .map((u) => ({
-                text: u.text.trim(),
-                kind: typeof u.kind === "string" && u.kind.trim() ? u.kind.trim() : u.observe_only ? "thinking move" : "move",
-                observe_only: Boolean(u.observe_only),
-                told: Boolean(u.told),
-              }))
-          : [];
-        const title = typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim().slice(0, 60) : undefined;
+        const suggested =
+          !hotOnly && Array.isArray(parsed.suggested_units)
+            ? parsed.suggested_units
+                .filter(
+                  (u): u is { text: string; kind?: string; observe_only?: boolean; told?: boolean } =>
+                    typeof u?.text === "string" && u.text.trim().length > 4,
+                )
+                .slice(0, 2)
+                .map((u) => ({
+                  text: u.text.trim(),
+                  kind: typeof u.kind === "string" && u.kind.trim() ? u.kind.trim() : u.observe_only ? "thinking move" : "move",
+                  observe_only: Boolean(u.observe_only),
+                  told: Boolean(u.told),
+                }))
+            : [];
+        const title = !hotOnly && typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim().slice(0, 60) : undefined;
         const question =
           typeof parsed.question === "string" && parsed.question.trim().length > 3 ? parsed.question.trim() : undefined;
         let rep_fix: ExploreRepFix | undefined;
@@ -1238,6 +1883,17 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
             };
           }
         }
+        this.emitPerf(
+          this.buildPerf(t0, "explore", this.exploreModel, workerKind, true, {
+            trace: agyTrace,
+            ttftProseMs,
+            proseMs,
+            tailJsonMs,
+            outputChars: raw.length,
+            promptChars: fullUser.length,
+          }),
+          onPerf,
+        );
         return {
           message: parsed.message.trim(),
           ...(question ? { question } : {}),
@@ -1246,17 +1902,166 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
           ...(rep_fix ? { rep_fix } : {}),
         };
       }
-      if (raw.trim()) return { message: raw.trim(), suggested_units: [] };
-    } catch {
-      /* fallback below */
+      if (raw.trim()) {
+        this.emitPerf(
+          this.buildPerf(t0, "explore", this.exploreModel, workerKind, true, {
+            trace: agyTrace,
+            outputChars: raw.length,
+            promptChars: fullUser.length,
+          }),
+          onPerf,
+        );
+        return { message: raw.trim(), suggested_units: [] };
+      }
+      this.emitPerf(this.buildPerf(t0, "explore", this.exploreModel, workerKind, false, { trace: agyTrace, error: "empty response" }), onPerf);
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        this.emitPerf(this.buildPerf(t0, "explore", this.exploreModel, workerKind, false, { trace: agyTrace, aborted: true, error: "aborted" }), onPerf);
+        throw err;
+      }
+      this.emitPerf(
+        this.buildPerf(t0, "explore", this.exploreModel, workerKind, false, {
+          trace: agyTrace,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        onPerf,
+      );
     }
     return { message: "Could not reach the coach just now.", suggested_units: [], failed: true };
   }
 
+  /**
+   * Non-blocking post-turn Explore sidecar: runs off the hot path after coach prose + question have
+   * already streamed to the UI, extracting calibrated anti-spoiler `suggested_units` and a crisp
+   * Turn-1 `title` without adding a single millisecond to foreground TTFT.
+   */
+  async extractExploreMeta(input: {
+    userText: string;
+    coachMessage: string;
+    coachQuestion?: string | undefined;
+    priorTurns: { role: "user" | "assistant"; text: string }[];
+    existingUnits: string[];
+    activeHabits: string[];
+    needsTitle: boolean;
+  }): Promise<ExploreSidecarResult> {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) return { suggested_units: [] };
+
+    const sys = `You are Myelin's calibrated knowledge-crystallization sidecar. You receive ONE just-completed Exploration exchange and extract ONLY high-signal durable units (and a crisp 2-5 word title when requested).
+
+Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
+- HARD ANTI-SPOILER RULE: NEVER emit a unit that reveals the answer to the Coach's open question on this turn.
+- NEVER ADD WHAT THEY ALREADY KNEW COLD: If the learner answered cleanly and directly because they already know the concept, emit "suggested_units": [].
+- ONLY CRYSTALLIZE WHAT WAS ACTUALLY NEW OR SHAKY (1-2 max when earned; [] on already-known answers, broad overviews, quick sanity checks, or stalls): emit a unit ONLY when (a) Coach just taught/explained a genuinely new concept, mechanism, or term the learner asked about or didn't know ("told": true), (b) Coach just fixed a concrete mistake/slip ("told": true), or (c) the learner just worked through a genuinely non-obvious new synthesis/derivation they had NOT known beforehand ("told": false).
+- DURABLE CONCEPTS ONLY (NO PAPER TRIVIA): Skip duplicates of Existing units. Write each unit "text" as one crisp, standalone, self-contained statement (1-2 sentences, with TeX math or short code if helpful).
+- Set observe_only=true ONLY for a meta-cognitive Thinking Move / reasoning reflex; false for knowledge/skill units to drill.
+- "title": ${input.needsTitle ? 'Return a crisp 2-5 word title for this exploration (e.g. "Linear attention & KDA", "Poisson limit derivation").' : "Set to null."}
+- Answer directly with ZERO tool calls. Return ONLY valid JSON:
+{"title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}]}`;
+
+    const recent = input.priorTurns
+      .slice(-4)
+      .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text.slice(0, 320)}`)
+      .join("\n");
+    const user = [
+      input.existingUnits.length > 0 ? `Existing units (do not duplicate):\n- ${input.existingUnits.slice(0, 35).join("\n- ")}` : "",
+      input.activeHabits.length > 0 ? `Active thinking moves:\n- ${input.activeHabits.slice(0, 8).join("\n- ")}` : "",
+      recent ? `Recent context:\n${recent}` : "",
+      `Latest turn:\nLearner: ${input.userText}\nCoach: ${input.coachMessage}${input.coachQuestion ? `\nCoach open question (DO NOT SPOIL): ${input.coachQuestion}` : ""}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    let agyTrace: AgyTurnTrace | undefined;
+    let workerKind: PerfWorker = "openrouter";
+    try {
+      let raw = "";
+      if (this.sidecarWorker) {
+        const res = await this.askAgy({
+          fallbackWorker: this.sidecarWorker,
+          fallbackWorkerName: "sidecar",
+          modelId: this.sidecarSlug,
+          systemPrompt: sys,
+          userPrompt: user,
+          timeoutMs: 35_000,
+          onTrace: (t) => {
+            agyTrace = t;
+          },
+        });
+        raw = res.raw;
+        workerKind = res.worker;
+      } else {
+        const res = await this.fetchFn(CHAT_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: this.sidecarModel,
+            reasoning: { effort: "low" },
+            temperature: 0.1,
+            max_tokens: 900,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: sys },
+              { role: "user", content: user },
+            ],
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+        raw = data.choices?.[0]?.message?.content ?? "";
+      }
+      const parsed = parseJudgeJson<{
+        title?: string | null;
+        suggested_units?: { text?: string; kind?: string; observe_only?: boolean; told?: boolean }[];
+      }>(raw);
+      const suggested = Array.isArray(parsed?.suggested_units)
+        ? parsed.suggested_units
+            .filter(
+              (u): u is { text: string; kind?: string; observe_only?: boolean; told?: boolean } =>
+                typeof u?.text === "string" && u.text.trim().length > 4,
+            )
+            .slice(0, 2)
+            .map((u) => ({
+              text: u.text.trim(),
+              kind: typeof u.kind === "string" && u.kind.trim() ? u.kind.trim() : u.observe_only ? "thinking move" : "move",
+              observe_only: Boolean(u.observe_only),
+              told: Boolean(u.told),
+            }))
+        : [];
+      const title =
+        input.needsTitle && typeof parsed?.title === "string" && parsed.title.trim() ? parsed.title.trim().slice(0, 60) : undefined;
+      this.perf?.record(
+        this.buildPerf(t0, "sidecar", this.sidecarModel, workerKind, true, {
+          background: true,
+          trace: agyTrace,
+          outputChars: raw.length,
+          promptChars: user.length,
+        }),
+      );
+      return { ...(title ? { title } : {}), suggested_units: suggested };
+    } catch (err) {
+      this.perf?.record(
+        this.buildPerf(t0, "sidecar", this.sidecarModel, workerKind, false, {
+          background: true,
+          trace: agyTrace,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      return { suggested_units: [] };
+    }
+  }
+
   /** One escalating hint rung without spoiling the answer. */
-  async hint(input: { prompt: string; unitText: string; restsOn: string[]; attempt: string; rung: number }): Promise<HintResult> {
+  async hint(
+    input: { prompt: string; unitText: string; restsOn: string[]; attempt: string; rung: number },
+    onPerf?: (rec: PerfRecord) => void,
+  ): Promise<HintResult> {
+    const t0 = Date.now();
     const rung = Math.max(1, Math.min(3, input.rung));
-    if (!this.apiKey && !this.agyWorker) {
+    if (!this.apiKey && !this.isAgy) {
       const seed = input.restsOn[0];
       return {
         rung,
@@ -1270,13 +2075,26 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
           ? "Ask one narrower guiding question that points directly at the key move (max 24 words). Do not state the full answer."
           : "Give only the first partial step so the learner still completes the rest (max 28 words).";
 
-    const hintSys = `You give brief Socratic nudges in plain sentence case. No exclamation marks, no praise. ${rungInstruction}`;
+    const hintSys = `You give brief Socratic nudges in plain sentence case. No exclamation marks, no praise. Answer directly with ZERO tool calls. ${rungInstruction}`;
     const hintUser = `Prompt: ${input.prompt}\nTarget unit: ${input.unitText}\nRests on: ${input.restsOn.join("; ") || "nothing"}\nLearner so far: ${input.attempt.trim() || "(empty)"}`;
 
+    let agyTrace: AgyTurnTrace | undefined;
+    let workerKind: PerfWorker = "openrouter";
     try {
       let text: string | undefined;
-      if (this.agyWorker) {
-        text = (await this.agyWorker.ask(`${hintSys}\n\n${hintUser}`)).trim();
+      if (this.drillWorker) {
+        const res = await this.askAgy({
+          fallbackWorker: this.drillWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.drillSlug,
+          systemPrompt: hintSys,
+          userPrompt: hintUser,
+          onTrace: (t) => {
+            agyTrace = t;
+          },
+        });
+        text = res.raw.trim();
+        workerKind = res.worker;
       } else {
         const res = await this.fetchFn(CHAT_URL, {
           method: "POST",
@@ -1285,7 +2103,7 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            model: this.llmModel,
+            model: this.drillModel,
             reasoning: { effort: "low" },
             temperature: 0.2,
             max_tokens: 1200,
@@ -1299,9 +2117,25 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
         const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
         text = data.choices?.[0]?.message?.content?.trim();
       }
-      if (text) return { rung, hint: text };
-    } catch {
-      /* fallback below */
+      if (text) {
+        this.emitPerf(
+          this.buildPerf(t0, "hint", this.drillModel, workerKind, true, {
+            trace: agyTrace,
+            outputChars: text.length,
+            promptChars: hintUser.length,
+          }),
+          onPerf,
+        );
+        return { rung, hint: text };
+      }
+    } catch (err) {
+      this.emitPerf(
+        this.buildPerf(t0, "hint", this.drillModel, workerKind, false, {
+          trace: agyTrace,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        onPerf,
+      );
     }
     const seed = input.restsOn[0];
     return {
@@ -1311,17 +2145,18 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
   }
 
   /**
-   * Strictly cosmetic draft formatter (like Black/Prettier + spellcheck) powered by a fast cheap model.
+   * Strictly cosmetic draft formatter (like Black/Prettier + spellcheck) powered by a fast model
+   * (uses `agy` fast tier at $0 cost when on `agy`, or OpenRouter flash-lite otherwise).
    * Tidies indentation, spacing, brackets, and obvious typos while explicitly NEVER solving the task
    * or altering semantic choices (e.g. axis, keepdim, signs, missing arguments).
    */
-  async tidyInput(text: string): Promise<{ text: string; changed: boolean }> {
+  async tidyInput(text: string, onPerf?: (rec: PerfRecord) => void): Promise<{ text: string; changed: boolean }> {
+    const t0 = Date.now();
     const raw = text;
     if (!raw.trim()) return { text: raw, changed: false };
-    if (!this.apiKey) {
-      throw new Error("Configure OPENROUTER_API_KEY to use fast draft formatting.");
+    if (!this.apiKey && !this.isAgy) {
+      throw new Error("Configure MYELIN_JUDGE_MODEL=agy/... or OPENROUTER_API_KEY to use fast draft formatting.");
     }
-    const tidyModel = process.env.MYELIN_TIDY_MODEL?.trim() || "google/gemini-2.5-flash-lite";
     const sys = `You are a strictly cosmetic code & notation formatter (like Black/Prettier + spellcheck).
 Your ONLY job is to tidy the user's rough draft (which may be incomplete or mid-thought) WITHOUT changing its meaning, logic, or solving anything.
 
@@ -1329,28 +2164,52 @@ STRICT RULES:
 - Fix indentation, spacing, alignment, line breaks, and obvious spelling/keyword typos (e.g. "keedim" -> "keepdim", "ret " -> "return ", "tru" -> "True").
 - NEVER complete unfinished code, NEVER add missing arguments/steps (e.g. do NOT add keepdim=True, do NOT fix a wrong axis/dim, do NOT fix a math sign or factor, do NOT add missing imports or return statements the user didn't write).
 - Preserve all user logic, variable names, rough structure, ASCII operators (keep "->", "!=", "<=", ">=" as ASCII), and any semantic bugs untouched—only clean syntax/formatting/typos.
-- Keep prose as prose and code as code. Do NOT wrap the output in markdown fences unless the input already had them. No explanations or commentary.
+- Keep prose as prose and code as code. Do NOT wrap the output in markdown fences unless the input already had them. No explanations or commentary. Answer directly with ZERO tool calls.
 - Return ONLY the tidied text verbatim.`;
 
-    const res = await this.fetchFn(CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: tidyModel,
-        temperature: 0,
-        max_tokens: 1400,
-        messages: [
-          { role: "system", content: sys },
-          { role: "user", content: raw },
-        ],
-      }),
-    });
-    if (!res.ok) throw new Error(`Formatter failed (HTTP ${res.status})`);
-    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    let out = data.choices?.[0]?.message?.content;
+    let out: string | undefined;
+    let modelUsed = this.drillModel;
+    let workerKind: PerfWorker = "openrouter";
+    let agyTrace: AgyTurnTrace | undefined;
+
+    if (this.drillWorker) {
+      const res = await this.askAgy({
+        fallbackWorker: this.drillWorker,
+        fallbackWorkerName: "agy",
+        modelId: this.drillSlug,
+        systemPrompt: sys,
+        userPrompt: raw,
+        timeoutMs: 25_000,
+        onTrace: (t) => {
+          agyTrace = t;
+        },
+      });
+      out = res.raw;
+      workerKind = res.worker;
+    } else {
+      const tidyModel = process.env.MYELIN_TIDY_MODEL?.trim() || "google/gemini-2.5-flash-lite";
+      modelUsed = tidyModel;
+      const res = await this.fetchFn(CHAT_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: tidyModel,
+          temperature: 0,
+          max_tokens: 1400,
+          messages: [
+            { role: "system", content: sys },
+            { role: "user", content: raw },
+          ],
+        }),
+      });
+      if (!res.ok) throw new Error(`Formatter failed (HTTP ${res.status})`);
+      const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+      out = data.choices?.[0]?.message?.content;
+    }
+
     if (typeof out !== "string" || !out.trim()) {
       return { text: raw, changed: false };
     }
@@ -1361,6 +2220,14 @@ STRICT RULES:
     }
     // Preserve whether the user had trailing whitespace/newline minimally
     out = out.replace(/^\r?\n+|\r?\n+$/g, "");
+    this.emitPerf(
+      this.buildPerf(t0, "tidy", modelUsed, workerKind, true, {
+        trace: agyTrace,
+        promptChars: raw.length,
+        outputChars: out.length,
+      }),
+      onPerf,
+    );
     return { text: out, changed: out !== raw };
   }
 
@@ -1369,17 +2236,21 @@ STRICT RULES:
    * poorly phrased map units, unfair grades, or missing prereqs, and returns concrete fixes
    * plus a concise learner-facing analysis.
    */
-  async auditRep(input: {
-    unitText: string;
-    unitKind: string;
-    depth: Depth;
-    prompt: string;
-    grade: Grade;
-    beats: { user: string; coach: string }[];
-    existingUnits: string[];
-    learnerMemory?: string | null | undefined;
-  }): Promise<AuditRepResult> {
-    if (!this.apiKey && !this.agyWorker) {
+  async auditRep(
+    input: {
+      unitText: string;
+      unitKind: string;
+      depth: Depth;
+      prompt: string;
+      grade: Grade;
+      beats: { user: string; coach: string }[];
+      existingUnits: string[];
+      learnerMemory?: string | null | undefined;
+    },
+    onPerf?: (rec: PerfRecord) => void,
+  ): Promise<AuditRepResult> {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) {
       throw new Error("Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL to audit reps.");
     }
     const sys = `You are Myelin's neutral session auditor. The learner just completed a drill rep and asked you to review whether the prompt, map unit, and grade were fair and high-signal.
@@ -1388,8 +2259,9 @@ Be candid, concise, and surgical (zero fluff, zero defensive excuses):
 1. Prompt check: Was the prompt vague/over-riddled, a spoiler, or mismatched with the unit? If clearly flawed, provide a crisp "improved_prompt" (1-2 sentences, names the concrete setup clearly, hides only the solution/trick). Otherwise null.
 2. Map unit check: Is the stored unit text unclear, too broad, or awkward? If clearly worth sharpening, provide "reworded_unit" (one clean, self-contained statement). Otherwise null.
 3. Grade check: Was the assigned grade ("again"|"hard"|"good"|"easy") clearly unfair (e.g. passed a lucky "?" guess or heavily hinted rep as "hard"/"good", OR penalized a genuinely solid answer)? If clearly off, set "recommended_grade". Otherwise null.
-4. Missing prereqs: ONLY if this exchange exposed a genuinely missing reusable prerequisite NOT already in Existing units, include at most 1 item in "missing_prereqs"; otherwise [].
+4. Missing prereqs: ONLY if this exchange exposed a genuinely missing reusable prerequisite, include at most 1 item in "missing_prereqs"; otherwise [].
 5. Analysis: Write 2-4 crisp sentences or short bullets summarizing what worked, what felt off (if anything), and why you made (or skipped) each adjustment.
+Answer directly with ZERO tool calls.
 
 Return ONLY valid JSON:
 {"analysis": string, "improved_prompt": string|null, "reworded_unit": string|null, "recommended_grade": "again"|"hard"|"good"|"easy"|null, "missing_prereqs": [{"text": string, "kind": string}]}`;
@@ -1398,65 +2270,97 @@ Return ONLY valid JSON:
       .slice(-10)
       .map((b, i) => `Turn ${i + 1}\nLearner: ${b.user}\nCoach: ${b.coach}`)
       .join("\n\n");
+    const mem = trimLearnerMemory(input.learnerMemory);
     const user = [
-      input.learnerMemory?.trim() ? `Learner memory:\n${input.learnerMemory.trim()}` : "",
+      mem ? `Learner memory:\n${mem}` : "",
       `Stored map unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       `Prompt shown: ${input.prompt}`,
       `Assigned grade: ${input.grade}`,
-      input.existingUnits.length > 0 ? `Existing units (do not duplicate):\n- ${input.existingUnits.slice(0, 35).join("\n- ")}` : "",
       `Transcript:\n${transcript}`,
     ]
       .filter(Boolean)
       .join("\n\n");
 
+    let agyTrace: AgyTurnTrace | undefined;
+    let workerKind: PerfWorker = "openrouter";
     let raw = "";
-    if (this.agyWorker) {
-      raw = await this.agyWorker.ask(`${sys}\n\n---\n\n${user}`);
-    } else {
-      const res = await this.fetchFn(CHAT_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: this.llmModel,
-          reasoning: { effort: this.llmEffort },
-          temperature: 0.1,
-          max_tokens: 1400,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: sys },
-            { role: "user", content: user },
-          ],
-        }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-      raw = data.choices?.[0]?.message?.content ?? "";
-    }
+    try {
+      if (this.agyWorker) {
+        const res = await this.askAgy({
+          fallbackWorker: this.agyWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.exploreSlug,
+          systemPrompt: sys,
+          userPrompt: user,
+          onTrace: (t) => {
+            agyTrace = t;
+          },
+        });
+        raw = res.raw;
+        workerKind = res.worker;
+      } else {
+        const res = await this.fetchFn(CHAT_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: this.exploreModel,
+            reasoning: { effort: this.llmEffort },
+            temperature: 0.1,
+            max_tokens: 1400,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: sys },
+              { role: "user", content: user },
+            ],
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+        raw = data.choices?.[0]?.message?.content ?? "";
+      }
 
-    const parsed = parseJudgeJson<{
-      analysis?: string;
-      improved_prompt?: string | null;
-      reworded_unit?: string | null;
-      recommended_grade?: string | null;
-      missing_prereqs?: unknown;
-    }>(raw);
-    if (!parsed || typeof parsed.analysis !== "string" || !parsed.analysis.trim()) {
-      throw new Error("Could not parse rep audit.");
+      const parsed = parseJudgeJson<{
+        analysis?: string;
+        improved_prompt?: string | null;
+        reworded_unit?: string | null;
+        recommended_grade?: string | null;
+        missing_prereqs?: unknown;
+      }>(raw);
+      if (!parsed || typeof parsed.analysis !== "string" || !parsed.analysis.trim()) {
+        throw new Error("Could not parse rep audit.");
+      }
+      const recGrade =
+        parsed.recommended_grade && ["again", "hard", "good", "easy"].includes(parsed.recommended_grade)
+          ? (parsed.recommended_grade as Grade)
+          : null;
+      this.emitPerf(
+        this.buildPerf(t0, "audit", this.exploreModel, workerKind, true, {
+          trace: agyTrace,
+          outputChars: raw.length,
+          promptChars: user.length,
+        }),
+        onPerf,
+      );
+      return {
+        analysis: parsed.analysis.trim(),
+        improved_prompt: typeof parsed.improved_prompt === "string" && parsed.improved_prompt.trim().length > 8 ? parsed.improved_prompt.trim() : null,
+        reworded_unit: typeof parsed.reworded_unit === "string" && parsed.reworded_unit.trim().length > 8 ? parsed.reworded_unit.trim() : null,
+        recommended_grade: recGrade,
+        missing_prereqs: this.parsePrereqs(parsed.missing_prereqs).slice(0, 1),
+      };
+    } catch (err) {
+      this.emitPerf(
+        this.buildPerf(t0, "audit", this.exploreModel, workerKind, false, {
+          trace: agyTrace,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        onPerf,
+      );
+      throw err;
     }
-    const recGrade =
-      parsed.recommended_grade && ["again", "hard", "good", "easy"].includes(parsed.recommended_grade)
-        ? (parsed.recommended_grade as Grade)
-        : null;
-    return {
-      analysis: parsed.analysis.trim(),
-      improved_prompt: typeof parsed.improved_prompt === "string" && parsed.improved_prompt.trim().length > 8 ? parsed.improved_prompt.trim() : null,
-      reworded_unit: typeof parsed.reworded_unit === "string" && parsed.reworded_unit.trim().length > 8 ? parsed.reworded_unit.trim() : null,
-      recommended_grade: recGrade,
-      missing_prereqs: this.parsePrereqs(parsed.missing_prereqs).slice(0, 1),
-    };
   }
 
   /** Overrides a cached prompt for a specific unit/depth/variant and persists the cache. */
@@ -1561,10 +2465,25 @@ Return ONLY valid JSON:
       `Recent explorations:\n${expBlock}`,
     ].join("\n\n---\n\n");
 
+    const t0 = Date.now();
+    let agyTrace: AgyTurnTrace | undefined;
+    let workerKind: PerfWorker = "openrouter";
     let raw = "";
     const worker = this.plannerWorker ?? this.agyWorker;
     if (worker) {
-      raw = await worker.ask(`${sys}\n\n---\n\n${user}`);
+      const res = await this.askAgy({
+        fallbackWorker: worker,
+        fallbackWorkerName: this.plannerWorker ? "planner" : "agy",
+        modelId: this.promptSlug,
+        systemPrompt: sys,
+        userPrompt: user,
+        timeoutMs: 120_000,
+        onTrace: (t) => {
+          agyTrace = t;
+        },
+      });
+      raw = res.raw;
+      workerKind = res.worker;
     } else {
       const res = await this.fetchFn(CHAT_URL, {
         method: "POST",
@@ -1573,7 +2492,7 @@ Return ONLY valid JSON:
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: this.llmModel,
+          model: this.promptModel,
           reasoning: { effort: "high" },
           temperature: 0.2,
           max_tokens: 2200,
@@ -1602,8 +2521,16 @@ Return ONLY valid JSON:
       Array.isArray(v)
         ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim()).slice(0, 6)
         : [];
+    this.perf?.record(
+      this.buildPerf(t0, "dream", this.promptModel, workerKind, true, {
+        background: true,
+        trace: agyTrace,
+        outputChars: raw.length,
+        promptChars: user.length,
+      }),
+    );
     return {
-      memory: parsed.memory.trim().slice(0, 3200),
+      memory: parsed.memory.trim().slice(0, 1800),
       summary: typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : "Consolidated recent learning patterns.",
       promoted: toList(parsed.promoted),
       graduated: toList(parsed.graduated),
@@ -1620,7 +2547,7 @@ Return ONLY valid JSON:
     return this.promptCache.get(this.promptKey(unit, depth, restsOn, variant)) ?? null;
   }
 
-  /** Prefetches uncached prompts in the background (yields whenever an active card is loading). */
+  /** Prefetches uncached prompts in the background (runs up to 2 concurrent ACP sessions; yields to foreground misses). */
   warmPrompts(
     items: {
       unit: { id: string; text: string; kind: string; topic?: string | null };
@@ -1632,9 +2559,17 @@ Return ONLY valid JSON:
     }[],
   ): void {
     if (!this.apiKey && !this.promptWorker) return;
-    void (async () => {
-      for (const item of items) {
+    const queue = items.filter((item) => {
+      const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0);
+      return !this.promptCache.has(key) && !this.inflightPrompts.has(key);
+    });
+    if (queue.length === 0) return;
+    const concurrency = this.acpClient && !this.acpClient.isUnsupported ? Math.min(2, queue.length) : 1;
+    let cursor = 0;
+    const runWorker = async () => {
+      while (cursor < queue.length) {
         if (this.activeForegroundPrompts > 0) break;
+        const item = queue[cursor++]!;
         const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0);
         if (this.promptCache.has(key) || this.inflightPrompts.has(key)) continue;
         try {
@@ -1653,10 +2588,16 @@ Return ONLY valid JSON:
           /* ignore background prefetch errors */
         }
       }
-    })();
+    };
+    for (let i = 0; i < concurrency; i++) void runWorker();
   }
 
-  /** Generates a crisp, self-contained single-beat prompt without giving away the answer (cached per variant). */
+  /**
+   * Generates a crisp, self-contained single-beat prompt without giving away the answer (cached per variant).
+   * Background prefetch (`background=true`) uses high-reasoning `promptModel` (`gemini-4-neon-high`);
+   * synchronous foreground cache misses (`background=false`) use fast `sidecarModel` (`gemini-4-hydrogen-medium`)
+   * with a tight 20s ceiling so card loads never stall 35–110s waiting on a background prefetch.
+   */
   async promptFor(
     unit: { id: string; text: string; kind: string; topic?: string | null },
     restsOn: string[],
@@ -1669,7 +2610,7 @@ Return ONLY valid JSON:
     const cached = this.promptCache.get(key);
     if (cached) return cached;
     const inflight = this.inflightPrompts.get(key);
-    if (inflight) return inflight;
+    if (inflight && (background || !inflight.background)) return inflight.promise;
 
     if (!this.apiKey && !this.promptWorker) {
       const fallback = defaultPrompt(unit.text, unit.kind, restsOn, depth);
@@ -1703,10 +2644,11 @@ Rules:
 - 100% SELF-CONTAINED COLD: Explicitly define every symbol or variable used (e.g. "a distribution $p_\\theta(x)$ parameterized by $\\theta$", never a bare undefined "$\\nabla p$").
 - ONE SINGLE TASK: Never stack two separate demands ("...and also explain..."). Plain text, TeX in $…$ only when genuinely helpful, no meta-commentary.`;
     const prior = (opts.priorPrompts ?? []).filter(Boolean).slice(-3);
+    const mem = trimLearnerMemory(opts.learnerMemory);
     const promptUser = [
       goalByDepth[depth],
-      opts.learnerMemory?.trim()
-        ? `Learner memory (use ONLY to match background level, preferred style, and target active blind spots—NEVER spoil the answer):\n${opts.learnerMemory.trim()}`
+      mem
+        ? `Learner memory (use ONLY to match background level, preferred style, and target active blind spots—NEVER spoil the answer):\n${mem}`
         : "",
       unit.topic ? `Topic: ${unit.topic}` : "",
       `Unit (${unit.kind}): ${unit.text}`,
@@ -1716,20 +2658,33 @@ Rules:
       .filter(Boolean)
       .join("\n");
 
+    const useFastFg = !background && this.isAgy;
+    const modelForCall = useFastFg ? this.sidecarModel : this.promptModel;
+    const slugForCall = useFastFg ? this.sidecarSlug : this.promptSlug;
+    const fallbackWorkerForCall = useFastFg ? (this.sidecarWorker ?? this.promptWorker) : this.promptWorker;
+    const timeoutMs = background ? 65_000 : 20_000;
+
     if (!background) this.activeForegroundPrompts++;
+    const t0 = Date.now();
     const p = (async () => {
+      let agyTrace: AgyTurnTrace | undefined;
+      let workerKind: PerfWorker = "openrouter";
       try {
         let text: string | undefined;
-        if (this.promptWorker) {
-          try {
-            text = (await this.promptWorker.ask(`${promptSys}\n\n${promptUser}`)).trim().replace(/^["']|["']$/g, "");
-          } catch (err) {
-            console.error("[judge] promptWorker failed:", err instanceof Error ? err.message : err);
-            // Retry once on a fresh worker (same configured model, never downgrade).
-            if (!background) {
-              text = (await this.promptWorker.ask(`${promptSys}\n\n${promptUser}`)).trim().replace(/^["']|["']$/g, "");
-            }
-          }
+        if (fallbackWorkerForCall) {
+          const res = await this.askAgy({
+            fallbackWorker: fallbackWorkerForCall,
+            fallbackWorkerName: "prompt",
+            modelId: slugForCall,
+            systemPrompt: `${promptSys}\nAnswer directly with ZERO tool calls.`,
+            userPrompt: promptUser,
+            timeoutMs,
+            onTrace: (t) => {
+              agyTrace = t;
+            },
+          });
+          workerKind = res.worker;
+          text = res.raw.trim().replace(/^["']|["']$/g, "");
         } else {
           const res = await this.fetchFn(CHAT_URL, {
             method: "POST",
@@ -1738,8 +2693,8 @@ Rules:
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              model: this.llmModel,
-              reasoning: { effort: "high" },
+              model: modelForCall,
+              reasoning: { effort: background ? "high" : "low" },
               temperature: 0.3,
               max_tokens: 2000,
               messages: [
@@ -1756,19 +2711,43 @@ Rules:
         if (text) {
           this.promptCache.set(key, text);
           this.savePromptCache();
+          this.perf?.record(
+            this.buildPerf(t0, "prompt", modelForCall, workerKind, true, {
+              background,
+              cacheHit: false,
+              trace: agyTrace,
+              outputChars: text.length,
+              promptChars: promptUser.length,
+            }),
+          );
           return text;
         }
       } catch (err) {
         console.error("[judge] promptFor failed:", err instanceof Error ? err.message : err);
+        this.perf?.record(
+          this.buildPerf(t0, "prompt", modelForCall, workerKind, false, {
+            background,
+            cacheHit: false,
+            trace: agyTrace,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
       }
       // Never cache a transient fallback in promptCache so the next load retries cleanly.
       return defaultPrompt(unit.text, unit.kind, restsOn, depth);
     })().finally(() => {
-      this.inflightPrompts.delete(key);
+      if (this.inflightPrompts.get(key)?.promise === p) {
+        this.inflightPrompts.delete(key);
+      }
       if (!background) this.activeForegroundPrompts = Math.max(0, this.activeForegroundPrompts - 1);
     });
 
-    this.inflightPrompts.set(key, p);
+    this.inflightPrompts.set(key, { promise: p, background });
+    // If a slow background neon-high prefetch was already running when a foreground user asked for
+    // this exact card, race both so the learner gets whichever finishes first (typically ~2.5s)!
+    if (!background && inflight?.background) {
+      return Promise.race([p, inflight.promise]);
+    }
     return p;
   }
 
@@ -1777,12 +2756,17 @@ Rules:
    * codebase, or topic (diffed against the learner's existing Map) so they can read in ~2 minutes,
    * highlight/cite anything confusing or intriguing, and optionally stress-test the non-obvious cruxes.
    */
-  async planFrontier(input: {
-    request: string;
-    existingUnits: { text: string; p_imm: number; reviews: number }[];
-    learnerMemory?: string | null | undefined;
-  }): Promise<PlannedFrontier> {
-    if (!this.apiKey && !this.plannerWorker) {
+  async planFrontier(
+    input: {
+      request: string;
+      existingUnits: { text: string; p_imm: number; reviews: number }[];
+      learnerMemory?: string | null | undefined;
+    },
+    onPerf?: (rec: PerfRecord) => void,
+    signal?: AbortSignal,
+  ): Promise<PlannedFrontier> {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) {
       return {
         title: input.request.slice(0, 48).trim() || "New briefing",
         body: `### Overview\n\nConfigure \`OPENROUTER_API_KEY\` or \`MYELIN_JUDGE_MODEL=agy/...\` to generate plain-English briefings from local files or topics.`,
@@ -1816,75 +2800,112 @@ CRITICAL WRITING RULES:
       .map((u) => `- ${u.text} (${u.reviews > 0 ? `P=${Math.round(u.p_imm * 100)}%` : "untested"})`)
       .join("\n");
 
+    const mem = trimLearnerMemory(input.learnerMemory);
     const user = [
-      input.learnerMemory?.trim() ? `Learner memory (calibrate assumed background & explanation style):\n${input.learnerMemory.trim()}` : "",
+      mem ? `Learner memory (calibrate assumed background & explanation style):\n${mem}` : "",
       `Learner wants to understand: ${input.request.trim()}`,
       knownLines ? `Existing Map units (skip re-explaining what is already solid):\n${knownLines}` : "Existing Map units: none yet.",
     ]
       .filter(Boolean)
       .join("\n\n");
 
+    let agyTrace: AgyTurnTrace | undefined;
+    let workerKind: PerfWorker = "openrouter";
     let raw = "";
-    if (this.plannerWorker) {
-      raw = await this.plannerWorker.ask(`${sys}\n\n---\n\n${user}`);
-    } else {
-      const res = await this.fetchFn(CHAT_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: this.llmModel,
-          reasoning: { effort: "high" },
-          temperature: 0.2,
-          max_tokens: 3200,
-          response_format: { type: "json_object" },
-          messages: [
-            { role: "system", content: sys },
-            { role: "user", content: user },
-          ],
+    try {
+      if (this.plannerWorker) {
+        const res = await this.askAgy({
+          fallbackWorker: this.plannerWorker,
+          fallbackWorkerName: "planner",
+          modelId: this.promptSlug,
+          systemPrompt: sys,
+          userPrompt: user,
+          timeoutMs: 120_000,
+          signal,
+          onTrace: (t) => {
+            agyTrace = t;
+          },
+        });
+        raw = res.raw;
+        workerKind = res.worker;
+      } else {
+        const res = await this.fetchFn(CHAT_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          signal,
+          body: JSON.stringify({
+            model: this.promptModel,
+            reasoning: { effort: "high" },
+            temperature: 0.2,
+            max_tokens: 3200,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: sys },
+              { role: "user", content: user },
+            ],
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+        raw = data.choices?.[0]?.message?.content ?? "";
+      }
+
+      const parsed = parseJudgeJson<{
+        title?: string;
+        body?: string;
+        skipped_known?: unknown;
+        cruxes?: unknown;
+      }>(raw);
+
+      if (!parsed || typeof parsed.body !== "string" || !parsed.body.trim()) {
+        throw new Error("Could not build a briefing from that request—try naming a specific file, paper, chapter, or topic.");
+      }
+
+      const cruxes: PlannedBriefingCrux[] = Array.isArray(parsed.cruxes)
+        ? parsed.cruxes
+            .filter(
+              (c): c is { text: string; kind?: string; source_ref?: string; question: string } =>
+                typeof c?.text === "string" && c.text.trim().length > 4 && typeof c?.question === "string" && c.question.trim().length > 4,
+            )
+            .slice(0, 4)
+            .map((c) => ({
+              text: c.text.trim(),
+              kind: typeof c.kind === "string" && c.kind.trim() ? c.kind.trim() : "result",
+              question: c.question.trim(),
+              ...(typeof c.source_ref === "string" && c.source_ref.trim() ? { source_ref: c.source_ref.trim() } : {}),
+            }))
+        : [];
+
+      this.emitPerf(
+        this.buildPerf(t0, "briefing-plan", this.promptModel, workerKind, true, {
+          trace: agyTrace,
+          outputChars: raw.length,
+          promptChars: user.length,
         }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-      raw = data.choices?.[0]?.message?.content ?? "";
+        onPerf,
+      );
+      return {
+        title: typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : input.request.slice(0, 48).trim(),
+        body: parsed.body.trim(),
+        skipped_known: Array.isArray(parsed.skipped_known)
+          ? parsed.skipped_known.filter((x): x is string => typeof x === "string" && x.trim().length > 0).slice(0, 4)
+          : [],
+        cruxes,
+      };
+    } catch (err) {
+      this.emitPerf(
+        this.buildPerf(t0, "briefing-plan", this.promptModel, workerKind, false, {
+          trace: agyTrace,
+          aborted: isAbortError(err) || signal?.aborted,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        onPerf,
+      );
+      throw err;
     }
-
-    const parsed = parseJudgeJson<{
-      title?: string;
-      body?: string;
-      skipped_known?: unknown;
-      cruxes?: unknown;
-    }>(raw);
-
-    if (!parsed || typeof parsed.body !== "string" || !parsed.body.trim()) {
-      throw new Error("Could not build a briefing from that request—try naming a specific file, paper, chapter, or topic.");
-    }
-
-    const cruxes: PlannedBriefingCrux[] = Array.isArray(parsed.cruxes)
-      ? parsed.cruxes
-          .filter(
-            (c): c is { text: string; kind?: string; source_ref?: string; question: string } =>
-              typeof c?.text === "string" && c.text.trim().length > 4 && typeof c?.question === "string" && c.question.trim().length > 4,
-          )
-          .slice(0, 4)
-          .map((c) => ({
-            text: c.text.trim(),
-            kind: typeof c.kind === "string" && c.kind.trim() ? c.kind.trim() : "result",
-            question: c.question.trim(),
-            ...(typeof c.source_ref === "string" && c.source_ref.trim() ? { source_ref: c.source_ref.trim() } : {}),
-          }))
-      : [];
-
-    return {
-      title: typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : input.request.slice(0, 48).trim(),
-      body: parsed.body.trim(),
-      skipped_known: Array.isArray(parsed.skipped_known)
-        ? parsed.skipped_known.filter((x): x is string => typeof x === "string" && x.trim().length > 0).slice(0, 4)
-        : [],
-      cruxes,
-    };
   }
 
   /**
@@ -1894,6 +2915,7 @@ CRITICAL WRITING RULES:
    */
   async discussBriefing(
     input: {
+      sessionKey?: string | undefined;
       title: string;
       source: string;
       body: string;
@@ -1908,8 +2930,11 @@ CRITICAL WRITING RULES:
       learnerMemory?: string | null | undefined;
     },
     onText?: (partialMessage: string) => void,
+    onPerf?: (rec: PerfRecord) => void,
+    signal?: AbortSignal,
   ): Promise<ExploreResult> {
-    if (!this.apiKey && !this.agyWorker) {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.isAgy) {
       return {
         message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL=agy/... for live discussion.",
         suggested_units: [],
@@ -1927,7 +2952,7 @@ Rules:
 - If the learner asks to be tested ("Test me" or "quiz me"):
   - Pick ONE untested crux below and ask ONE consequential, source-grounded task (predict what breaks under a changed assumption, trace an edge case, or explain a core tradeoff in plain English). If they get stuck, show one concrete worked step and let them finish the next.
   - When the learner genuinely demonstrates a crux in their own words, set "demonstrated_crux_index" to its 0-based index (otherwise null), confirm cleanly, and move to the next untested crux (or wrap up naturally once all are covered).
-- suggested_units: ONLY when a genuinely reusable, concrete unit of understanding clearly crystallizes from what the learner just demonstrated or unpacked (and is NOT already in Existing units), include 1 (at most 2) crisp self-contained one-sentence unit(s). Most clarification turns should return []. Set observe_only=true ONLY for a meta-cognitive Thinking Move; false for knowledge/skill units.
+- suggested_units: ONLY when a genuinely reusable, concrete unit of understanding clearly crystallizes from what the learner just demonstrated or unpacked, include 1 (at most 2) crisp self-contained one-sentence unit(s). Most clarification turns should return []. Set observe_only=true ONLY for a meta-cognitive Thinking Move; false for knowledge/skill units.
 - Return ONLY valid JSON with "message" FIRST: {"message": string, "demonstrated_crux_index": number|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean}]}`;
 
     const thread = input.turns
@@ -1940,34 +2965,57 @@ Rules:
       .map((c, i) => `${i}. [${c.kind}${doneSet.has(i) ? ", already demonstrated" : ""}${c.source_ref ? ` · ${c.source_ref}` : ""}] ${c.text}\n   Task: ${c.question}`)
       .join("\n");
 
+    const mem = trimLearnerMemory(input.learnerMemory);
+    const latestLine = input.testMe
+      ? `Learner clicked "Test me" (already demonstrated cruxes: [${[...doneSet].join(",")}]): ${input.reply.trim() || "Pose one consequential, source-grounded task on the next untested crux."}`
+      : `Learner latest message:\n${input.reply.trim() || "(see attached sketch)"}`;
+
     const lines = [
-      input.learnerMemory?.trim() ? `Learner memory:\n${input.learnerMemory.trim()}` : "",
+      mem ? `Learner memory:\n${mem}` : "",
       `Briefing shown to learner:\n${input.body}`,
       cruxLines ? `Core non-obvious cruxes (0-indexed, for "Test me" mode):\n${cruxLines}` : "",
-      input.existingUnits.length ? `Existing Map units (do not duplicate):\n- ${input.existingUnits.slice(0, 35).join("\n- ")}` : "",
       input.activeHabits.length ? `Active thinking moves:\n- ${input.activeHabits.slice(0, 8).join("\n- ")}` : "",
       thread ? `Discussion so far:\n${thread}` : "",
-      input.testMe
-        ? `Learner clicked "Test me": ${input.reply.trim() || "Pose one consequential, source-grounded task on the next untested crux."}`
-        : `Learner latest message:\n${input.reply.trim() || "(see attached sketch)"}`,
+      latestLine,
     ].filter(Boolean);
+
+    const fullUser = lines.join("\n\n");
+    const expectedPriorTurns = Math.floor(input.turns.length / 2);
 
     const userContent: unknown = input.sketchDataUrl
       ? [
-          { type: "text", text: lines.join("\n\n") },
+          { type: "text", text: fullUser },
           { type: "image_url", image_url: { url: input.sketchDataUrl } },
         ]
-      : lines.join("\n\n");
+      : fullUser;
 
+    let agyTrace: AgyTurnTrace | undefined;
+    let ttftProseMs: number | undefined;
+    let proseMs: number | undefined;
+    let tailJsonMs: number | undefined;
+    let workerKind: PerfWorker = "openrouter";
     try {
       let raw = "";
       if (this.agyWorker) {
-        let streamed = "";
-        raw = await this.agyWorker.ask(`${sys}\n\n---\n\n${lines.join("\n\n")}`, input.sketchDataUrl, onText ? (delta) => {
-          streamed += delta;
-          const partial = extractStreamingJsonMessage(streamed);
-          if (partial) onText(partial);
-        } : undefined);
+        const out = await this.askJsonWithTrace({
+          fallbackWorker: this.agyWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.exploreSlug,
+          systemPrompt: sys,
+          userPrompt: fullUser,
+          deltaPrompt: input.turns.length > 0 ? latestLine : undefined,
+          sessionKey: input.sessionKey,
+          expectedPriorTurns: input.turns.length > 0 ? expectedPriorTurns : undefined,
+          sketchDataUrl: input.sketchDataUrl,
+          signal,
+          onText,
+        });
+        raw = out.raw;
+        agyTrace = out.trace;
+        ttftProseMs = out.ttftProseMs;
+        proseMs = out.proseMs;
+        tailJsonMs = out.tailJsonMs;
+        workerKind = out.worker;
       } else {
         const res = await this.fetchFn(CHAT_URL, {
           method: "POST",
@@ -1975,8 +3023,9 @@ Rules:
             Authorization: `Bearer ${this.apiKey}`,
             "Content-Type": "application/json",
           },
+          signal,
           body: JSON.stringify({
-            model: this.llmModel,
+            model: this.exploreModel,
             reasoning: { effort: this.llmEffort },
             temperature: 0.2,
             max_tokens: 1800,
@@ -2014,15 +3063,46 @@ Rules:
           parsed.demonstrated_crux_index < input.cruxes.length
             ? parsed.demonstrated_crux_index
             : null;
+        this.emitPerf(
+          this.buildPerf(t0, "briefing", this.exploreModel, workerKind, true, {
+            trace: agyTrace,
+            ttftProseMs,
+            proseMs,
+            tailJsonMs,
+            outputChars: raw.length,
+            promptChars: fullUser.length,
+          }),
+          onPerf,
+        );
         return {
           message: parsed.message.trim(),
           suggested_units: suggested,
           ...(demoIdx !== null ? { demonstrated_crux_index: demoIdx } : {}),
         };
       }
-      if (raw.trim()) return { message: raw.trim(), suggested_units: [] };
-    } catch {
-      /* fallback below */
+      if (raw.trim()) {
+        this.emitPerf(
+          this.buildPerf(t0, "briefing", this.exploreModel, workerKind, true, {
+            trace: agyTrace,
+            outputChars: raw.length,
+            promptChars: fullUser.length,
+          }),
+          onPerf,
+        );
+        return { message: raw.trim(), suggested_units: [] };
+      }
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        this.emitPerf(this.buildPerf(t0, "briefing", this.exploreModel, workerKind, false, { trace: agyTrace, aborted: true, error: "aborted" }), onPerf);
+        throw err;
+      }
+      this.emitPerf(
+        this.buildPerf(t0, "briefing", this.exploreModel, workerKind, false, {
+          trace: agyTrace,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+        onPerf,
+      );
     }
     return { message: "Could not reach the coach just now.", suggested_units: [], failed: true };
   }

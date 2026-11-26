@@ -4,6 +4,7 @@ import { serve } from "@hono/node-server";
 import { createApp } from "./app.js";
 import { Files } from "./files.js";
 import { FastJudge } from "./judge.js";
+import { PerfLog } from "./perf.js";
 import { Registry } from "./registry.js";
 import { RwkvInstantEngine } from "./rwkv.js";
 import { Sandbox, type SandboxOptions } from "./sandbox.js";
@@ -41,8 +42,9 @@ export async function startServer({ port = 4317, host = "127.0.0.1", dataDir, we
   const files = new Files(dataDir);
   const tutors = tutor ? new Tutors(stores, { sandbox, files, ...tutor }, (id) => registry.user(id)?.name ?? "the learner") : undefined;
   const rwkv = RwkvInstantEngine.load();
-  const judge = new FastJudge({ cachePath: join(dataDir, "prompts.json") });
-  const app = createApp({ registry, stores, webRoot, tutors, sandbox, keys, files, rwkv, judge, dataDir });
+  const perf = new PerfLog(join(dataDir, "perf.jsonl"));
+  const judge = new FastJudge({ cachePath: join(dataDir, "prompts.json"), perf });
+  const app = createApp({ registry, stores, webRoot, tutors, sandbox, keys, files, rwkv, judge, perf, dataDir });
   const { server, address } = await new Promise<{ server: Server; address: { port: number } }>((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port, hostname: host }, (info) => resolve({ server: s as Server, address: info }));
     (s as Server).once("error", reject);
