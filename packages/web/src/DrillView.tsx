@@ -1054,11 +1054,12 @@ export function DrillView() {
     return { kind: "drill", res };
   };
 
-  const submitBeat = async (overrideText?: string, opts?: { showPivot?: boolean }) => {
+  const submitBeat = async (overrideText?: string, opts?: { showPivot?: boolean; tellMe?: boolean }) => {
     const showPivot = Boolean(opts?.showPivot);
+    const tellMe = Boolean(opts?.tellMe);
     const hasOverride = typeof overrideText === "string" && overrideText.trim().length > 0;
-    if (!hasOverride && !showPivot && !canSubmit()) return;
-    if ((hasOverride || showPivot) && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
+    if (!hasOverride && !showPivot && !tellMe && !canSubmit()) return;
+    if ((hasOverride || showPivot || tellMe) && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
     const ownerKey = sessionKey();
     const isFreshExplore = isExplore();
     const savedExp = activeExploration();
@@ -1066,16 +1067,22 @@ export function DrillView() {
     const frontier = activeFrontier();
     const unitRep = rep();
     const prevDraft = draft().trim();
-    const text = hasOverride ? overrideText.trim() : showPivot ? prevDraft || "Show me the pivot." : prevDraft;
+    const text = tellMe
+      ? ""
+      : hasOverride
+        ? overrideText.trim()
+        : showPivot
+          ? prevDraft || "Show me the pivot."
+          : prevDraft;
     const activeQ = activeExploreQuestion();
-    const qAns = hasOverride ? "" : questionReply().trim();
-    const rawCitations = snapshot(citations());
+    const qAns = tellMe ? "Walk me through this directly." : hasOverride ? "" : questionReply().trim();
+    const rawCitations = tellMe ? [] : snapshot(citations());
     const pendingCitations: Citation[] =
       activeQ && qAns
         ? [{ id: uuidv7(), text: activeQ, comment: qAns }, ...rawCitations]
         : rawCitations;
-    const payloadText = formatCitedMessage(pendingCitations, text);
-    const sketch = exportSketch();
+    const payloadText = formatCitedMessage(pendingCitations, text || (tellMe ? qAns : ""));
+    const sketch = tellMe ? null : exportSketch();
     const priorBeats = snapshot(beats());
     const latencyMs = !modeExplore && !frontier ? currentActiveLatencyMs() : null;
     const attemptId = !modeExplore && !frontier && unitRep ? ensureAttemptId(ownerKey) : undefined;
@@ -1101,18 +1108,22 @@ export function DrillView() {
     if (isFreshExplore) {
       practice.updateExplore((d) => {
         d.beats.push(pendingBeat);
-        d.draft = "";
-        d.citations = [];
+        if (!tellMe) {
+          d.draft = "";
+          d.citations = [];
+        }
       });
     } else {
       practice.updateUnitSession(ownerKey, (d) => {
         if (latencyMs !== null) d.activeMs = latencyMs;
         d.beats.push(pendingBeat);
-        d.draft = "";
-        d.citations = [];
+        if (!tellMe) {
+          d.draft = "";
+          d.citations = [];
+        }
       });
     }
-    clearSketch();
+    if (!tellMe) clearSketch();
     requestAnimationFrame(() => {
       autoGrow();
       scrollPadIntoView();
@@ -1146,7 +1157,7 @@ export function DrillView() {
           const idx = list.findIndex((b) => b.pending && b.pendingId === pendingId);
           if (idx >= 0) list.splice(idx, 1);
         });
-        if (!disposed) {
+        if (!disposed && !tellMe) {
           setDraftFor(ownerKey, hasOverride ? prevDraft : text);
           if (qAns) setQuestionReply(qAns);
           if (rawCitations.length > 0) {
@@ -1225,7 +1236,7 @@ export function DrillView() {
           const idx = list.findIndex((b) => b.pending && b.pendingId === pendingId);
           if (idx >= 0) list.splice(idx, 1);
         });
-        if (!disposed) {
+        if (!disposed && !tellMe) {
           setDraftFor(ownerKey, hasOverride ? prevDraft : text);
           if (qAns) setQuestionReply(qAns);
           if (rawCitations.length > 0) {
@@ -2009,16 +2020,7 @@ export function DrillView() {
 
   const tellMeDirectly = () => {
     if (busy()) return;
-    const msg = "Walk me through this directly.";
-    // If the learner is already drafting a follow-up in the main pad, queue this under the question
-    // so it batches cleanly with their follow-up; otherwise send immediately in 1 click.
-    if (draft().trim().length > 0) {
-      setQuestionReply(msg);
-      requestAnimationFrame(autoGrowQuestion);
-      return;
-    }
-    setQuestionReply(msg);
-    void submitBeat();
+    void submitBeat(undefined, { tellMe: true });
   };
 
   const ComposerCitationChips = () => (
