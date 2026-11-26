@@ -255,7 +255,6 @@ export function DrillView() {
   const [bumpOpen, setBumpOpen] = createSignal(false);
   const [editingBeatIdx, setEditingBeatIdx] = createSignal<number | null>(null);
   const [editDraft, setEditDraft] = createSignal("");
-  const [questionReply, setQuestionReply] = createSignal("");
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -373,7 +372,6 @@ export function DrillView() {
   let stageEl!: HTMLDivElement;
   let textarea!: HTMLTextAreaElement;
   let editTextarea!: HTMLTextAreaElement;
-  let questionInputEl: HTMLTextAreaElement | undefined;
   let postInputEl!: HTMLInputElement;
   let citeTextarea!: HTMLTextAreaElement;
   let padEl!: HTMLDivElement;
@@ -388,12 +386,6 @@ export function DrillView() {
     const minH = beats().length > 0 ? 36 : isExploreMode() ? 72 : 120;
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(360, Math.max(minH, textarea.scrollHeight))}px`;
-  };
-
-  const autoGrowQuestion = () => {
-    if (!questionInputEl) return;
-    questionInputEl.style.height = "auto";
-    questionInputEl.style.height = `${Math.min(160, Math.max(24, questionInputEl.scrollHeight))}px`;
   };
 
   const scrollPadIntoView = () => {
@@ -497,7 +489,6 @@ export function DrillView() {
     setPostBusy(false);
     setEditingBeatIdx(null);
     setEditDraft("");
-    setQuestionReply("");
     setCitePill(null);
     setCiteEditor(null);
     setCiteComment("");
@@ -867,8 +858,7 @@ export function DrillView() {
   const canSubmit = () => {
     if (busy()) return false;
     if (!isNonUnit() && passedVerdict()?.ok) return false;
-    const hasQuestionAnswer = Boolean(activeExploreQuestion() && questionReply().trim().length > 0);
-    return draft().trim().length > 0 || hasQuestionAnswer || citations().length > 0 || (sketchOpen() && hasInk());
+    return draft().trim().length > 0 || citations().length > 0 || (sketchOpen() && hasInk());
   };
 
   const triggerComplete = (
@@ -1075,7 +1065,7 @@ export function DrillView() {
           ? prevDraft || "Show me the pivot."
           : prevDraft;
     const activeQ = activeExploreQuestion();
-    const qAns = tellMe ? "Walk me through this directly." : hasOverride ? "" : questionReply().trim();
+    const qAns = tellMe ? "Walk me through this directly." : "";
     const rawCitations = tellMe ? [] : snapshot(citations());
     const pendingCitations: Citation[] =
       activeQ && qAns
@@ -1092,7 +1082,6 @@ export function DrillView() {
     activeAbort = ctrl;
     setCitePill(null);
     setCiteEditor(null);
-    setQuestionReply("");
     setBusy(true);
     setError(null);
 
@@ -1159,7 +1148,6 @@ export function DrillView() {
         });
         if (!disposed && !tellMe) {
           setDraftFor(ownerKey, hasOverride ? prevDraft : text);
-          if (qAns) setQuestionReply(qAns);
           if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
               if (list.length === 0) list.push(...rawCitations);
@@ -1238,7 +1226,6 @@ export function DrillView() {
         });
         if (!disposed && !tellMe) {
           setDraftFor(ownerKey, hasOverride ? prevDraft : text);
-          if (qAns) setQuestionReply(qAns);
           if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
               if (list.length === 0) list.push(...rawCitations);
@@ -2648,79 +2635,26 @@ export function DrillView() {
           }}
         </Show>
 
-        {/* Explicit active question card in Explore mode: quiet header + inline batchable answer strip */}
+        {/* Explicit active question card in Explore mode: quiet header + 1-click Tell me */}
         <Show when={activeExploreQuestion()}>
           {(q) => (
-            <div class={{ "v2-explore-q": true, "has-answer": questionReply().trim().length > 0 }}>
+            <div class="v2-explore-q">
               <div class="v2-explore-q-head">
                 <span class="v2-explore-q-label">Question</span>
                 <div class="v2-explore-q-actions">
-                  <Show
-                    when={questionReply().trim().length > 0}
-                    fallback={
-                      <button
-                        type="button"
-                        class="v2-explore-q-tell"
-                        disabled={busy()}
-                        data-tip={draft().trim() ? "Queue 'Tell me' with your follow-up" : "Walk me through this directly"}
-                        onClick={tellMeDirectly}
-                      >
-                        Tell me
-                      </button>
-                    }
+                  <button
+                    type="button"
+                    class="v2-explore-q-tell"
+                    disabled={busy()}
+                    data-tip="Walk me through this directly"
+                    onClick={tellMeDirectly}
                   >
-                    <span class="v2-explore-q-queued" data-tip="Sent as an annotation with your reply (⌘↵)">
-                      Batched
-                    </span>
-                    <button
-                      type="button"
-                      class="v2-explore-q-clear"
-                      aria-label="Clear answer"
-                      data-tip="Clear answer"
-                      onClick={() => {
-                        setQuestionReply("");
-                        requestAnimationFrame(() => {
-                          autoGrowQuestion();
-                          questionInputEl?.focus();
-                        });
-                      }}
-                    >
-                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
-                        <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
-                      </svg>
-                    </button>
-                  </Show>
+                    Tell me
+                  </button>
                 </div>
               </div>
               <div class="v2-explore-q-body" data-citable="true">
                 <Body text={q()} />
-              </div>
-              <div class="v2-explore-q-bar">
-                <textarea
-                  ref={questionInputEl}
-                  rows={1}
-                  class="v2-explore-q-input"
-                  placeholder="Answer this, or leave blank to skip…"
-                  spellcheck="false"
-                  autocorrect="off"
-                  autocapitalize="off"
-                  value={questionReply()}
-                  disabled={busy()}
-                  onInput={(e) => {
-                    setQuestionReply(e.currentTarget.value);
-                    autoGrowQuestion();
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                      e.preventDefault();
-                      void submitBeat();
-                    } else if (e.key === "Escape" && questionReply().length > 0) {
-                      e.preventDefault();
-                      setQuestionReply("");
-                      requestAnimationFrame(autoGrowQuestion);
-                    }
-                  }}
-                />
               </div>
             </div>
           )}
@@ -2745,7 +2679,7 @@ export function DrillView() {
                 class="v2-pad-input"
                 placeholder={
                   activeExploreQuestion()
-                    ? "Ask a follow-up…"
+                    ? "Answer or ask a follow-up…"
                     : beats().length > 0
                       ? "Continue, or ask…"
                       : isExploreMode()
