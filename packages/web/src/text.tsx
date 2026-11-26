@@ -1,5 +1,6 @@
 // Message text to elements: paragraphs, headings, lists, blockquotes, fenced code, multi-line
 // display math ($$...$$), inline math ($...$), inline code, bold and italic. No raw HTML parsed.
+import { createSignal, onSettled } from "solid-js";
 import type { JSX } from "@solidjs/web";
 import { mathHtml } from "./math.js";
 
@@ -111,17 +112,51 @@ export function inline(text: string): JSX.Element[] {
   return out;
 }
 
+function CodeBlock(props: { text: string }) {
+  let preEl: HTMLPreElement | undefined;
+  const [overflowLeft, setOverflowLeft] = createSignal(false);
+  const [overflowRight, setOverflowRight] = createSignal(false);
+
+  const syncOverflow = () => {
+    if (!preEl) return;
+    const maxScroll = preEl.scrollWidth - preEl.clientWidth;
+    if (maxScroll <= 2) {
+      setOverflowLeft(false);
+      setOverflowRight(false);
+      return;
+    }
+    setOverflowLeft(preEl.scrollLeft > 2);
+    setOverflowRight(preEl.scrollLeft < maxScroll - 2);
+  };
+
+  onSettled(() => {
+    syncOverflow();
+    if (!preEl || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(syncOverflow);
+    ro.observe(preEl);
+    return () => ro.disconnect();
+  });
+
+  return (
+    <div
+      class="myl-code"
+      data-overflow-left={overflowLeft() ? "true" : undefined}
+      data-overflow-right={overflowRight() ? "true" : undefined}
+    >
+      <pre ref={preEl} onScroll={syncOverflow}>
+        {props.text}
+      </pre>
+    </div>
+  );
+}
+
 export function Body(props: { text: string }) {
   return (
     <>
       {blocks(props.text).map((b) => {
         switch (b.kind) {
           case "code":
-            return (
-              <div class="myl-code">
-                <pre>{b.text}</pre>
-              </div>
-            );
+            return <CodeBlock text={b.text} />;
           case "math":
             return <div class="myl-math app-math-display" data-tex={b.tex} innerHTML={mathHtml(b.tex, true)} />;
           case "h":
