@@ -318,6 +318,38 @@ body,
   justify-content: space-between;
   gap: 8px;
 }
+/* Single-entry Practice queue trigger: sits flush on the section title rail without exposing card previews. */
+.v2-sb-practice-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  width: 100%;
+  height: var(--v2-sb-row-h);
+  padding: 0 8px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+.v2-sb-practice-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--v2-fg) 5%, transparent);
+}
+.v2-sb-practice-btn.is-active {
+  background: color-mix(in srgb, var(--v2-fg) 6.5%, transparent);
+}
+.v2-sb-practice-btn.is-active .v2-sidebar-count {
+  color: var(--v2-ink-2);
+}
+.v2-sb-practice-btn:disabled {
+  cursor: default;
+}
+.v2-sb-practice-btn:disabled .v2-sidebar-title {
+  color: var(--v2-ink-2);
+}
 .v2-sb-head-add {
   appearance: none;
   border: 0;
@@ -602,8 +634,7 @@ body,
   }
 }
 
-.v2-sb-practice-chev:focus,
-.v2-sb-practice-main:focus,
+.v2-sb-practice-btn:focus,
 .v2-sb-head-add:focus,
 .v2-sb-item:focus,
 .v2-sb-fold:focus,
@@ -611,8 +642,7 @@ body,
 .v2-sb-act:focus {
   outline: none;
 }
-.v2-sb-practice-chev:focus-visible,
-.v2-sb-practice-main:focus-visible,
+.v2-sb-practice-btn:focus-visible,
 .v2-sb-head-add:focus-visible,
 .v2-sb-item:focus-visible,
 .v2-sb-fold:focus-visible,

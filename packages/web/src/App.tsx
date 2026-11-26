@@ -4,7 +4,7 @@ import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, Sw
 import { watchActivity } from "./activity.js";
 import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
-import { createPracticeStore, PracticeContext, sessionKeyForStage, type Stage } from "./practiceStore.js";
+import { createPracticeStore, PracticeContext, sessionHasWork, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
 import { formatSidebarDrillLabel, plainSidebarText, sidebarLayout } from "./sidebar.js";
 import { installSidebarRoll, trackSidebarOverflow } from "./sidebarRoll.js";
@@ -441,6 +441,43 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
       briefings: practice.state.frontiers.length,
     });
 
+  const isPracticeActive = () => {
+    const s = practice.state.stage;
+    if (s.kind === "sitting-done") return true;
+    if (s.kind !== "unit") return false;
+    return practice.dueQueue().some((u) => u.unit_id === s.unitId);
+  };
+
+  const practiceDueTotal = () =>
+    practice.remainingCount() > 0 ? practice.remainingCount() : practice.backlogDueCount();
+
+  const canOpenPractice = () =>
+    practice.dueQueue().length > 0 || practice.backlogDueCount() > 0;
+
+  const openPractice = () => {
+    const due = practice.dueQueue();
+    if (due.length > 0) {
+      const curId = stageUnitId();
+      if (curId && due.some((u) => u.unit_id === curId)) {
+        closeSidebarOnNarrow();
+        return;
+      }
+      // Resume an in-progress due card first; otherwise take the scheduler's next due card.
+      const inProgress = due.find((u) => {
+        const sess = practice.state.sessions[u.unit_id];
+        return Boolean(sess && sessionHasWork(sess) && !sess.passedVerdict?.ok);
+      });
+      const next = inProgress ?? due.find((u) => u.unit_id !== practice.state.justCompletedId) ?? due[0]!;
+      practice.selectUnit(next.unit_id);
+      closeSidebarOnNarrow();
+      return;
+    }
+    if (practice.backlogDueCount() > 0) {
+      practice.startNextSitting();
+      closeSidebarOnNarrow();
+    }
+  };
+
   // A quiet sub-fold that closes its parent section: Done under Practice, Archived under Explorations.
   const subFold = (title: string, listId: string, count: () => number, open: () => boolean, toggle: () => void) => (
     <button
@@ -469,31 +506,33 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
             <Show when={layout().practice}>
               <section class="v2-sb-section">
                 <div class="v2-sb-block">
-                  <div class="v2-sb-section-head">
-                    <span class="v2-sidebar-title">Practice</span>
-                    <Show when={practice.remainingCount() > 0}>
-                      <span class="v2-sidebar-count">{practice.remainingCount()}</span>
-                    </Show>
-                  </div>
-                  <Show
-                    when={practice.dueQueue().length > 0}
-                    fallback={
-                      <Show when={practice.backlogDueCount() > 0}>
-                        <button
-                          type="button"
-                          class="v2-sb-item"
-                          onClick={() => {
-                            practice.startNextSitting();
-                            closeSidebarOnNarrow();
-                          }}
-                        >
-                          <RollingSidebarText text={`Start next sitting (${Math.min(8, practice.backlogDueCount())})`} />
-                        </button>
-                      </Show>
+                  <button
+                    type="button"
+                    class={{
+                      "v2-sb-practice-btn": true,
+                      "is-active": isPracticeActive(),
+                    }}
+                    disabled={!canOpenPractice()}
+                    aria-current={isPracticeActive() ? "true" : undefined}
+                    data-tip={
+                      practice.dueQueue().length === 0 && practice.backlogDueCount() > 0
+                        ? `Start next sitting (${Math.min(8, practice.backlogDueCount())})`
+                        : undefined
                     }
+                    onClick={openPractice}
                   >
-                    <For each={practice.dueQueue()}>{(u) => drillRow(u)}</For>
-                  </Show>
+                    <span class="v2-sidebar-title">Practice</span>
+                    <Show
+                      when={practiceDueTotal() > 0}
+                      fallback={
+                        <Show when={practice.soonestNextMs()}>
+                          {(ms) => <span class="v2-sidebar-count">in {fmtWait(ms())}</span>}
+                        </Show>
+                      }
+                    >
+                      <span class="v2-sidebar-count">{practiceDueTotal()}</span>
+                    </Show>
+                  </button>
                   <Show when={layout().done}>
                     {subFold(
                       "Done",
