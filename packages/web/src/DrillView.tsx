@@ -2313,7 +2313,7 @@ export function DrillView() {
                               when={annoSummary().matchedCount > 0}
                               fallback={
                                 <pre
-                                  class="v2-beat-code"
+                                  class={{ "v2-beat-code": true, "is-prose": isNonUnit() }}
                                   onDblClick={() => {
                                     if (canEdit()) startEditingBeat(idx());
                                   }}
@@ -2488,7 +2488,7 @@ export function DrillView() {
                       <div class="v2-beat-user" data-citable="true">
                         <BeatCitations items={beat.citations} />
                         <Show when={beat.user}>
-                          <pre class="v2-beat-code">{mathOnly(beat.user)}</pre>
+                          <pre class="v2-beat-code is-prose">{mathOnly(beat.user)}</pre>
                         </Show>
                       </div>
                       <div

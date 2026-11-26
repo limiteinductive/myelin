@@ -144,6 +144,10 @@ body,
   background: var(--v2-bg);
   color: var(--v2-fg);
   font-family: var(--v2-font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
 }
 
 /* Subtle tactile grain for crafted inner surfaces */
@@ -879,17 +883,17 @@ body,
 }
 
 .v2-added-list {
-  margin-top: 2px;
-  padding-top: 10px;
+  margin-top: 4px;
+  padding-top: 12px;
   border-top: 1px solid var(--v2-border);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 .v2-added-row {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   transition: opacity 160ms ease;
 }
 .v2-added-row.is-removed {
@@ -910,8 +914,8 @@ body,
   opacity: 0.8;
 }
 .v2-added-text {
-  font-size: 13px;
-  line-height: 1.5;
+  font-size: 13.5px;
+  line-height: 1.62;
   color: color-mix(in srgb, var(--v2-fg) 84%, var(--v2-muted));
 }
 .v2-added-undo {
@@ -1027,7 +1031,7 @@ body,
 }
 .v2-pad.is-explore .v2-pad-input {
   min-height: 72px;
-  font: 400 14.5px/1.55 var(--v2-font-sans);
+  font: 400 15px/1.6 var(--v2-font-sans);
 }
 .v2-pad.is-compact .v2-pad-input {
   min-height: 36px;
@@ -1343,8 +1347,14 @@ body,
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
-  font: 400 14px/1.65 var(--v2-font-mono);
+  font: 400 14px/1.7 var(--v2-font-mono);
+  font-variant-ligatures: none;
   color: color-mix(in srgb, var(--v2-fg) 86%, var(--v2-muted));
+}
+.v2-beat-code.is-prose {
+  font: 400 15px/1.68 var(--v2-font-sans);
+  letter-spacing: -0.005em;
+  color: color-mix(in srgb, var(--v2-fg) 90%, var(--v2-muted));
 }
 .v2-beat-code .myl-math {
   white-space: normal;
@@ -1358,14 +1368,14 @@ body,
   object-fit: contain;
 }
 .v2-beat-coach {
-  padding: 15px 16px;
+  padding: 16px 18px;
   border-radius: var(--v2-radius);
   background: var(--v2-surface);
   border: 0.5px solid var(--v2-hairline-soft);
   box-shadow: var(--v2-edge-light);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 .v2-beat-coach.is-pass {
   background: var(--v2-success-soft);
@@ -1955,7 +1965,7 @@ body,
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 11px 10px 0 16px;
+  padding: 12px 12px 0 18px;
   min-height: 24px;
 }
 .v2-explore-q-label {
@@ -1970,13 +1980,17 @@ body,
   gap: 4px;
 }
 .v2-explore-q-body {
-  padding: 4px 16px 15px;
-  font: 500 14.5px/22px var(--v2-font-sans);
-  letter-spacing: -0.006em;
+  padding: 6px 18px 16px;
+  font: 400 15px/1.68 var(--v2-font-sans);
+  letter-spacing: -0.005em;
+  text-wrap: pretty;
   color: var(--v2-fg);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
+}
+.v2-explore-q-body .katex {
+  font-size: 1.07em;
 }
 .v2-explore-q-body p {
   margin: 0;
@@ -2019,7 +2033,7 @@ body,
 }
 .v2-beat-cite-comment {
   color: color-mix(in srgb, var(--v2-fg) 92%, var(--v2-muted));
-  font: 400 14px/1.6 var(--v2-font-sans);
+  font: 400 15px/1.65 var(--v2-font-sans);
   padding-left: 0;
 }
 .v2-post-follow:focus-within,
@@ -2401,11 +2415,11 @@ body,
 }
 .v2-verdict-body {
   margin: 0;
-  font-size: 14px;
-  line-height: 1.68;
-  letter-spacing: -0.004em;
+  font-size: 15px;
+  line-height: 1.72;
+  letter-spacing: -0.005em;
   text-wrap: pretty;
-  color: color-mix(in srgb, var(--v2-fg) 90%, var(--v2-muted));
+  color: color-mix(in srgb, var(--v2-fg) 91%, var(--v2-muted));
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -2414,7 +2428,7 @@ body,
   margin: 0;
 }
 .v2-verdict-body .katex {
-  font-size: 1.09em;
+  font-size: 1.07em;
   color: var(--v2-fg);
 }
 .v2-verdict-body .katex .mfrac {
@@ -2477,13 +2491,14 @@ body,
   opacity: 1;
 }
 .app-code {
-  font-size: 0.86em;
+  font-family: var(--v2-font-mono);
+  font-size: 0.87em;
   line-height: 1;
-  padding: 0.14em 0.4em 0.16em;
-  border-radius: 5px;
-  background: color-mix(in srgb, var(--v2-fg) 7%, transparent);
-  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--v2-fg) 9%, transparent);
-  color: color-mix(in srgb, var(--v2-fg) 94%, var(--v2-muted));
+  padding: 0.08em 0.34em 0.1em;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--v2-fg) 5%, transparent);
+  box-shadow: none;
+  color: color-mix(in srgb, var(--v2-fg) 95%, var(--v2-muted));
   font-variant-ligatures: none;
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
