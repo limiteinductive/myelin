@@ -381,6 +381,7 @@ export function checkDrill(
     depth: Depth;
     prompt: string;
     attempt: string;
+    show_pivot?: boolean;
     sketch_data_url?: string | null;
     history?: { attempt: string; feedback: string }[];
     latency_ms: number | null;
@@ -426,6 +427,7 @@ export function askDrillFollowUp(
     turns: { role: "user" | "assistant"; text: string }[];
     question: string;
     revised_attempt?: boolean;
+    show_pivot?: boolean;
     sketch_data_url?: string | null;
     latency_ms: number | null;
     hints_used: number;

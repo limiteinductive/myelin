@@ -272,10 +272,11 @@ export function DrillView() {
 
   // Active stage accessors backed directly by PracticeStore (fine-grained, single source of truth).
   const isExplore = () => practice.state.stage.kind === "explore";
+  const isSittingDone = () => practice.state.stage.kind === "sitting-done";
   const activeExploration = () => practice.currentExploration();
   const isExploreMode = () => isExplore() || Boolean(activeExploration());
   const activeFrontier = () => practice.currentFrontier();
-  const isNonUnit = () => isExplore() || Boolean(activeExploration()) || Boolean(activeFrontier());
+  const isNonUnit = () => isExplore() || isSittingDone() || Boolean(activeExploration()) || Boolean(activeFrontier());
   const activeUnitId = () => (practice.state.stage.kind === "unit" ? practice.state.stage.unitId : null);
   const sessionKey = () => practice.stageKey();
   const unitSession = () => (isExplore() ? undefined : practice.state.sessions[sessionKey()]);
@@ -917,6 +918,7 @@ export function DrillView() {
     payloadText: string;
     sketch: string | null;
     testMe?: boolean;
+    showPivot?: boolean;
     signal: AbortSignal;
     onDelta?: (partialText: string) => void;
   }): Promise<
@@ -1007,9 +1009,10 @@ export function DrillView() {
           depth: r.depth,
           prompt: r.prompt,
           attempt: opts.payloadText,
+          ...(opts.showPivot ? { show_pivot: true } : {}),
           sketch_data_url: opts.sketch,
           latency_ms: opts.latencyMs,
-          hints_used: 0,
+          hints_used: opts.showPivot ? 1 : 0,
         },
         opts.signal,
         opts.onDelta,
@@ -1034,6 +1037,7 @@ export function DrillView() {
         feedback: first.coach,
         turns: middleTurns,
         question: opts.payloadText,
+        ...(opts.showPivot ? { show_pivot: true } : {}),
         sketch_data_url: opts.sketch,
         latency_ms: opts.latencyMs,
         hints_used: cleanPrior.length,
@@ -1044,10 +1048,11 @@ export function DrillView() {
     return { kind: "drill", res };
   };
 
-  const submitBeat = async (overrideText?: string) => {
+  const submitBeat = async (overrideText?: string, opts?: { showPivot?: boolean }) => {
+    const showPivot = Boolean(opts?.showPivot);
     const hasOverride = typeof overrideText === "string" && overrideText.trim().length > 0;
-    if (!hasOverride && !canSubmit()) return;
-    if (hasOverride && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
+    if (!hasOverride && !showPivot && !canSubmit()) return;
+    if ((hasOverride || showPivot) && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
     const ownerKey = sessionKey();
     const isFreshExplore = isExplore();
     const savedExp = activeExploration();
@@ -1055,7 +1060,7 @@ export function DrillView() {
     const frontier = activeFrontier();
     const unitRep = rep();
     const prevDraft = draft().trim();
-    const text = hasOverride ? overrideText.trim() : prevDraft;
+    const text = hasOverride ? overrideText.trim() : showPivot ? prevDraft || "Show me the pivot." : prevDraft;
     const activeQ = activeExploreQuestion();
     const qAns = hasOverride ? "" : questionReply().trim();
     const rawCitations = snapshot(citations());
@@ -1126,6 +1131,7 @@ export function DrillView() {
         priorBeats,
         payloadText,
         sketch,
+        showPivot,
         signal: ctrl.signal,
         onDelta,
       });
@@ -2131,6 +2137,47 @@ export function DrillView() {
       </div>
 
       <Show when={!loading()} fallback={<div class="v2-loading-dots"><span /><span /><span /></div>}>
+        <Show
+          when={!isSittingDone()}
+          fallback={
+            <div class="v2-sitting-done">
+              <div class="v2-sitting-done-badge">
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                </svg>
+                <span>Sitting complete</span>
+              </div>
+              <h1 class="v2-prompt">
+                {practice.sittingDoneCount() === 1
+                  ? "1 card cleared."
+                  : `${practice.sittingDoneCount()} cards cleared.`}
+              </h1>
+              <p class="v2-sitting-done-sub">
+                {practice.backlogDueCount() > 0
+                  ? `${practice.backlogDueCount()} more due card${practice.backlogDueCount() === 1 ? "" : "s"} waiting whenever you want another sitting.`
+                  : "Everything due right now is scheduled for later. Great stopping point."}
+              </p>
+              <div class="v2-sitting-done-actions">
+                <Show when={practice.backlogDueCount() > 0}>
+                  <button
+                    type="button"
+                    class="v2-btn-primary"
+                    onClick={() => practice.startNextSitting()}
+                  >
+                    Start next sitting ({Math.min(8, practice.backlogDueCount())})
+                  </button>
+                </Show>
+                <button
+                  type="button"
+                  class="v2-btn-secondary"
+                  onClick={() => practice.selectExplore()}
+                >
+                  Explore something new
+                </button>
+              </div>
+            </div>
+          }
+        >
         <div class="v2-prompt-wrap">
           <Switch fallback={<h1 class="v2-prompt v2-prompt--open">What do you want to work through?</h1>}>
             <Match when={activeExploration()}>
@@ -2869,6 +2916,16 @@ export function DrillView() {
               </div>
 
               <div class="v2-pad-actions">
+                <Show when={!isNonUnit() && !busy()}>
+                  <button
+                    type="button"
+                    class="v2-btn-secondary"
+                    data-tip="Reveal the key move directly and wrap this rep"
+                    onClick={() => void submitBeat(undefined, { showPivot: true })}
+                  >
+                    Show pivot
+                  </button>
+                </Show>
                 <Show when={draft().trim().length >= 12}>
                   <button
                     type="button"
@@ -2926,6 +2983,7 @@ export function DrillView() {
 
         <Show when={error() || practice.state.error}>
           {(msg) => <p class="v2-error-line">{msg()}</p>}
+        </Show>
         </Show>
       </Show>
 

@@ -13,7 +13,7 @@ import { FrontierStore, type Frontier } from "./frontiers.js";
 import { FastJudge } from "./judge.js";
 import { formatServerTiming, PerfLog, type PerfOp, type PerfRecord } from "./perf.js";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
-import { pickDrillDepth, RwkvInstantEngine, unitExposureStats, type RwkvUnitScore } from "./rwkv.js";
+import { computeCalibratedIntervals, pickDrillDepth, RwkvInstantEngine, unitExposureStats, type RwkvUnitScore } from "./rwkv.js";
 import type { Sandbox } from "./sandbox.js";
 import {
   ConflictError,
@@ -516,13 +516,27 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
   // --- Fast Micro-Production Drill (RWKV-Instant + Jev System 1 -> System 2 cascade) & Map ---
 
   function scoreAll(state: State, scheduler: { name: string; recall(m: Unit["memory"], at: number): number }, now: number): { scheduler: string; scores: Map<string, RwkvUnitScore> } {
-    if (rwkv) return { scheduler: rwkv.name, scores: rwkv.scoreUnits(state, now) };
+    const calibrated = computeCalibratedIntervals(state, now);
+    if (rwkv) {
+      const rwkvScores = rwkv.scoreUnits(state, now);
+      for (const [id, s] of rwkvScores) {
+        const cal = calibrated.get(id);
+        if (cal) {
+          // Keep RWKV's fine-grained p_imm for within-due priority ordering, while using
+          // calibrated FSRS-6 (R=0.85, Build-gear-aware, >=4h floor) for due/next_in_ms spacing.
+          s.next_in_ms = cal.next_in_ms;
+          s.reviews = cal.reviews;
+        }
+      }
+      return { scheduler: `${rwkv.name}+fsrs85`, scores: rwkvScores };
+    }
     const scores = new Map<string, RwkvUnitScore>();
     for (const u of Object.values(state.units)) {
       if (u.status === "split" || u.status === "merged" || u.observe_only) continue;
-      const p = u.memory_reviews > 0 ? scheduler.recall(u.memory, now) : 0;
-      const due = typeof u.memory.due === "number" ? Math.max(0, u.memory.due - now) : null;
-      scores.set(u.id, { unit_id: u.id, p_imm: p, p_rating: [1 - p, 0, p, 0], next_in_ms: due, reviews: u.memory_reviews });
+      const cal = calibrated.get(u.id);
+      const p = cal && cal.reviews > 0 ? cal.fsrs_recall : u.memory_reviews > 0 ? scheduler.recall(u.memory, now) : 0;
+      const due = cal ? cal.next_in_ms : typeof u.memory.due === "number" ? Math.max(0, u.memory.due - now) : null;
+      scores.set(u.id, { unit_id: u.id, p_imm: p, p_rating: [1 - p, 0, p, 0], next_in_ms: due, reviews: cal?.reviews ?? u.memory_reviews });
     }
     return { scheduler: scheduler.name, scores };
   }
@@ -1538,6 +1552,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       latency_ms?: number | null;
       hints_used?: number;
       hint_only?: boolean;
+      show_pivot?: boolean;
       rung?: number;
     } | null;
 
@@ -1547,7 +1562,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     if (!u) return c.json({ error: "unknown unit" }, 404);
     const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
     const depth: Depth = body.depth && ["recall", "rebuild", "explain", "use"].includes(body.depth) ? body.depth : pickDrillDepth(u, state);
-    const prompt = body.prompt?.trim() || (await judge.promptFor(u, restsOn, depth));
+    const preStats = unitExposureStats(state, u.id, depth, Date.now());
+    const cachedPromptEntry = judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses);
+    const prompt = body.prompt?.trim() || cachedPromptEntry?.prompt || (await judge.promptFor(u, restsOn, depth));
+    const expectedCrux = cachedPromptEntry?.crux;
+    const firstContact = u.told && preStats.passes === 0;
+    const showPivot = Boolean(body.show_pivot);
 
     if (body.hint_only) {
       const t0 = Date.now();
@@ -1572,7 +1592,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
     const attempt = (body.attempt ?? "").trim();
     const sketch = typeof body.sketch_data_url === "string" && body.sketch_data_url.startsWith("data:image/") ? body.sketch_data_url : null;
-    if (!attempt && !sketch) return c.json({ error: "write an attempt or sketch first" }, 400);
+    if (!attempt && !sketch && !showPivot) return c.json({ error: "write an attempt or sketch first" }, 400);
 
     const attemptId = typeof body.attempt_id === "string" && body.attempt_id.trim() ? body.attempt_id.trim() : uuidv7();
     const existingAttempt = store.getAttempt(attemptId);
@@ -1603,6 +1623,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         {
           sessionKey: `drill:${attemptId}`,
           prompt,
+          expectedCrux,
+          firstContact,
+          showPivot,
           unitText: u.text,
           unitKind: u.kind,
           depth,
@@ -1614,7 +1637,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           activeHabits: habits.map((h) => h.text),
           learnerMemory: learnerMemoryOf(store),
           latencyMs,
-          hintsUsed,
+          hintsUsed: showPivot ? Math.max(1, hintsUsed) : hintsUsed,
         },
         onText,
         onPerf,
@@ -1640,7 +1663,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             answer_message_id: null,
             grade: verdict.grade,
             corrected_grade: null,
-            hints: hintsUsed,
+            hints: showPivot ? Math.max(1, hintsUsed) : hintsUsed,
             latency_ms: latencyMs,
             scheduler,
             predicted_recall: preScore ? preScore.p_imm : null,
@@ -1748,17 +1771,22 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       turns?: { role: "user" | "assistant"; text: string }[];
       question?: string;
       revised_attempt?: boolean;
+      show_pivot?: boolean;
       sketch_data_url?: string | null;
       latency_ms?: number | null;
       hints_used?: number;
     } | null;
     const sketch = typeof body?.sketch_data_url === "string" && body.sketch_data_url.startsWith("data:image/") ? body.sketch_data_url : null;
-    if (!body?.unit_id || (!body.question?.trim() && !sketch)) return c.json({ error: "unit_id and reply or sketch required" }, 400);
+    const showPivot = Boolean(body?.show_pivot);
+    if (!body?.unit_id || (!body.question?.trim() && !sketch && !showPivot)) return c.json({ error: "unit_id and reply or sketch required" }, 400);
     const state = store.state;
     const u = resolveUnit(state, body.unit_id);
     if (!u) return c.json({ error: "unknown unit" }, 404);
     const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
     const depth: Depth = body.depth && ["recall", "rebuild", "explain", "use"].includes(body.depth) ? body.depth : pickDrillDepth(u, state);
+    const preStats = unitExposureStats(state, u.id, depth, Date.now());
+    const expectedCrux = judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses)?.crux;
+    const firstContact = u.told && preStats.passes === 0;
     const turns = Array.isArray(body.turns)
       ? body.turns.filter((t): t is { role: "user" | "assistant"; text: string } => (t?.role === "user" || t?.role === "assistant") && typeof t?.text === "string").slice(-20)
       : [];
@@ -1787,6 +1815,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         {
           sessionKey: `drill:${attemptId}`,
           prompt: body.prompt ?? "",
+          expectedCrux,
+          firstContact,
+          showPivot,
           unitText: u.text,
           unitKind: u.kind,
           depth,

@@ -555,4 +555,139 @@ for await (const line of rl) {
     expect(prompt).toBe("A calibrated prompt?");
     expect(bodies[1]).toContain("Strong PyTorch intuition");
   });
+
+  it("caches expected_crux from promptEntryFor, accepts casual '?' answers, and enforces showPivot & 2-turn cap", async () => {
+    const calls: { url: string; body: string }[] = [];
+    const mockFetch: typeof fetch = async (url, init) => {
+      const u = String(url);
+      const b = String(init?.body ?? "");
+      calls.push({ url: u, body: b });
+      if (u.includes("/decisions")) {
+        return new Response(
+          JSON.stringify({
+            model: "typesafe/jev-1.14",
+            answers: {
+              demonstrated: { type: "noul", noul: 0.92 },
+              cot_gap: { type: "noul", noul: 0.1 },
+              clarity: { type: "score", score: 0.8 },
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (b.includes("expected_crux") && b.includes("Return ONLY valid JSON")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    prompt: "What is Var(X_bar) for n i.i.d. draws of variance sigma^2?",
+                    expected_crux: "State sigma^2 / n (variances add linearly while 1/n scales variance by 1/n^2).",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  ok: false,
+                  grade: "again",
+                  message: "The pivot is Var(cX) = c^2 Var(X), so Var((1/n) sum X_i) = (1/n^2)(n sigma^2) = sigma^2/n.",
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const unit = { id: "u_var", text: "Variance of sample mean of n i.i.d. draws is sigma^2 / n", kind: "move" };
+
+    // 1. promptEntryFor parses & caches { prompt, crux }
+    const entry = await judge.promptEntryFor(unit, [], "recall", { variant: 0 });
+    expect(entry.prompt).toContain("Var(X_bar)");
+    expect(entry.crux).toContain("sigma^2 / n");
+    expect(judge.peekPromptEntry(unit, "recall", [], 0)?.crux).toContain("sigma^2 / n");
+
+    // 2. Substantive answer with trailing "?" is NOT blocked as a non-attempt (hits System 1 Jev cleanly)
+    calls.length = 0;
+    const tentative = await judge.check({
+      prompt: entry.prompt,
+      expectedCrux: entry.crux,
+      unitText: unit.text,
+      unitKind: unit.kind,
+      depth: "recall",
+      restsOn: [],
+      attempt: "sigma**2 / n?",
+      latencyMs: 8000,
+      hintsUsed: 0,
+    });
+    expect(calls[0]?.url).toContain("/decisions");
+    expect(tentative.ok).toBe(true);
+
+    // 3. showPivot closes immediately with ok=true, grading "hard" on firstContact and "again" on review
+    const pivotFirst = await judge.check({
+      prompt: entry.prompt,
+      expectedCrux: entry.crux,
+      firstContact: true,
+      showPivot: true,
+      unitText: unit.text,
+      unitKind: unit.kind,
+      depth: "recall",
+      restsOn: [],
+      attempt: "",
+      latencyMs: 10000,
+      hintsUsed: 0,
+    });
+    expect(pivotFirst.ok).toBe(true);
+    expect(pivotFirst.grade).toBe("hard");
+
+    const pivotReview = await judge.check({
+      prompt: entry.prompt,
+      expectedCrux: entry.crux,
+      firstContact: false,
+      showPivot: true,
+      unitText: unit.text,
+      unitKind: unit.kind,
+      depth: "recall",
+      restsOn: [],
+      attempt: "",
+      latencyMs: 10000,
+      hintsUsed: 0,
+    });
+    expect(pivotReview.ok).toBe(true);
+    expect(pivotReview.grade).toBe("again");
+
+    // 4. Hard 2-turn ceiling in continueRep forces ok=true even if model emits ok=false
+    const capped = await judge.continueRep({
+      prompt: entry.prompt,
+      expectedCrux: entry.crux,
+      firstContact: false,
+      unitText: unit.text,
+      unitKind: unit.kind,
+      depth: "recall",
+      restsOn: [],
+      attempt: "sigma^2 / n^2",
+      feedback: "Close — how many terms are in the sum?",
+      turns: [
+        { role: "user", text: "n terms, so sigma^2?" },
+        { role: "assistant", text: "And what happens to the 1/n factor outside Var?" },
+      ],
+      reply: "not sure",
+      latencyMs: 25000,
+      hintsUsed: 0,
+    });
+    expect(capped.ok).toBe(true);
+    expect(calls[calls.length - 1]?.body).toContain("DIRECT_PIVOT");
+  });
 });

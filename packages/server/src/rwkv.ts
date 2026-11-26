@@ -6,7 +6,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Depth, Grade, State, Unit } from "@myelin/core";
+import { fsrsScheduler, type Depth, type Grade, type State, type Unit } from "@myelin/core";
 
 export interface RwkvStreamSpec {
   name: "card_id" | "deck_id" | "note_id" | "preset_id" | "user_id";
@@ -700,12 +700,19 @@ export class RwkvInstantEngine {
       const noteKey = noteKeyOf(u, ev.unit_id);
       const deckKey = deckKeyOf(u);
 
+      // Rescale generative writing durations (50-300s) into Anki-equivalent recognition durations
+      // (~2-18s) so long derivations never poison RWKV's global user/deck hidden states.
+      const scaledDurationMs =
+        ev.latency_ms !== null && ev.latency_ms !== undefined
+          ? Math.min(18_000, Math.max(2_000, Math.round(ev.latency_ms / 5)))
+          : 8000;
+
       const features = buildFeatures({
         elapsedDays,
         cumDays,
         elapsedSeconds,
         cumSeconds,
-        durationMs: ev.latency_ms ?? 8000,
+        durationMs: scaledDurationMs,
         rating: GRADE_RATING[ev.grade!],
         dayOffsetDiff,
         dayOffset,
@@ -872,15 +879,68 @@ export function unitExposureStats(state: State, unitId: string, depth?: Depth, n
   };
 }
 
+const MIN_LAPSE_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4h: next sitting, never a 10m boomerang
+
+/**
+ * Computes calibrated FSRS-6 (requestRetention = 0.85, optimal desirable difficulty for active
+ * generative recall) spacing intervals across ALL probe depths (recall/rebuild/explain/use).
+ *
+ * Key decoupling from Anki lapse traps:
+ * - Assisted Build-gear completions (`again` with hints > 0) and first-contact `told` acquisitions
+ *   are initial encoding, not memory lapses -> fed as `hard` (~12-24h consolidation).
+ * - Pure unassisted lapses (`again`, hints === 0) get at least a 4-hour next-sitting floor so
+ *   completed cards never boomerang back into the middle of the same sitting.
+ */
+export function computeCalibratedIntervals(
+  state: State,
+  now: number,
+): Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }> {
+  const sched = fsrsScheduler({ requestRetention: 0.85 });
+  const out = new Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }>();
+
+  for (const u of Object.values(state.units)) {
+    if (u.status === "split" || u.status === "merged" || u.observe_only) continue;
+    const probes = u.evidence
+      .map((id) => state.evidence[id])
+      .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null))
+      .sort((a, b) => a.at - b.at || a.seq - b.seq);
+
+    if (probes.length === 0) {
+      out.set(u.id, { next_in_ms: 0, fsrs_recall: 0, reviews: 0 });
+      continue;
+    }
+
+    let mem = sched.init();
+    let lastAt = 0;
+    for (let i = 0; i < probes.length; i++) {
+      const ev = probes[i]!;
+      const isAssistedOrFirstContact = ev.grade === "again" && (ev.hints > 0 || (i === 0 && u.told));
+      const effectiveGrade: Grade = isAssistedOrFirstContact ? "hard" : ev.grade!;
+      mem = sched.update(mem, { grade: effectiveGrade, at: ev.at });
+      lastAt = ev.at;
+    }
+
+    const rawDue = typeof mem.due === "number" ? mem.due : lastAt + MIN_LAPSE_INTERVAL_MS;
+    const effectiveDue = Math.max(rawDue, lastAt + MIN_LAPSE_INTERVAL_MS);
+    const nextInMs = Math.max(0, effectiveDue - now);
+    const fsrsRecall = sched.recall(mem, now);
+    out.set(u.id, { next_in_ms: nextInMs, fsrs_recall: fsrsRecall, reviews: probes.length });
+  }
+
+  return out;
+}
+
 /**
  * Picks the best active depth for a micro-production drill rep on unit `u`.
  * Promotes depth strictly on demonstrated (non-"again") performance—never on repeated misses—
+ * caps pure `definition` units at `explain` (no artificial transfer essays on vocabulary),
  * and includes `explain` before promoting to transfer `use`.
  */
 export function pickDrillDepth(u: Unit, state?: State): Depth {
+  const isDefinition = u.kind.trim().toLowerCase() === "definition";
   if (!state) {
     if (u.rests_on.length > 0 && !u.rebuilt_once) return "rebuild";
-    if (u.memory_reviews >= 2) return "use";
+    if (u.memory_reviews >= 2) return isDefinition ? "explain" : "use";
     if (u.rests_on.length > 0) return "rebuild";
     return u.memory_reviews === 1 ? "explain" : "recall";
   }
@@ -893,6 +953,7 @@ export function pickDrillDepth(u: Unit, state?: State): Depth {
 
   if (u.rests_on.length > 0 && !u.rebuilt_once) return "rebuild";
   if (passes === 0) return u.rests_on.length > 0 ? "rebuild" : "recall";
+  if (isDefinition) return "explain";
   if (passes === 1) return explainedOnce ? "use" : "explain";
   return "use";
 }

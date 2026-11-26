@@ -399,7 +399,8 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   // ----- Sidebar view state (session-only; the record lives in the practice store) -----
   const stageUnitId = () => (practice.state.stage.kind === "unit" ? practice.state.stage.unitId : null);
   const isUnitActive = (id: string) => !practice.state.mapOpen && stageUnitId() === id;
-  const isPracticeActive = () => !practice.state.mapOpen && practice.state.stage.kind === "unit";
+  const isPracticeActive = () =>
+    !practice.state.mapOpen && (practice.state.stage.kind === "unit" || practice.state.stage.kind === "sitting-done");
 
   const [explorationsExpanded, setExplorationsExpanded] = createSignal(false);
   const visibleExplorations = createMemo(() => {
@@ -435,9 +436,15 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
       closeSidebarOnNarrow();
       return;
     }
-    const target = practice.dueQueue()[0] ?? practice.state.queue[0];
+    const target = practice.dueQueue()[0];
     if (target) {
       practice.selectUnit(target.unit_id);
+      closeSidebarOnNarrow();
+    } else if (practice.backlogDueCount() > 0) {
+      practice.startNextSitting();
+      closeSidebarOnNarrow();
+    } else if (practice.state.queue[0]) {
+      practice.selectUnit(practice.state.queue[0].unit_id);
       closeSidebarOnNarrow();
     } else {
       setQueueOpen((v) => !v);

@@ -2284,6 +2284,35 @@ body,
   opacity: 1;
 }
 
+.v2-sitting-done {
+  padding: 28px 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  animation: v2-in 180ms ease;
+}
+.v2-sitting-done-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: 500 12px/1 var(--v2-font-sans);
+  color: var(--v2-ok);
+  letter-spacing: 0.01em;
+}
+.v2-sitting-done-sub {
+  margin: 0;
+  color: var(--v2-muted);
+  font: 400 14px/1.55 var(--v2-font-sans);
+  max-width: 46ch;
+}
+.v2-sitting-done-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
 .v2-sketch-pane {
   display: none;
   position: relative;

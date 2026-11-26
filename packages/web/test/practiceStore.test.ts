@@ -346,4 +346,64 @@ describe("PracticeStore (Solid 2.0)", () => {
       dispose();
     }
   });
+
+  it("caps a committed sitting at 8 due cards, prevents mid-sitting boomerang, and lands on sitting-done", async () => {
+    const items = Array.from({ length: 11 }, (_, i) => ({
+      unit_id: `u${i + 1}`,
+      text: `Unit ${i + 1}`,
+      prompt: `Q${i + 1}?`,
+      kind: "move",
+      topic: null,
+      depth: "recall" as const,
+      p_imm: 0.5,
+      reviews: 1,
+      next_in_ms: 0,
+      due: true,
+    }));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/frontiers") || url.startsWith("/api/explorations")) {
+        return new Response(JSON.stringify({ frontiers: [], explorations: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ scheduler: "rwkv+fsrs85", total_units: items.length, items }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    let store!: PracticeStore;
+    const dispose = createRoot((d) => {
+      store = createPracticeStore("user_sitting", { autoLoad: false });
+      return d;
+    });
+
+    try {
+      await store.refreshQueue({ selectInitial: true });
+      flush();
+
+      // Locked at 8 cards in this sitting, 3 waiting in backlog
+      expect(store.dueQueue()).toHaveLength(8);
+      expect(store.backlogDueCount()).toBe(3);
+
+      // Complete all 8 cards; even though mock server still says due:true, none boomerang back!
+      for (let i = 1; i <= 8; i++) {
+        store.markUnitCompleted(`u${i}`);
+        flush();
+        store.advanceFromUnit(`u${i}`);
+        flush();
+      }
+      expect(store.dueQueue()).toHaveLength(0);
+      expect(store.sittingDoneCount()).toBe(8);
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+      expect(store.backlogDueCount()).toBe(3);
+
+      // Starting next sitting loads the remaining 3 due cards cleanly
+      store.startNextSitting();
+      flush();
+      expect(store.dueQueue().map((u) => u.unit_id)).toEqual(["u9", "u10", "u11"]);
+      expect(store.state.stage).toEqual({ kind: "unit", unitId: "u9" });
+    } finally {
+      dispose();
+    }
+  });
 });

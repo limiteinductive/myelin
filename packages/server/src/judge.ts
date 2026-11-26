@@ -23,10 +23,21 @@ export interface JudgeHistoryItem {
   feedback: string;
 }
 
+export interface PromptCacheEntry {
+  prompt: string;
+  crux?: string | undefined;
+}
+
 export interface JudgeInput {
   /** Optional stable drill attempt ID used as KV-cached ACP session key (`drill:<attemptId>`). */
   sessionKey?: string | undefined;
   prompt: string;
+  /** Prompt-scoped single claim needed to pass THIS prompt (prevents grading unasked unit clauses). */
+  expectedCrux?: string | undefined;
+  /** True when this is a newly told unit's first active production (acquisition, not a memory lapse). */
+  firstContact?: boolean | undefined;
+  /** True when the learner clicked "Show pivot" to reveal the key move directly and close the rep. */
+  showPivot?: boolean | undefined;
   unitText: string;
   unitKind: string;
   depth: Depth;
@@ -783,38 +794,43 @@ export function inferGrade(latencyMs: number | null, hintsUsed: number, clarity?
 export function isLikelyNonAttempt(raw: string): boolean {
   const t = raw.trim().toLowerCase();
   if (!t) return true;
-  if (t.endsWith("?")) return true;
   const nonAttemptRe =
     /^(i\s+(have\s+)?no\s+ideas?|no\s+ideas?|i\s+don'?t\s+know|i\s+dont\s+know|idk|dunno|not\s+sure|lost|confused|help|stuck|blank|skip|pass)[\s.!?]*$/;
   if (nonAttemptRe.test(t)) return true;
   const firstLine = t.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? "";
   if (nonAttemptRe.test(firstLine)) return true;
+  // Only treat trailing "?" as a non-attempt when it's actually an interrogative question
+  // (e.g. "what is p here?"), NOT a substantive answer with a casual "?" (e.g. "sigma**2/n?").
+  if (t.endsWith("?") && /^(what|why|how|when|where|which|who|is|are|do|does|did|can|could|should|wait|clarify)\b/.test(firstLine)) {
+    return true;
+  }
   return false;
 }
 
 const DRILL_COACH_SYSTEM = `You are a sharp, domain-agnostic learning partner inside Myelin (any subject: math, coding, systems, science, languages, writing, etc.).
-Your goal is genuine human understanding as fast as possible—NOT exam proctoring. Adapt smoothly between two gears:
+Your goal is maximum genuine human understanding per minute—NOT exam proctoring or tedious multi-turn Socratic interrogation.
 
-1. CHECK GEAR (the learner wrote a real attempt and is close, made a slip, or missed one nuance):
-- Accept messy shorthand, typos, unfinished thoughts, and valid alternative routes. Never be pedantic about formatting.
-- NEVER pass a circular restatement/tautology, vague hand-waving, or an uncertain guess ending in "?".
-- If what they wrote genuinely demonstrates understanding of the unit, pass right away: set ok=true and write a crisp confirmation (at most 10 words, no extra commentary).
-- If there is a single crack, slip, or missing justification, set ok=false and point directly at that one crack with ONE short question (max 35 words).
+1. PROMPT-SCOPED GRADING (NO GOALPOST MOVING):
+- Grade STRICTLY against what "Prompt asked" (and "Expected crux for this prompt", when given) actually asked for.
+- NEVER reject a correct answer just because "Target unit" mentions an extra unasked clause, paper constant, or side detail.
+- Accept messy shorthand, typos, unfinished formatting, and valid alternative routes.
+- CASUAL "?" ON A RIGHT ANSWER: If the learner writes the right core answer ending in "?" (e.g. "$\\sigma^2/n?$"), PASS it right away (ok=true, grade="hard") with a crisp 1-line confirmation instead of rejecting it and forcing a 90s proof! Only ask a follow-up if the guess is actually wrong, circular, or missing a load-bearing piece.
 
-2. BUILD GEAR (the learner says "i have no ideas", "i don't know", seems blank, or shows foundational confusion):
-- STOP hinting at the high-level answer! Do NOT give a multi-concept intuition riddle or a 2-part question.
-- Drop immediately to the lowest concrete ground-floor building block underneath this unit and ask ONE tiny, 15-second question (e.g. a basic definition/distinction or a tiny concrete 2-element example) so they get fast feedback and climb one atomic rung at a time.
-- NEVER Socratic-quiz an arbitrary convention, symbol, or definition they clearly don't know—state it cleanly in 1 short sentence, then ask ONE tiny concrete check using it.
+2. FAST 2-TURN CEILING & DIRECT WHITEBOARD PIVOTS:
+- Turn 1 (Check):
+  - If they demonstrated what the prompt asked: set ok=true, grade="good"|"easy"|"hard", crisp confirmation (<=10 words).
+  - If there is ONE concrete crack/slip or they are stuck: set ok=false, grade="again", and give ONE surgical nudge (max 35 words) pointing directly at the single missing pivot (never telegraph the exact symbol/answer inside the question).
+- Turn 2+ (Follow-up) OR when "Resolution mode: DIRECT_PIVOT" is set:
+  - If they landed it: set ok=true right away (<=10 words).
+  - If they STILL miss on Turn 2, OR clicked "Show pivot" (DIRECT_PIVOT): STOP quizzing! State the missing pivot cleanly in 1-2 crisp whiteboard sentences and CLOSE THE REP (ok=true) so they absorb it and move on without a 5-turn slog!
+- Decouple ok (rep complete) from grade (spaced-repetition consolidation rating):
+  - First-contact ("First contact: yes") or scaffolded build/pivot completion: grade="hard" (consolidates tomorrow — initial encoding is NOT a memory lapse!).
+  - Core mechanism right on Turn 1, minor slip fixed on 1 nudge: grade="hard" (or "good" if Turn 1 was purely a clarifying question).
+  - Previously learned unit ("First contact: no") missed cold on core mechanism or revealed via Show pivot: grade="again" (schedules for next sitting, >=4h).
+  - When ok=false: grade="again".
 
-Follow-up & grading rules:
-- ALWAYS speak directly in second person ("You..."). Never say "The learner..." or "The attempt...". Stay strictly on-topic—no tangents, no lecturing.
-- ONE tiny atom and ONE question per turn (max 40 words). NEVER pack two questions or multiple unfamiliar concepts into one beat.
-- NEVER TELEGRAPH THE ANSWER IN YOUR HINT: Never print the missing variable names, symbols, or answer fragment inside the very question asking for them. Point to the role or constraint instead.
-- If climbing an atomic staircase (Build gear), move up ONE small rung at a time. The moment the learner lands the final rung of the target unit, finish right away (ok=true, grade="again")—NEVER tack on a forced recap or meta-summary quiz.
-- Decouple ok (rep complete) from grade (cold-retrieval memory rating for spaced repetition):
-  - On turn 1 clean pass: grade="good"|"easy"|"hard" (if hesitant).
-  - On follow-up pass: grade="again" if turn 1 missed the core concept cold or needed Build gear / 2+ nudges; grade="hard" if turn 1 had the core idea and only fixed one minor slip on 1 quick nudge; grade="good" ONLY if turn 1 was purely a clarifying/notation question and they solved the whole unit cleanly.
-  - When ok=false, set grade="again".
+General rules:
+- ALWAYS speak directly in second person ("You..."). Never say "The learner..." or "The attempt...". Stay crisp and strictly on-topic.
 - annotations: OPTIONAL array of AT MOST 1–2 grounded inline pins anchored onto exact verbatim substrings of the learner's latest text (kind="slip"|"question"|"move", note max 22 words). Leave [] on short 1-line answers, "no idea" replies, or when message alone is already clear.
 - missing_prereqs: ONLY when a genuinely missing, reusable atomic prerequisite underneath this unit appears; include at most 1 crisp one-sentence unit, otherwise [].
 - Use $...$ for inline math only when needed. No praise fluff, no exclamation marks. Answer directly with ZERO tool calls.
@@ -865,8 +881,8 @@ export class FastJudge {
   private readonly passThreshold: number;
   private readonly gapCeiling: number;
   private readonly fetchFn: typeof fetch;
-  private readonly promptCache = new Map<string, string>();
-  private readonly inflightPrompts = new Map<string, { promise: Promise<string>; background: boolean }>();
+  private readonly promptCache = new Map<string, PromptCacheEntry>();
+  private readonly inflightPrompts = new Map<string, { promise: Promise<PromptCacheEntry>; background: boolean }>();
   private activeForegroundPrompts = 0;
 
   constructor(opts: JudgeOptions = {}) {
@@ -943,9 +959,14 @@ export class FastJudge {
   private loadPromptCache(): void {
     if (!this.cachePath || !existsSync(this.cachePath)) return;
     try {
-      const data = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<string, string>;
+      const data = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<string, string | { prompt?: string; crux?: string }>;
       for (const [k, v] of Object.entries(data)) {
-        if (typeof v === "string" && v.trim()) this.promptCache.set(k, v);
+        if (typeof v === "string" && v.trim()) {
+          this.promptCache.set(k, { prompt: v.trim() });
+        } else if (v && typeof v === "object" && typeof v.prompt === "string" && v.prompt.trim()) {
+          const crux = typeof v.crux === "string" && v.crux.trim() ? v.crux.trim() : undefined;
+          this.promptCache.set(k, { prompt: v.prompt.trim(), ...(crux ? { crux } : {}) });
+        }
       }
     } catch {
       /* ignore corrupt cache */
@@ -956,7 +977,11 @@ export class FastJudge {
     if (!this.cachePath) return;
     try {
       mkdirSync(dirname(this.cachePath), { recursive: true });
-      writeFileSync(this.cachePath, JSON.stringify(Object.fromEntries(this.promptCache), null, 2), "utf8");
+      const obj: Record<string, string | PromptCacheEntry> = {};
+      for (const [k, v] of this.promptCache) {
+        obj[k] = v.crux ? v : v.prompt;
+      }
+      writeFileSync(this.cachePath, JSON.stringify(obj, null, 2), "utf8");
     } catch {
       /* ignore write errors */
     }
@@ -1274,7 +1299,7 @@ export class FastJudge {
     const hasSketch = Boolean(input.sketchDataUrl);
     let jev: JevSignals | null = null;
     let jevMs: number | undefined;
-    if (this.jevEnabled && !hasSketch && !isLikelyNonAttempt(input.attempt)) {
+    if (this.jevEnabled && !hasSketch && !input.showPivot && !isLikelyNonAttempt(input.attempt)) {
       const tJev = Date.now();
       jev = await this.runJev(input);
       jevMs = jev?.latency_ms ?? Date.now() - tJev;
@@ -1362,12 +1387,17 @@ export class FastJudge {
     const metaLines = [
       mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
       `Prompt asked: ${input.prompt}`,
+      input.expectedCrux?.trim() ? `Expected crux for this prompt (grade STRICTLY against this; do NOT require unasked unit clauses): ${input.expectedCrux.trim()}` : "",
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
+      `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
+      input.showPivot ? "Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the key pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true)." : "",
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
       jev ? `System-1 quick check: P(demonstrated)=${jev.demonstrated.toFixed(2)}, P(cot_gap)=${jev.cot_gap.toFixed(2)}` : "",
       historyBlock,
-      `Current learner attempt:\n${input.attempt.trim() || "(see attached sketch)"}`,
+      input.showPivot
+        ? `Current learner attempt:\n${input.attempt.trim() || "(requested direct pivot)"}`
+        : `Current learner attempt:\n${input.attempt.trim() || "(see attached sketch)"}`,
     ].filter(Boolean);
 
     const userText = metaLines.join("\n");
@@ -1443,14 +1473,19 @@ export class FastJudge {
       if (!parsed || typeof parsed.ok !== "boolean" || !combined) {
         throw new Error(`invalid JSON verdict (raw=${raw.slice(0, 180)})`);
       }
-      const grade: Grade = parsed.ok
-        ? parsed.grade && ["hard", "good", "easy"].includes(parsed.grade)
-          ? parsed.grade
-          : inferGrade(input.latencyMs, input.hintsUsed, jev?.clarity)
+      const finalOk = input.showPivot ? true : parsed.ok;
+      const grade: Grade = finalOk
+        ? input.showPivot
+          ? input.firstContact
+            ? "hard"
+            : "again"
+          : parsed.grade && ["hard", "good", "easy"].includes(parsed.grade)
+            ? parsed.grade
+            : inferGrade(input.latencyMs, input.hintsUsed, jev?.clarity)
         : "again";
       const missingPrereqs = this.parsePrereqs(parsed.missing_prereqs);
       const annotations = this.parseAnnotations(parsed.annotations, input.attempt);
-      if (parsed.ok && input.sessionKey) this.closeSession(input.sessionKey);
+      if (finalOk && input.sessionKey) this.closeSession(input.sessionKey);
       this.emitPerf(
         this.buildPerf(t0, "check", this.drillModel, workerKind, true, {
           jevMs,
@@ -1466,7 +1501,7 @@ export class FastJudge {
         onPerf,
       );
       return {
-        ok: parsed.ok,
+        ok: finalOk,
         grade,
         message: combined,
         tier: "system2",
@@ -1520,6 +1555,9 @@ export class FastJudge {
     input: {
       sessionKey?: string | undefined;
       prompt: string;
+      expectedCrux?: string | undefined;
+      firstContact?: boolean | undefined;
+      showPivot?: boolean | undefined;
       unitText: string;
       unitKind: string;
       depth: Depth;
@@ -1556,21 +1594,35 @@ export class FastJudge {
       .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
       .join("\n");
     const mem = trimLearnerMemory(input.learnerMemory);
+    const forceDirectPivot = Boolean(input.showPivot) || input.turns.length >= 2;
+    const resolutionNote = input.showPivot
+      ? "Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the missing pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true)."
+      : forceDirectPivot
+        ? "Resolution mode: DIRECT_PIVOT (2-turn drill cap reached — if they got it, confirm crisply; if they still missed, state the missing pivot cleanly in 1-2 sentences and close the rep with ok=true instead of quizzing further)."
+        : "";
     const fullUser = [
       mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
       `Prompt asked: ${input.prompt}`,
+      input.expectedCrux?.trim() ? `Expected crux for this prompt (grade STRICTLY against this; do NOT require unasked unit clauses): ${input.expectedCrux.trim()}` : "",
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "",
+      `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
+      resolutionNote,
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
       `Learner initial beat:\n${input.attempt.trim() || "(empty)"}`,
       `Initial coach response: ${input.feedback}`,
       thread ? `Exchange so far:\n${thread}` : "",
-      `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || "(see attached sketch)"}`,
+      `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || (input.showPivot ? "(requested direct pivot)" : "(see attached sketch)")}`,
     ]
       .filter(Boolean)
       .join("\n");
 
-    const deltaUser = `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || "(see attached sketch)"}`;
+    const deltaUser = [
+      resolutionNote,
+      `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || (input.showPivot ? "(requested direct pivot)" : "(see attached sketch)")}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
     const expectedPriorTurns = 1 + Math.floor(input.turns.length / 2);
 
     const userContent: unknown = input.sketchDataUrl
@@ -1640,19 +1692,24 @@ export class FastJudge {
         missing_prereqs?: unknown;
       }>(raw);
       if (parsed && typeof parsed.ok === "boolean" && typeof parsed.message === "string" && parsed.message.trim()) {
-        const trimmedReply = input.reply.trim();
-        const tentativeGuess = trimmedReply.endsWith("?") && trimmedReply.length <= 40;
-        let grade: Grade = parsed.ok
-          ? parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
-            ? parsed.grade
-            : "again"
+        const finalOk = forceDirectPivot ? true : parsed.ok;
+        let grade: Grade = finalOk
+          ? input.showPivot
+            ? input.firstContact
+              ? "hard"
+              : "again"
+            : parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
+              ? parsed.grade
+              : input.firstContact
+                ? "hard"
+                : "hard"
           : "again";
-        if (parsed.ok && tentativeGuess && input.hintsUsed >= 2) {
-          grade = "again";
+        if (finalOk && input.firstContact && grade === "again") {
+          grade = "hard";
         }
         const missingPrereqs = this.parsePrereqs(parsed.missing_prereqs);
         const annotations = this.parseAnnotations(parsed.annotations, input.reply);
-        if (parsed.ok && input.sessionKey) this.closeSession(input.sessionKey);
+        if (finalOk && input.sessionKey) this.closeSession(input.sessionKey);
         this.emitPerf(
           this.buildPerf(t0, "follow-up", this.drillModel, workerKind, true, {
             trace: agyTrace,
@@ -1665,7 +1722,7 @@ export class FastJudge {
           onPerf,
         );
         return {
-          ok: parsed.ok,
+          ok: finalOk,
           grade,
           message: parsed.message.trim(),
           tier: "system2",
@@ -2370,10 +2427,14 @@ Return ONLY valid JSON:
     restsOn: string[],
     variant: number,
     prompt: string,
+    crux?: string,
   ): void {
     const clean = prompt.trim();
     if (!clean) return;
-    this.promptCache.set(this.promptKey(unit, depth, restsOn, variant), clean);
+    this.promptCache.set(this.promptKey(unit, depth, restsOn, variant), {
+      prompt: clean,
+      ...(crux?.trim() ? { crux: crux.trim() } : {}),
+    });
     this.savePromptCache();
   }
 
@@ -2542,9 +2603,14 @@ Return ONLY valid JSON:
     return `v5:${unit.id}:${depth}:v${variant}:${depSig}:${unit.text}`;
   }
 
+  /** Returns a cached prompt + expected crux synchronously if already warmed, or null. */
+  peekPromptEntry(unit: { id: string; text: string }, depth: Depth, restsOn: string[] = [], variant = 0): PromptCacheEntry | null {
+    return this.promptCache.get(this.promptKey(unit, depth, restsOn, variant)) ?? null;
+  }
+
   /** Returns a cached prompt synchronously if already warmed, or null. */
   peekPrompt(unit: { id: string; text: string }, depth: Depth, restsOn: string[] = [], variant = 0): string | null {
-    return this.promptCache.get(this.promptKey(unit, depth, restsOn, variant)) ?? null;
+    return this.peekPromptEntry(unit, depth, restsOn, variant)?.prompt ?? null;
   }
 
   /** Prefetches uncached prompts in the background (runs up to 2 concurrent ACP sessions; yields to foreground misses). */
@@ -2593,18 +2659,18 @@ Return ONLY valid JSON:
   }
 
   /**
-   * Generates a crisp, self-contained single-beat prompt without giving away the answer (cached per variant).
-   * Background prefetch (`background=true`) uses high-reasoning `promptModel` (`gemini-4-neon-high`);
-   * synchronous foreground cache misses (`background=false`) use fast `sidecarModel` (`gemini-4-hydrogen-medium`)
-   * with a tight 20s ceiling so card loads never stall 35–110s waiting on a background prefetch.
+   * Generates a crisp, self-contained single-beat prompt + its prompt-scoped `expected_crux`
+   * (cached per variant). Background prefetch (`background=true`) uses high-reasoning `promptModel`
+   * (`gemini-4-neon-high`); synchronous foreground cache misses (`background=false`) use fast
+   * `sidecarModel` (`gemini-4-hydrogen-medium`) with a tight 20s ceiling so card loads never stall.
    */
-  async promptFor(
+  async promptEntryFor(
     unit: { id: string; text: string; kind: string; topic?: string | null },
     restsOn: string[],
     depth: Depth,
     opts: PromptContextOptions = {},
     background = false,
-  ): Promise<string> {
+  ): Promise<PromptCacheEntry> {
     const variant = opts.variant ?? 0;
     const key = this.promptKey(unit, depth, restsOn, variant);
     const cached = this.promptCache.get(key);
@@ -2613,7 +2679,7 @@ Return ONLY valid JSON:
     if (inflight && (background || !inflight.background)) return inflight.promise;
 
     if (!this.apiKey && !this.promptWorker) {
-      const fallback = defaultPrompt(unit.text, unit.kind, restsOn, depth);
+      const fallback: PromptCacheEntry = { prompt: defaultPrompt(unit.text, unit.kind, restsOn, depth) };
       this.promptCache.set(key, fallback);
       return fallback;
     }
@@ -2630,19 +2696,15 @@ Return ONLY valid JSON:
         : "Pose ONE concrete mini-scenario where the learner must choose and apply this idea themselves, without naming the concept, trick, or theorem.",
     };
 
-    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words).
+    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words) AND its exact single-claim grading rubric ("expected_crux", max 28 words).
 Rules:
 - MOTIVATE, DON'T WORKSHEET: Frame a real problem, comparison, or curiosity trigger where the brain actually needs this idea—NEVER a disembodied textbook command ("Decompose X into A and B", "State formula Y", "What identity does trick Z use?").
 - ZERO SPOILERS, ZERO RIDDLES: Name the starting setup/object clearly (e.g. standard attention $\\text{softmax}(QK^T)V$, a database write path, a sample mean $\\bar{x}$)—hide ONLY the solution, trick, or intermediate pivot, NEVER obfuscate the premise into a vague riddle ("interactions between all pairs of elements").
-  - Bad (spoils & unmotivated): "How do you decompose $\\sum(x_i - \\mu)^2$ into spread around $\\bar{x}$ and the mean's offset from $\\mu$?"
-  - Bad (vague riddle): "A model computes interactions between all pairs of elements—how do you avoid $O(L^2)$?"
-  - Good (concrete setup, zero spoiler): "Standard attention computes $\\text{softmax}(QK^T)V$ in $O(L^2)$ time—how can you avoid forming the $L\\times L$ matrix for long sequences?"
-  - Good (real trigger, zero spoiler): "For data $x_1,\\dots,x_n$ with sample mean $\\bar{x}$ and true mean $\\mu$, how much smaller is $\\sum(x_i - \\bar{x})^2$ than $\\sum(x_i - \\mu)^2$?"
-  - Bad (spoils architecture): "How do you combine a write-ahead log with an in-memory buffer for fast durable writes?"
-  - Good (real trigger): "A database must survive power loss without flushing random disk pages on every write—how do you keep writes both fast and durable?"
-- NO SURFACE-CUE REPETITION: If Previously asked prompts are listed below, DO NOT reuse the same cover story, numbers, or phrasing—change what the learner must recognize or decide (a genuinely new context, boundary condition, or numerical regime).
-- 100% SELF-CONTAINED COLD: Explicitly define every symbol or variable used (e.g. "a distribution $p_\\theta(x)$ parameterized by $\\theta$", never a bare undefined "$\\nabla p$").
-- ONE SINGLE TASK: Never stack two separate demands ("...and also explain..."). Plain text, TeX in $…$ only when genuinely helpful, no meta-commentary.`;
+- NO SURFACE-CUE REPETITION: If Previously asked prompts are listed below, DO NOT reuse the same cover story, numbers, or phrasing—change what the learner must recognize or decide.
+- 100% SELF-CONTAINED COLD: Explicitly define every symbol or variable used.
+- ONE SINGLE TASK: Never stack two separate demands ("...and also explain...").
+- "expected_crux": State the exact single claim/expression needed to answer THIS prompt cleanly (so the judge never nitpicks unasked unit clauses).
+- Return ONLY valid JSON: {"prompt": string, "expected_crux": string}`;
     const prior = (opts.priorPrompts ?? []).filter(Boolean).slice(-3);
     const mem = trimLearnerMemory(opts.learnerMemory);
     const promptUser = [
@@ -2666,11 +2728,11 @@ Rules:
 
     if (!background) this.activeForegroundPrompts++;
     const t0 = Date.now();
-    const p = (async () => {
+    const p = (async (): Promise<PromptCacheEntry> => {
       let agyTrace: AgyTurnTrace | undefined;
       let workerKind: PerfWorker = "openrouter";
       try {
-        let text: string | undefined;
+        let raw: string | undefined;
         if (fallbackWorkerForCall) {
           const res = await this.askAgy({
             fallbackWorker: fallbackWorkerForCall,
@@ -2684,7 +2746,7 @@ Rules:
             },
           });
           workerKind = res.worker;
-          text = res.raw.trim().replace(/^["']|["']$/g, "");
+          raw = res.raw.trim();
         } else {
           const res = await this.fetchFn(CHAT_URL, {
             method: "POST",
@@ -2697,6 +2759,7 @@ Rules:
               reasoning: { effort: background ? "high" : "low" },
               temperature: 0.3,
               max_tokens: 2000,
+              response_format: { type: "json_object" },
               messages: [
                 { role: "system", content: promptSys },
                 { role: "user", content: promptUser },
@@ -2705,22 +2768,34 @@ Rules:
           });
           if (res.ok) {
             const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-            text = data.choices?.[0]?.message?.content?.trim().replace(/^["']|["']$/g, "");
+            raw = data.choices?.[0]?.message?.content?.trim();
           }
         }
-        if (text) {
-          this.promptCache.set(key, text);
-          this.savePromptCache();
-          this.perf?.record(
-            this.buildPerf(t0, "prompt", modelForCall, workerKind, true, {
-              background,
-              cacheHit: false,
-              trace: agyTrace,
-              outputChars: text.length,
-              promptChars: promptUser.length,
-            }),
-          );
-          return text;
+        if (raw) {
+          const parsed = parseJudgeJson<{ prompt?: string; expected_crux?: string }>(raw);
+          const promptText =
+            typeof parsed?.prompt === "string" && parsed.prompt.trim().length > 6
+              ? parsed.prompt.trim()
+              : raw.replace(/^["']|["']$/g, "").trim();
+          const cruxText =
+            typeof parsed?.expected_crux === "string" && parsed.expected_crux.trim().length > 4
+              ? parsed.expected_crux.trim()
+              : undefined;
+          if (promptText) {
+            const entry: PromptCacheEntry = { prompt: promptText, ...(cruxText ? { crux: cruxText } : {}) };
+            this.promptCache.set(key, entry);
+            this.savePromptCache();
+            this.perf?.record(
+              this.buildPerf(t0, "prompt", modelForCall, workerKind, true, {
+                background,
+                cacheHit: false,
+                trace: agyTrace,
+                outputChars: promptText.length,
+                promptChars: promptUser.length,
+              }),
+            );
+            return entry;
+          }
         }
       } catch (err) {
         console.error("[judge] promptFor failed:", err instanceof Error ? err.message : err);
@@ -2734,7 +2809,7 @@ Rules:
         );
       }
       // Never cache a transient fallback in promptCache so the next load retries cleanly.
-      return defaultPrompt(unit.text, unit.kind, restsOn, depth);
+      return { prompt: defaultPrompt(unit.text, unit.kind, restsOn, depth) };
     })().finally(() => {
       if (this.inflightPrompts.get(key)?.promise === p) {
         this.inflightPrompts.delete(key);
@@ -2743,12 +2818,22 @@ Rules:
     });
 
     this.inflightPrompts.set(key, { promise: p, background });
-    // If a slow background neon-high prefetch was already running when a foreground user asked for
-    // this exact card, race both so the learner gets whichever finishes first (typically ~2.5s)!
     if (!background && inflight?.background) {
       return Promise.race([p, inflight.promise]);
     }
     return p;
+  }
+
+  /** Generates a crisp, self-contained single-beat prompt without giving away the answer (cached per variant). */
+  async promptFor(
+    unit: { id: string; text: string; kind: string; topic?: string | null },
+    restsOn: string[],
+    depth: Depth,
+    opts: PromptContextOptions = {},
+    background = false,
+  ): Promise<string> {
+    const entry = await this.promptEntryFor(unit, restsOn, depth, opts, background);
+    return entry.prompt;
   }
 
   /**

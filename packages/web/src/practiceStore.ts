@@ -67,10 +67,13 @@ export interface ExploreSession {
   citations: Citation[];
 }
 
+export const SITTING_LIMIT = 8;
+
 export type Stage =
   | { kind: "unit"; unitId: string }
   | { kind: "frontier"; frontierId: string }
   | { kind: "exploration"; explorationId: string }
+  | { kind: "sitting-done" }
   | { kind: "explore" };
 
 export interface PracticeState {
@@ -82,6 +85,10 @@ export interface PracticeState {
   sessions: Record<string, UnitSession>;
   explore: ExploreSession;
   removedUnits: Record<string, true>;
+  /** Finite committed sitting: up to SITTING_LIMIT due units locked for the current sitting. */
+  sittingIds: string[];
+  /** Units completed during this sitting — never boomerang back into the active sitting. */
+  sittingCompletedIds: Record<string, true>;
   stage: Stage;
   /** Keeps the unit currently showing its green verdict card in "Up next" until the learner moves on. */
   justCompletedId: string | null;
@@ -112,7 +119,7 @@ export function emptyExploreSession(): ExploreSession {
 }
 
 export function sessionKeyForStage(stage: Stage): string {
-  if (stage.kind === "explore") return "__explore__";
+  if (stage.kind === "explore" || stage.kind === "sitting-done") return "__explore__";
   if (stage.kind === "frontier") return `briefing:${stage.frontierId}`;
   if (stage.kind === "exploration") return `explore:${stage.explorationId}`;
   return stage.unitId;
@@ -344,6 +351,8 @@ export interface PracticeStore {
   readonly dueQueue: () => QueueUnit[];
   readonly doneQueue: () => QueueUnit[];
   readonly remainingCount: () => number;
+  readonly backlogDueCount: () => number;
+  readonly sittingDoneCount: () => number;
   readonly soonestNextMs: () => number | null;
   readonly currentFrontier: () => Frontier | null;
   readonly currentExploration: () => SavedExploration | null;
@@ -374,6 +383,7 @@ export interface PracticeStore {
   markUnitCompleted(unitId: string): void;
   practiceUnitAgain(unitId: string): void;
   advanceFromUnit(fromUnitId: string | null): void;
+  startNextSitting(): void;
   undoAddedUnit(unitId: string): Promise<void>;
 
   updateUnitSession(key: string, fn: (draft: UnitSession) => void): void;
@@ -403,7 +413,9 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     sessions: saved?.sessions ?? {},
     explore: saved?.explore ?? emptyExploreSession(),
     removedUnits: initialRemoved,
-    stage: saved?.stage ?? { kind: "explore" },
+    sittingIds: [],
+    sittingCompletedIds: {},
+    stage: saved?.stage && saved.stage.kind !== "sitting-done" ? saved.stage : { kind: "explore" },
     justCompletedId: null,
     celebratingId: null,
     doneOpen: saved?.doneOpen ?? false,
@@ -431,15 +443,30 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   let celebrateTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Derived views (memoized once per change).
-  const dueQueue = createMemo(() =>
-    state.queue.filter((u) => u.due || u.unit_id === state.justCompletedId),
-  );
-  const doneQueue = createMemo(() =>
-    state.queue.filter((u) => !u.due && u.unit_id !== state.justCompletedId),
-  );
+  // Committed Sitting: locks up to SITTING_LIMIT due cards and prevents cards completed during
+  // this sitting from boomeranging back into the active sitting queue.
+  const dueQueue = createMemo(() => {
+    const sittingSet = state.sittingIds.length > 0 ? new Set(state.sittingIds) : null;
+    return state.queue.filter((u) => {
+      if (u.unit_id === state.justCompletedId) return true;
+      if (!u.due) return false;
+      if (state.sittingCompletedIds[u.unit_id]) return false;
+      if (sittingSet && !sittingSet.has(u.unit_id)) return false;
+      return true;
+    });
+  });
+  const doneQueue = createMemo(() => {
+    const activeIds = new Set(dueQueue().map((u) => u.unit_id));
+    return state.queue.filter((u) => !activeIds.has(u.unit_id));
+  });
   const remainingCount = createMemo(() =>
     dueQueue().filter((u) => u.unit_id !== state.justCompletedId).length,
   );
+  const backlogDueCount = createMemo(() => {
+    const activeIds = new Set(dueQueue().map((u) => u.unit_id));
+    return state.queue.filter((u) => u.due && !activeIds.has(u.unit_id) && !state.sittingCompletedIds[u.unit_id]).length;
+  });
+  const sittingDoneCount = createMemo(() => Object.keys(state.sittingCompletedIds).length);
   const soonestNextMs = createMemo(() => {
     let best: number | null = null;
     for (const u of doneQueue()) {
@@ -477,7 +504,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       const payload: PersistedPractice = {
         version: 2,
         migratedLegacy: true,
-        stage: snap.stage,
+        stage: snap.stage.kind === "sitting-done" ? { kind: "explore" } : snap.stage,
         doneOpen: snap.doneOpen,
         sessions: cleanSessions,
         explore: {
@@ -857,6 +884,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     setState((s) => {
       s.justCompletedId = unitId;
       s.celebratingId = unitId;
+      s.sittingCompletedIds[unitId] = true;
       const item = s.queue.find((u) => u.unit_id === unitId);
       const nextIn = s.sessions[unitId]?.passedVerdict?.next_in_ms ?? null;
       if (item && (nextIn === null || nextIn > 0)) {
@@ -882,6 +910,10 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     }
     setState((s) => {
       if (s.justCompletedId === unitId) s.justCompletedId = null;
+      delete s.sittingCompletedIds[unitId];
+      if (s.sittingIds.length > 0 && !s.sittingIds.includes(unitId)) {
+        s.sittingIds.unshift(unitId);
+      }
       delete s.sessions[unitId];
       s.mapOpen = false;
       s.stage = { kind: "unit", unitId };
@@ -892,7 +924,15 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
 
   const advanceFromUnit = (fromUnitId: string | null) => {
     const snap = snapshot(state);
-    const nextDue = snap.queue.find((u) => u.due && u.unit_id !== fromUnitId);
+    const sittingSet = snap.sittingIds.length > 0 ? new Set(snap.sittingIds) : null;
+    const nextDue = snap.queue.find(
+      (u) =>
+        u.due &&
+        u.unit_id !== fromUnitId &&
+        !snap.sittingCompletedIds[u.unit_id] &&
+        (!sittingSet || sittingSet.has(u.unit_id)),
+    );
+    const hadSittingProgress = Object.keys(snap.sittingCompletedIds).length > 0;
     setState((s) => {
       // If leaving a completed unit whose re-test cooldown already elapsed while lingering in follow-ups,
       // clear its old passed session so the next time it's opened it starts a fresh drill.
@@ -903,7 +943,34 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
         }
       }
       s.justCompletedId = null;
-      s.stage = nextDue ? { kind: "unit", unitId: nextDue.unit_id } : { kind: "explore" };
+      s.stage = nextDue
+        ? { kind: "unit", unitId: nextDue.unit_id }
+        : hadSittingProgress
+          ? { kind: "sitting-done" }
+          : { kind: "explore" };
+    });
+    markDirty();
+  };
+
+  const startNextSitting = () => {
+    const snap = snapshot(state);
+    const nextBatch = snap.queue
+      .filter((u) => u.due && !snap.sittingCompletedIds[u.unit_id])
+      .slice(0, SITTING_LIMIT)
+      .map((u) => u.unit_id);
+    const fallbackBatch =
+      nextBatch.length > 0
+        ? nextBatch
+        : snap.queue
+            .filter((u) => u.due)
+            .slice(0, SITTING_LIMIT)
+            .map((u) => u.unit_id);
+    setState((s) => {
+      s.justCompletedId = null;
+      s.sittingCompletedIds = {};
+      s.sittingIds = fallbackBatch;
+      s.mapOpen = false;
+      s.stage = fallbackBatch[0] ? { kind: "unit", unitId: fallbackBatch[0] } : { kind: "explore" };
     });
     markDirty();
   };
@@ -1012,6 +1079,21 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       setState((s) => {
         reconcile(orderedItems, "unit_id")(s.queue);
         s.queueLoaded = true;
+
+        // Lock or top-up the finite committed sitting (up to SITTING_LIMIT due cards, excluding
+        // any cards already finished during this sitting so completed cards never boomerang back).
+        const validSitting = s.sittingIds.filter((id) => itemsById.has(id));
+        const sittingSet = new Set(validSitting);
+        if (validSitting.length < SITTING_LIMIT) {
+          for (const u of orderedItems) {
+            if (validSitting.length >= SITTING_LIMIT) break;
+            if (u.due && !s.sittingCompletedIds[u.unit_id] && !sittingSet.has(u.unit_id)) {
+              validSitting.push(u.unit_id);
+              sittingSet.add(u.unit_id);
+            }
+          }
+        }
+        s.sittingIds = validSitting;
 
         // Sync newly warmed prompts into the per-unit keyed promptMap.
         for (const u of orderedItems) {
@@ -1341,6 +1423,8 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     dueQueue,
     doneQueue,
     remainingCount,
+    backlogDueCount,
+    sittingDoneCount,
     soonestNextMs,
     currentFrontier,
     currentExploration,
@@ -1368,6 +1452,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     markUnitCompleted,
     practiceUnitAgain,
     advanceFromUnit,
+    startNextSitting,
     undoAddedUnit,
     updateUnitSession,
     updateExplore,

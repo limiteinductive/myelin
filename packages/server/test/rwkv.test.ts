@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { emptyState, fsrsScheduler, makeEvent, replay, uuidv7 } from "@myelin/core";
-import { RwkvInstantEngine } from "../src/rwkv.js";
+import { computeCalibratedIntervals, pickDrillDepth, RwkvInstantEngine } from "../src/rwkv.js";
 
 const MODEL_DIR = fileURLToPath(new URL("../../../data/models/sm72e25/sm72e25", import.meta.url));
 
@@ -74,5 +74,31 @@ print(json.dumps(out))
     expect(s1.next_in_ms).toBeGreaterThan(0);
     // u2 was graded "again" 1h ago, so remaining time until due must count down to 0
     expect(s2.next_in_ms).toBe(0);
+  });
+
+  it("calibrates FSRS-6 (R=0.85) intervals without 10m boomerangs and caps pure definitions at explain", () => {
+    const t0 = 1_790_000_000_000;
+    const uTold = uuidv7(t0);
+    const uLapse = uuidv7(t0 + 1);
+    const uGood = uuidv7(t0 + 2);
+    const events = [
+      makeEvent("unit.found", { unit_id: uTold, text: "bp stands for base pair.", kind: "definition", topic: "genomics", rests_on: [], origin: "need", told: true, observe_only: false, message_id: null }, { id: uuidv7(t0), device_id: "server:drill", ts: t0, seq: 1 }),
+      makeEvent("unit.found", { unit_id: uLapse, text: "Variance scaling pulls constants out squared.", kind: "move", topic: "stats", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0 + 1), device_id: "server:drill", ts: t0 + 1, seq: 2 }),
+      makeEvent("unit.found", { unit_id: uGood, text: "Linearity of expectation holds without independence.", kind: "move", topic: "stats", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0 + 2), device_id: "server:drill", ts: t0 + 2, seq: 3 }),
+      // Assisted Build-gear pass on newly told definition (again with hints=2) -> treated as hard (>=12h), NOT 10m!
+      makeEvent("unit.probed", { unit_id: uTold, depth: "recall", slot: "seam", prompt: "What is bp?", answer_message_id: null, grade: "again", corrected_grade: null, hints: 2, latency_ms: 45_000, scheduler: "rwkv", predicted_recall: 0 }, { id: uuidv7(t0 + 1000), device_id: "server:drill", ts: t0 + 1000, seq: 4 }),
+      // Pure unassisted lapse -> enforces >=4h next-sitting floor (never 10m boomerang)
+      makeEvent("unit.probed", { unit_id: uLapse, depth: "recall", slot: "seam", prompt: "Var(aX)?", answer_message_id: null, grade: "again", corrected_grade: null, hints: 0, latency_ms: 15_000, scheduler: "rwkv", predicted_recall: 0.5 }, { id: uuidv7(t0 + 2000), device_id: "server:drill", ts: t0 + 2000, seq: 5 }),
+      // Clean cold good -> multi-day interval (not 1.7h!)
+      makeEvent("unit.probed", { unit_id: uGood, depth: "recall", slot: "seam", prompt: "E[X+Y]?", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 60_000, scheduler: "rwkv", predicted_recall: 0 }, { id: uuidv7(t0 + 3000), device_id: "server:drill", ts: t0 + 3000, seq: 6 }),
+      // Two clean passes on definition -> should stay at explain, never use
+      makeEvent("unit.probed", { unit_id: uTold, depth: "recall", slot: "seam", prompt: "What is bp?", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 8_000, scheduler: "rwkv", predicted_recall: 0.7 }, { id: uuidv7(t0 + 4000), device_id: "server:drill", ts: t0 + 4000, seq: 7 }),
+      makeEvent("unit.probed", { unit_id: uTold, depth: "explain", slot: "seam", prompt: "Why bp?", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 9_000, scheduler: "rwkv", predicted_recall: 0.8 }, { id: uuidv7(t0 + 5000), device_id: "server:drill", ts: t0 + 5000, seq: 8 }),
+    ];
+    const state = replay(events, fsrsScheduler(), emptyState(fsrsScheduler()));
+    const cal = computeCalibratedIntervals(state, t0 + 10_000);
+    expect(cal.get(uLapse)!.next_in_ms).toBeGreaterThanOrEqual(3.9 * 3600_000);
+    expect(cal.get(uGood)!.next_in_ms).toBeGreaterThanOrEqual(24 * 3600_000);
+    expect(pickDrillDepth(state.units[uTold]!, state)).toBe("explain");
   });
 });
