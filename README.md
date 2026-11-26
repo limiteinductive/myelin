@@ -29,7 +29,7 @@ TypeScript monorepo (`Node >= 22`):
 ```bash
 npm install
 cp .env.example .env
-# Add your model key in .env (e.g. GEMINI_API_KEY or MYELIN_MODEL)
+# Configure either your local `agy` CLI subscription (no API key needed) or OPENROUTER_API_KEY in .env
 npm run build
 node packages/cli/dist/main.js up
 ```
@@ -46,9 +46,12 @@ npm run watch:server
 
 Put environment variables in `.env` (never committed):
 
-- `GEMINI_API_KEY` — API key for the default Gemini model
-- `MYELIN_MODEL` — Model selector (`provider/model`, e.g. `google/gemini-4-neon`)
-- `MYELIN_JUDGE_MODEL` — Optional override for the drill/explore judge model
+- **Option 1 — Local Antigravity CLI subscription (no API key needed):**
+  - `MYELIN_MODEL=agy`
+  - `MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low` (or `agy/gemini-4-neon-medium`)
+- **Option 2 — OpenRouter API:**
+  - `OPENROUTER_API_KEY=...`
+  - `MYELIN_JUDGE_MODEL=...` (optional model override)
 - `MYELIN_DATA` — Data directory (defaults to `~/.myelin/data`)
 
 ## Shortcuts
