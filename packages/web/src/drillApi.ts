@@ -47,13 +47,14 @@ export interface AddedUnit {
 export interface SavedExploration {
   id: string;
   title: string;
-  turns: { user: string; coach: string; added?: AddedUnit[] }[];
+  turns: { user: string; coach: string; question?: string; added?: AddedUnit[] }[];
   created_at: number;
   updated_at: number;
 }
 
 export interface ExploreResponse {
   message: string;
+  question?: string;
   added_units: AddedUnit[];
   demonstrated_cruxes?: number[];
   frontier?: Frontier;
@@ -286,7 +287,7 @@ export function exploreDrill(
     reply?: string;
     promote_on_unit?: boolean;
     origin_prompt?: string;
-    prior_post_turns?: { user: string; coach: string; added?: AddedUnit[] }[];
+    prior_post_turns?: { user: string; coach: string; question?: string; added?: AddedUnit[] }[];
     rep_context?: {
       unit_id: string;
       depth: Depth;
@@ -322,7 +323,7 @@ export function fetchExplorations(
 export function saveExploration(payload: {
   id?: string;
   title?: string;
-  turns: { user: string; coach: string; added?: AddedUnit[] }[];
+  turns: { user: string; coach: string; question?: string; added?: AddedUnit[] }[];
 }): Promise<{ exploration: SavedExploration }> {
   return req<{ exploration: SavedExploration }>("/api/explorations", {
     method: "POST",

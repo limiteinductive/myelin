@@ -1135,6 +1135,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             {
               user: userText,
               coach: res.message,
+              ...(res.question ? { question: res.question } : {}),
               ...(added_units.length > 0 ? { added: added_units } : {}),
             },
           ].slice(-60);
@@ -1154,6 +1155,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             {
               user: userText,
               coach: res.message,
+              ...(res.question ? { question: res.question } : {}),
               ...(added_units.length > 0 ? { added: added_units } : {}),
             },
           ];
@@ -1175,6 +1177,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       return {
         message: res.message,
+        ...(res.question ? { question: res.question } : {}),
         added_units,
         ...(exploration ? { exploration: { id: exploration.id, title: exploration.title } } : {}),
         ...(rep_fix_applied ? { rep_fix_applied } : {}),

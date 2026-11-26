@@ -273,7 +273,7 @@ export function MapView() {
                   type="button"
                   class="v2-ghost-btn"
                   disabled={dreaming()}
-                  title="Consolidate recent drills and explorations into lean learner memory"
+                  data-tip="Consolidate recent drills and explorations into lean learner memory"
                   onClick={() => void runDreamNow()}
                 >
                   {dreaming() ? "Dreaming…" : "Dream now"}
@@ -414,7 +414,7 @@ export function MapView() {
                     <span
                       class="v2-strength-bar"
                       style={{ opacity: strengthOpacity(u()) }}
-                      title={u().reviews > 0 ? `P(recall) ${Math.round(u().p_imm * 100)}%` : "Untested"}
+                      data-tip={u().reviews > 0 ? `P(recall) ${Math.round(u().p_imm * 100)}%` : "Untested"}
                     />
                     <span class="v2-row-text">{inline(u().text)}</span>
                     <span class="v2-row-right">

@@ -5,9 +5,10 @@ import { watchActivity } from "./activity.js";
 import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
 import { MapView } from "./MapView.js";
-import { createPracticeStore, PracticeContext } from "./practiceStore.js";
+import { createPracticeStore, PracticeContext, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
-import { inline } from "./text.js";
+import { formatSidebarDrillLabel, plainSidebarText } from "./sidebar.js";
+import { installStyledTooltips } from "./tooltip.js";
 import type { QueueUnit } from "./drillApi.js";
 
 export type Screen = { kind: "loading" } | { kind: "signin"; error?: string } | { kind: "thread"; session: Me };
@@ -27,6 +28,65 @@ function media(query: string): () => boolean {
   return get;
 }
 
+// Sidebar density: how many rows a list shows before it folds the rest behind a quiet toggle.
+const EXPLORATION_LIMIT = 8;
+const EXPLORATION_SHOWN = 7;
+const QUEUE_LIMIT = 7;
+const QUEUE_SHOWN = 6;
+
+const ICON_STROKE = {
+  fill: "none",
+  stroke: "currentColor",
+  "stroke-width": "1.5",
+  "stroke-linecap": "round",
+  "stroke-linejoin": "round",
+  "aria-hidden": "true",
+} as const;
+
+const PlusIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE}>
+    <path d="M6 2v8M2 6h8" />
+  </svg>
+);
+const CloseIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE}>
+    <path d="M3.25 3.25l5.5 5.5M8.75 3.25l-5.5 5.5" />
+  </svg>
+);
+const ArchiveIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 16 16" {...ICON_STROKE} stroke-width="1.35">
+    <rect x="2" y="2.5" width="12" height="3.25" rx="1" />
+    <path d="M3 5.75v6.25a1.5 1.5 0 0 0 1.5 1.5h7a1.5 1.5 0 0 0 1.5-1.5V5.75" />
+    <path d="M6.5 8.75h3" />
+  </svg>
+);
+const ChevronIcon = () => (
+  <svg class="v2-sb-chev" width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE}>
+    <path d="M4.5 2.75 7.75 6 4.5 9.25" />
+  </svg>
+);
+const BranchIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE}>
+    <path d="M3.5 8.5l5-5M4.75 3.5H8.5v3.75" />
+  </svg>
+);
+const SidebarToggleIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 18 18" {...ICON_STROKE}>
+    <rect x="2.5" y="3" width="13" height="12" rx="2.5" />
+    <path d="M6.75 3v12" />
+  </svg>
+);
+const BackIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 16 16" {...ICON_STROKE}>
+    <path d="M12.5 8H3.5M7.5 4 3.5 8l4 4" />
+  </svg>
+);
+const ForwardIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 16 16" {...ICON_STROKE}>
+    <path d="M3.5 8h9M8.5 4l4 4-4 4" />
+  </svg>
+);
+
 function fmtWait(ms: number): string {
   const m = Math.max(1, Math.round(ms / 60_000));
   if (m < 90) return `${m}m`;
@@ -36,9 +96,10 @@ function fmtWait(ms: number): string {
 }
 
 export function App(props: { screen: Screen; go: (s: Screen) => void }) {
-  // Follow device light/dark preference with clean owner-scoped teardown.
+  // Follow device light/dark preference + install styled global tooltips with clean teardown.
   onSettled(() => {
-    if (typeof matchMedia !== "function") return;
+    const cleanupTips = installStyledTooltips();
+    if (typeof matchMedia !== "function") return cleanupTips;
     const dark = matchMedia("(prefers-color-scheme: dark)");
     const applyTheme = () => {
       const t = dark.matches ? "dark" : "light";
@@ -47,7 +108,10 @@ export function App(props: { screen: Screen; go: (s: Screen) => void }) {
     };
     applyTheme();
     dark.addEventListener("change", applyTheme);
-    return () => dark.removeEventListener("change", applyTheme);
+    return () => {
+      dark.removeEventListener("change", applyTheme);
+      cleanupTips();
+    };
   });
 
   const signin = () => (props.screen.kind === "signin" ? props.screen : null);
@@ -169,6 +233,18 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
         practice.setMapOpen(false);
         return;
       }
+      if (e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+        if (e.key === "ArrowLeft") {
+          e.preventDefault();
+          goBack();
+          return;
+        }
+        if (e.key === "ArrowRight") {
+          e.preventDefault();
+          goForward();
+          return;
+        }
+      }
       if (!(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return;
       if (e.key === "\\") {
         e.preventDefault();
@@ -176,6 +252,12 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
       } else if (e.key.toLowerCase() === "m") {
         e.preventDefault();
         practice.setMapOpen((v) => !v);
+      } else if (e.key === "[" || e.key === "]") {
+        const active = document.activeElement;
+        if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
+        e.preventDefault();
+        if (e.key === "[") goBack();
+        else goForward();
       }
     };
     const onCopy = (e: ClipboardEvent) => {
@@ -206,240 +288,405 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     if (narrow()) setSidebarOpen(false);
   };
 
-  const strengthOpacity = (u: QueueUnit) => (u.reviews === 0 ? 0.24 : Math.max(0.22, Math.min(1, u.p_imm)));
+  // ----- In-app Back / Forward navigation history -----
+  type NavEntry = { stage: Stage; mapOpen: boolean };
+  const navKey = (e: NavEntry) => `${e.mapOpen ? "map:" : ""}${sessionKeyForStage(e.stage)}`;
+  const [navStack, setNavStack] = createSignal<NavEntry[]>([]);
+  const [navIdx, setNavIdx] = createSignal(-1);
+  let replayingNav = false;
+
+  const currentNavEntry = createMemo<NavEntry>(() => {
+    const s = practice.state.stage;
+    const stage: Stage =
+      s.kind === "unit"
+        ? { kind: "unit", unitId: s.unitId }
+        : s.kind === "frontier"
+          ? { kind: "frontier", frontierId: s.frontierId }
+          : s.kind === "exploration"
+            ? { kind: "exploration", explorationId: s.explorationId }
+            : { kind: "explore" };
+    return { stage, mapOpen: practice.state.mapOpen };
+  });
+
+  createEffect(
+    () => (practice.state.queueLoaded ? currentNavEntry() : null),
+    (entry) => {
+      if (!entry) return;
+      if (replayingNav) {
+        replayingNav = false;
+        return;
+      }
+      const stack = navStack();
+      const idx = navIdx();
+      const cur = idx >= 0 ? stack[idx] : undefined;
+      if (cur && navKey(cur) === navKey(entry)) return;
+      const next = [...stack.slice(0, idx + 1), entry].slice(-50);
+      setNavStack(next);
+      setNavIdx(next.length - 1);
+    },
+  );
+
+  const canGoBack = () => navIdx() > 0;
+  const canGoForward = () => navIdx() >= 0 && navIdx() < navStack().length - 1;
+
+  const applyNavEntry = (entry: NavEntry) => {
+    replayingNav = true;
+    const s = entry.stage;
+    if (s.kind === "unit") practice.selectUnit(s.unitId);
+    else if (s.kind === "exploration") practice.selectExploration(s.explorationId);
+    else if (s.kind === "frontier") practice.selectFrontier(s.frontierId);
+    else practice.selectExplore();
+    if (entry.mapOpen) practice.setMapOpen(true);
+  };
+
+  const goBack = () => {
+    const idx = navIdx();
+    if (idx <= 0) return;
+    const target = navStack()[idx - 1];
+    if (!target) return;
+    setNavIdx(idx - 1);
+    applyNavEntry(target);
+  };
+
+  const goForward = () => {
+    const idx = navIdx();
+    const stack = navStack();
+    if (idx < 0 || idx >= stack.length - 1) return;
+    const target = stack[idx + 1];
+    if (!target) return;
+    setNavIdx(idx + 1);
+    applyNavEntry(target);
+  };
+
+  const NavChrome = () => (
+    <div class="v2-nav-chrome">
+      <button
+        type="button"
+        class="v2-icon-toggle"
+        aria-label={sidebarOpen() ? "Hide sidebar" : "Show sidebar"}
+        aria-pressed={sidebarOpen() ? "true" : "false"}
+        data-tip="Toggle sidebar (⌘\)"
+        data-tip-side="bottom"
+        onClick={() => setSidebarOpen((v) => !v)}
+      >
+        <SidebarToggleIcon />
+      </button>
+      <button
+        type="button"
+        class="v2-icon-toggle"
+        aria-label="Back"
+        disabled={!canGoBack()}
+        data-tip={canGoBack() ? "Back (⌘[)" : undefined}
+        data-tip-side="bottom"
+        onClick={goBack}
+      >
+        <BackIcon />
+      </button>
+      <button
+        type="button"
+        class="v2-icon-toggle"
+        aria-label="Forward"
+        disabled={!canGoForward()}
+        data-tip={canGoForward() ? "Forward (⌘])" : undefined}
+        data-tip-side="bottom"
+        onClick={goForward}
+      >
+        <ForwardIcon />
+      </button>
+    </div>
+  );
+
+  // ----- Sidebar view state (session-only; the record lives in the practice store) -----
+  const stageUnitId = () => (practice.state.stage.kind === "unit" ? practice.state.stage.unitId : null);
+  const isUnitActive = (id: string) => !practice.state.mapOpen && stageUnitId() === id;
+  const isPracticeActive = () => !practice.state.mapOpen && practice.state.stage.kind === "unit";
+
+  const [explorationsExpanded, setExplorationsExpanded] = createSignal(false);
+  const visibleExplorations = createMemo(() => {
+    const all = practice.state.explorations;
+    if (explorationsExpanded() || all.length <= EXPLORATION_LIMIT) return all;
+    const head = all.slice(0, EXPLORATION_SHOWN);
+    const stage = practice.state.stage;
+    const activeId = stage.kind === "exploration" ? stage.explorationId : null;
+    const active = activeId ? all.find((e) => e.id === activeId) : undefined;
+    return active && !head.includes(active) ? [...head, active] : head;
+  });
+  const hiddenExplorations = () => practice.state.explorations.length - visibleExplorations().length;
+
+  const [queueOpen, setQueueOpen] = createSignal(false);
+  const [queueShowAll, setQueueShowAll] = createSignal(false);
+  const visibleQueueItems = createMemo(() => {
+    const items = practice.dueQueue();
+    if (queueShowAll() || items.length <= QUEUE_LIMIT) return items;
+    const id = stageUnitId();
+    const activeIdx = id ? items.findIndex((u) => u.unit_id === id) : -1;
+    const shown = Math.max(QUEUE_SHOWN, activeIdx + 1);
+    return items.length - shown <= 1 ? items : items.slice(0, shown);
+  });
+  const hiddenQueueItems = () => practice.dueQueue().length - visibleQueueItems().length;
+
+  const openPractice = () => {
+    if (isPracticeActive()) {
+      if (practice.dueQueue().length > 0) setQueueOpen((v) => !v);
+      return;
+    }
+    if (practice.state.stage.kind === "unit") {
+      practice.setMapOpen(false);
+      closeSidebarOnNarrow();
+      return;
+    }
+    const target = practice.dueQueue()[0] ?? practice.state.queue[0];
+    if (target) {
+      practice.selectUnit(target.unit_id);
+      closeSidebarOnNarrow();
+    } else {
+      setQueueOpen((v) => !v);
+    }
+  };
+
+  const drillRow = (u: QueueUnit, done = false) => {
+    const isActive = () => isUnitActive(u.unit_id);
+    const isDone = () => done || practice.state.justCompletedId === u.unit_id;
+    return (
+      <button
+        type="button"
+        class={{ "v2-sb-item": true, "is-active": isActive(), "is-done": isDone() }}
+        aria-current={isActive() ? "true" : undefined}
+        onClick={() => {
+          practice.selectUnit(u.unit_id);
+          closeSidebarOnNarrow();
+        }}
+      >
+        <span class="v2-sb-text">
+          {formatSidebarDrillLabel(practice.sidebarLabel(u), [u.topic || u.kind, u.depth].filter(Boolean).join(" · "))}
+        </span>
+      </button>
+    );
+  };
 
   return (
     <PracticeContext value={practice}>
       <div class={{ "v2-workspace": true, "has-sidebar": sidebarOpen() }}>
-        <aside class="v2-sidebar" aria-label="Up next" aria-hidden={sidebarOpen() ? "false" : "true"}>
-          <div class="v2-sidebar-head">
-            <span class="v2-sidebar-title">Up next</span>
-            <Show when={practice.remainingCount() > 0}>
-              <span class="v2-sidebar-count">{practice.remainingCount()}</span>
-            </Show>
+        <aside class="v2-sidebar" aria-label="Explorations and practice" aria-hidden={sidebarOpen() ? "false" : "true"}>
+          <div class="v2-sb-chrome">
+            <NavChrome />
           </div>
-
           <div class="v2-sidebar-list">
-            <Show
-              when={practice.dueQueue().length > 0}
-              fallback={
-                <p class="v2-sidebar-empty">
-                  {practice.doneQueue().length > 0
-                    ? practice.soonestNextMs() !== null
-                      ? `All caught up — next recall in ~${fmtWait(practice.soonestNextMs()!)}. Start an exploration or check Done below.`
-                      : "All caught up for now. Start an exploration or check Done below."
-                    : "Nothing queued yet. Explore something new to build your map."}
-                </p>
-              }
-            >
-              <For each={practice.dueQueue()}>
-                {(u) => {
-                  const isActive = () =>
-                    !practice.state.mapOpen && practice.state.stage.kind === "unit" && practice.state.stage.unitId === u.unit_id;
-                  const isDone = () => practice.state.justCompletedId === u.unit_id;
-                  return (
+            <section class="v2-sb-section">
+              <div class={{ "v2-sb-practice-row": true, "is-active": isPracticeActive(), "is-open": queueOpen() }}>
+                <button
+                  type="button"
+                  class="v2-sb-practice-chev"
+                  aria-label={queueOpen() ? "Collapse practice queue" : "Expand practice queue"}
+                  aria-expanded={queueOpen() ? "true" : "false"}
+                  disabled={practice.dueQueue().length === 0}
+                  onClick={() => setQueueOpen((v) => !v)}
+                >
+                  <ChevronIcon />
+                </button>
+                <button
+                  type="button"
+                  class="v2-sb-practice-main"
+                  disabled={practice.state.queue.length === 0}
+                  onClick={openPractice}
+                >
+                  <span class="v2-sb-nav-label">Practice</span>
+                  <Show when={practice.remainingCount() > 0}>
+                    <span class="v2-sidebar-count">{practice.remainingCount()}</span>
+                  </Show>
+                </button>
+              </div>
+              <Show when={queueOpen() && practice.dueQueue().length > 0}>
+                <div class="v2-sb-fold-list">
+                  <For each={visibleQueueItems()}>{(u) => drillRow(u)}</For>
+                  <Show when={hiddenQueueItems() > 0 || (queueShowAll() && practice.dueQueue().length > QUEUE_LIMIT)}>
                     <button
                       type="button"
-                      class={{ "v2-sb-item": true, "is-active": isActive(), "is-done": isDone() }}
-                      onClick={() => {
-                        practice.selectUnit(u.unit_id);
-                        closeSidebarOnNarrow();
-                      }}
+                      class="v2-sb-more"
+                      onClick={() => setQueueShowAll((v) => !v)}
                     >
-                      <span class="v2-sb-bar" style={{ opacity: isDone() ? 0.85 : strengthOpacity(u) }} />
-                      <span class="v2-sb-text">{inline(practice.sidebarLabel(u))}</span>
+                      {hiddenQueueItems() > 0 ? `Show ${hiddenQueueItems()} more` : "Show less"}
                     </button>
-                  );
-                }}
-              </For>
-            </Show>
+                  </Show>
+                </div>
+              </Show>
+            </section>
 
-            <Show when={practice.state.explorations.length > 0}>
-              <div class="v2-sb-briefings">
+            <section class="v2-sb-section">
+              <div class="v2-sb-block">
                 <div class="v2-sb-section-head">
                   <span class="v2-sidebar-title">Explorations</span>
+                  <button
+                    type="button"
+                    class={{
+                      "v2-sb-head-add": true,
+                      "is-active": !practice.state.mapOpen && practice.state.stage.kind === "explore",
+                    }}
+                    aria-label="New exploration"
+                    data-tip="New exploration"
+                    onClick={() => {
+                      practice.selectExplore();
+                      closeSidebarOnNarrow();
+                    }}
+                  >
+                    <PlusIcon />
+                  </button>
                 </div>
-                <For each={practice.state.explorations}>
-                  {(e) => {
-                    const isActive = () =>
-                      !practice.state.mapOpen &&
-                      practice.state.stage.kind === "exploration" &&
-                      practice.state.stage.explorationId === e.id;
-                    return (
-                      <div class={{ "v2-sb-briefing-row": true, "is-active": isActive() }}>
-                        <button
-                          type="button"
-                          class={{ "v2-sb-item": true, "is-active": isActive() }}
-                          title={e.title}
-                          onClick={() => {
-                            practice.selectExploration(e.id);
-                            closeSidebarOnNarrow();
-                          }}
-                        >
-                          <span class="v2-sb-bar" style={{ opacity: isActive() ? 1 : 0.35 }} />
-                          <span class="v2-sb-text">{inline(e.title)}</span>
-                        </button>
-                        <button
-                          type="button"
-                          class="v2-sb-frontier-rm"
-                          aria-label={`Archive ${e.title}`}
-                          title="Archive exploration (kept in Archived)"
-                          onClick={() => void practice.archiveExplorationById(e.id)}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    );
-                  }}
-                </For>
-              </div>
-            </Show>
-
-            <Show when={practice.state.frontiers.length > 0}>
-              <div class="v2-sb-briefings">
-                <div class="v2-sb-section-head">
-                  <span class="v2-sidebar-title">Briefings</span>
-                </div>
-                <For each={practice.state.frontiers}>
-                  {(f) => {
-                    const isActive = () =>
-                      !practice.state.mapOpen && practice.state.stage.kind === "frontier" && practice.state.stage.frontierId === f.id;
-                    return (
-                      <div class={{ "v2-sb-briefing-row": true, "is-active": isActive() }}>
-                        <button
-                          type="button"
-                          class={{ "v2-sb-item": true, "is-active": isActive() }}
-                          title={f.title}
-                          onClick={() => {
-                            practice.selectFrontier(f.id);
-                            closeSidebarOnNarrow();
-                          }}
-                        >
-                          <span class="v2-sb-bar" style={{ opacity: isActive() ? 1 : 0.35 }} />
-                          <span class="v2-sb-text">{inline(f.title)}</span>
-                        </button>
-                        <button
-                          type="button"
-                          class="v2-sb-frontier-rm"
-                          aria-label={`Remove ${f.title}`}
-                          title="Remove briefing"
-                          onClick={() => void practice.removeFrontierById(f.id)}
-                        >
-                          ×
-                        </button>
-                      </div>
-                    );
-                  }}
-                </For>
-              </div>
-            </Show>
-
-            <Show when={practice.doneQueue().length > 0}>
-              <div class="v2-sb-done-wrap">
-                <button
-                  type="button"
-                  class={{ "v2-sb-done-toggle": true, "is-open": practice.state.doneOpen }}
-                  aria-expanded={practice.state.doneOpen ? "true" : "false"}
-                  onClick={() => practice.setDoneOpen((v) => !v)}
-                >
-                  <svg class="v2-sb-done-chev" width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M4.5 2.75L7.75 6 4.5 9.25" />
-                  </svg>
-                  <span>Done</span>
-                  <span class="v2-sidebar-count">{practice.doneQueue().length}</span>
-                </button>
-                <Show when={practice.state.doneOpen}>
-                  <div class="v2-sb-done-list">
-                    <For each={practice.doneQueue()}>
-                      {(u) => {
-                        const isActive = () =>
-                          !practice.state.mapOpen && practice.state.stage.kind === "unit" && practice.state.stage.unitId === u.unit_id;
-                        return (
+                <Show when={practice.state.explorations.length > 0}>
+                  <For each={visibleExplorations()}>
+                    {(e) => {
+                      const isActive = () =>
+                        !practice.state.mapOpen &&
+                        practice.state.stage.kind === "exploration" &&
+                        practice.state.stage.explorationId === e.id;
+                      return (
+                        <div class="v2-sb-row">
                           <button
                             type="button"
-                            class={{ "v2-sb-item": true, "is-active": isActive(), "is-done": true }}
+                            class={{ "v2-sb-item": true, "is-active": isActive() }}
+                            aria-current={isActive() ? "true" : undefined}
                             onClick={() => {
-                              practice.selectUnit(u.unit_id);
+                              practice.selectExploration(e.id);
                               closeSidebarOnNarrow();
                             }}
                           >
-                            <span class="v2-sb-bar" style={{ opacity: 0.75 }} />
-                            <span class="v2-sb-text">{inline(practice.sidebarLabel(u))}</span>
-                          </button>
-                        );
-                      }}
-                    </For>
-                  </div>
-                </Show>
-              </div>
-            </Show>
-
-            <Show when={practice.state.archivedExplorations.length > 0}>
-              <div class="v2-sb-done-wrap">
-                <button
-                  type="button"
-                  class={{ "v2-sb-done-toggle": true, "is-open": practice.state.archivedOpen }}
-                  aria-expanded={practice.state.archivedOpen ? "true" : "false"}
-                  onClick={() => practice.setArchivedOpen((v) => !v)}
-                >
-                  <svg class="v2-sb-done-chev" width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M4.5 2.75L7.75 6 4.5 9.25" />
-                  </svg>
-                  <span>Archived</span>
-                  <span class="v2-sidebar-count">{practice.state.archivedExplorations.length}</span>
-                </button>
-                <Show when={practice.state.archivedOpen}>
-                  <div class="v2-sb-done-list">
-                    <For each={practice.state.archivedExplorations}>
-                      {(e) => (
-                        <div class="v2-sb-briefing-row">
-                          <button
-                            type="button"
-                            class="v2-sb-item is-done"
-                            title={`Reopen "${e.title}"`}
-                            onClick={() => {
-                              void practice.unarchiveExplorationById(e.id);
-                              closeSidebarOnNarrow();
-                            }}
-                          >
-                            <span class="v2-sb-bar" style={{ opacity: 0.35 }} />
-                            <span class="v2-sb-text">{inline(e.title)}</span>
+                            <span class="v2-sb-text">{plainSidebarText(e.title)}</span>
                           </button>
                           <button
                             type="button"
-                            class="v2-sb-frontier-rm"
-                            aria-label={`Start new exploration from ${e.title}`}
-                            title="Start new exploration with this context"
-                            onClick={() => {
-                              practice.startExplorationFrom(e);
-                              closeSidebarOnNarrow();
-                            }}
+                            class="v2-sb-act"
+                            aria-label={`Archive ${plainSidebarText(e.title)}`}
+                            data-tip="Archive exploration"
+                            onClick={() => void practice.archiveExplorationById(e.id)}
                           >
-                            ↗
+                            <ArchiveIcon />
                           </button>
                         </div>
-                      )}
-                    </For>
-                  </div>
+                      );
+                    }}
+                  </For>
+                  <Show when={practice.state.explorations.length > EXPLORATION_LIMIT}>
+                    <button
+                      type="button"
+                      class="v2-sb-more"
+                      aria-expanded={explorationsExpanded() ? "true" : "false"}
+                      onClick={() => setExplorationsExpanded((v) => !v)}
+                    >
+                      {explorationsExpanded() ? "Show less" : `${hiddenExplorations()} more`}
+                    </button>
+                  </Show>
                 </Show>
               </div>
-            </Show>
-          </div>
 
-          <div class="v2-sidebar-foot">
-            <button
-              type="button"
-              class={{ "v2-sb-explore": true, "is-active": !practice.state.mapOpen && practice.state.stage.kind === "explore" }}
-              onClick={() => {
-                practice.selectExplore();
-                closeSidebarOnNarrow();
-              }}
-            >
-              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
-                <path d="M7 2.5v9M2.5 7h9" />
-              </svg>
-              New exploration
-            </button>
+              <Show when={practice.state.frontiers.length > 0}>
+                <div class="v2-sb-block">
+                  <div class="v2-sb-section-head">
+                    <span class="v2-sidebar-title">Briefings</span>
+                  </div>
+                  <For each={practice.state.frontiers}>
+                    {(f) => {
+                      const isActive = () =>
+                        !practice.state.mapOpen && practice.state.stage.kind === "frontier" && practice.state.stage.frontierId === f.id;
+                      return (
+                        <div class="v2-sb-row">
+                          <button
+                            type="button"
+                            class={{ "v2-sb-item": true, "is-active": isActive() }}
+                            aria-current={isActive() ? "true" : undefined}
+                            onClick={() => {
+                              practice.selectFrontier(f.id);
+                              closeSidebarOnNarrow();
+                            }}
+                          >
+                            <span class="v2-sb-text">{plainSidebarText(f.title)}</span>
+                          </button>
+                          <button
+                            type="button"
+                            class="v2-sb-act"
+                            aria-label={`Remove ${plainSidebarText(f.title)}`}
+                            data-tip="Remove briefing"
+                            onClick={() => void practice.removeFrontierById(f.id)}
+                          >
+                            <CloseIcon />
+                          </button>
+                        </div>
+                      );
+                    }}
+                  </For>
+                </div>
+              </Show>
+            </section>
+
+            <Show when={practice.doneQueue().length > 0 || practice.state.archivedExplorations.length > 0}>
+              <section class="v2-sb-section">
+                <Show when={practice.doneQueue().length > 0}>
+                  <button
+                    type="button"
+                    class={{ "v2-sb-fold": true, "is-open": practice.state.doneOpen }}
+                    aria-expanded={practice.state.doneOpen ? "true" : "false"}
+                    onClick={() => practice.setDoneOpen((v) => !v)}
+                  >
+                    <span class="v2-sb-slot">
+                      <ChevronIcon />
+                    </span>
+                    <span class="v2-sb-fold-title">Done</span>
+                    <span class="v2-sidebar-count">{practice.doneQueue().length}</span>
+                  </button>
+                  <Show when={practice.state.doneOpen}>
+                    <div class="v2-sb-fold-list">
+                      <For each={practice.doneQueue()}>{(u) => drillRow(u, true)}</For>
+                    </div>
+                  </Show>
+                </Show>
+
+                <Show when={practice.state.archivedExplorations.length > 0}>
+                  <button
+                    type="button"
+                    class={{ "v2-sb-fold": true, "is-open": practice.state.archivedOpen }}
+                    aria-expanded={practice.state.archivedOpen ? "true" : "false"}
+                    onClick={() => practice.setArchivedOpen((v) => !v)}
+                  >
+                    <span class="v2-sb-slot">
+                      <ChevronIcon />
+                    </span>
+                    <span class="v2-sb-fold-title">Archived</span>
+                    <span class="v2-sidebar-count">{practice.state.archivedExplorations.length}</span>
+                  </button>
+                  <Show when={practice.state.archivedOpen}>
+                    <div class="v2-sb-fold-list">
+                      <For each={practice.state.archivedExplorations}>
+                        {(e) => (
+                          <div class="v2-sb-row">
+                            <button
+                              type="button"
+                              class="v2-sb-item is-done"
+                              onClick={() => {
+                                void practice.unarchiveExplorationById(e.id);
+                                closeSidebarOnNarrow();
+                              }}
+                            >
+                              <span class="v2-sb-text">{plainSidebarText(e.title)}</span>
+                            </button>
+                            <button
+                              type="button"
+                              class="v2-sb-act"
+                              aria-label={`Start new exploration from ${plainSidebarText(e.title)}`}
+                              data-tip="Start new exploration with this context"
+                              onClick={() => {
+                                practice.startExplorationFrom(e);
+                                closeSidebarOnNarrow();
+                              }}
+                            >
+                              <BranchIcon />
+                            </button>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </Show>
+              </section>
+            </Show>
           </div>
         </aside>
 
@@ -449,19 +696,11 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
 
         <div class="v2-main">
           <header class="v2-topbar">
-            <button
-              type="button"
-              class="v2-icon-toggle"
-              aria-label={sidebarOpen() ? "Hide queue" : "Show queue"}
-              aria-pressed={sidebarOpen() ? "true" : "false"}
-              title="Toggle sidebar (⌘\)"
-              onClick={() => setSidebarOpen((v) => !v)}
-            >
-              <svg width="16" height="16" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="2.5" y="3" width="13" height="12" rx="2.5" />
-                <path d="M6.75 3v12" />
-              </svg>
-            </button>
+            <div class="v2-topbar-left">
+              <Show when={!sidebarOpen() || narrow()}>
+                <NavChrome />
+              </Show>
+            </div>
 
             <div class="v2-topbar-right">
               <Show when={run()}>{(r) => <RunClock run={r()} now={clockNow()} />}</Show>
@@ -469,7 +708,8 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                 type="button"
                 class={{ "v2-map-toggle": true, "is-active": practice.state.mapOpen }}
                 aria-pressed={practice.state.mapOpen ? "true" : "false"}
-                title="Toggle Map (⌘M)"
+                data-tip="Toggle Map (⌘M)"
+                data-tip-side="bottom"
                 onClick={() => practice.setMapOpen((v) => !v)}
               >
                 Map

@@ -141,6 +141,31 @@ export function buildAnnotatedLines(
   return { lines, matchedCount: resolved.length };
 }
 
+/** Splits a live edit draft into plain and highlighted segments for unresolved action pins (slip / question). */
+export function buildEditHighlightSegments(
+  draft: string,
+  annotations: readonly InlineAnnotation[],
+): { text: string; kind?: "slip" | "question" }[] {
+  const hits: { start: number; end: number; kind: "slip" | "question" }[] = [];
+  for (const ann of annotations) {
+    if (ann.kind === "move") continue;
+    const hit = locateAnnotation(draft, ann.quote);
+    if (!hit) continue;
+    if (hits.some((h) => hit.start < h.end && hit.end > h.start)) continue;
+    hits.push({ start: hit.start, end: hit.end, kind: ann.kind });
+  }
+  hits.sort((a, b) => a.start - b.start);
+  const out: { text: string; kind?: "slip" | "question" }[] = [];
+  let pos = 0;
+  for (const h of hits) {
+    if (h.start > pos) out.push({ text: draft.slice(pos, h.start) });
+    out.push({ text: draft.slice(h.start, h.end), kind: h.kind });
+    pos = h.end;
+  }
+  if (pos < draft.length) out.push({ text: draft.slice(pos) });
+  return out;
+}
+
 /** True when the learner has edited/removed the flagged substring in their living draft. */
 export function isAnnotationEdited(draft: string, quote: string): boolean {
   return locateAnnotation(draft, quote) === null;

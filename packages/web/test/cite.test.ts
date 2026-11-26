@@ -30,4 +30,17 @@ describe("citations", () => {
   it("normalizes copied whitespace without collapsing paragraphs", () => {
     expect(normalizeCitedText("  hello   world \n\n\n  next   line  ")).toBe("hello world\n\nnext line");
   });
+
+  it("formats 1-click ??? confused annotations alongside normal citations and main reply", () => {
+    const out = formatCitedMessage(
+      [
+        { id: "c1", kind: "confused", text: "Poisson–multinomial", comment: "" },
+        { id: "c2", kind: "confused", text: "$\\hat{y}_i / \\sum_j \\hat{y}_j$", comment: "why normalize?" },
+      ],
+      "Maybe so huge counts don't dominate?",
+    );
+    expect(out).toBe(
+      "> Poisson–multinomial\n[I don't understand this]\n\n> $\\hat{y}_i / \\sum_j \\hat{y}_j$\n[I don't understand this] why normalize?\n\nMaybe so huge counts don't dominate?",
+    );
+  });
 });

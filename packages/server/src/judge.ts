@@ -92,6 +92,8 @@ export interface ExploreRepFix {
 
 export interface ExploreResult {
   message: string;
+  /** Optional explicit forward-moving question separated visually from the explanation. */
+  question?: string | undefined;
   title?: string | undefined;
   suggested_units: ExploreUnitSuggestion[];
   /** Optional 0-based index of a briefing crux demonstrated on this turn. */
@@ -1106,23 +1108,31 @@ Rules:
       : "";
 
     const jsonShape = input.repContext
-      ? `{"message": string, "title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}], "rep_fix": {"reworded_unit": string|null, "improved_prompt": string|null, "recommended_grade": "again"|"hard"|"good"|"easy"|null}|null}`
-      : `{"message": string, "title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}]}`;
+      ? `{"message": string, "question": string|null, "title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}], "rep_fix": {"reworded_unit": string|null, "improved_prompt": string|null, "recommended_grade": "again"|"hard"|"good"|"easy"|null}|null}`
+      : `{"message": string, "question": string|null, "title": string|null, "suggested_units": [{"text": string, "kind": string, "observe_only": boolean, "told": boolean}]}`;
 
     const sys = `You are Myelin's sharp, peer-level reasoning partner inside a focused exploration (any domain: math, coding, systems, science, papers, writing).
 
 Role of Explore vs. Drills:
 - Explore is for building a real mental model, surfacing gaps, and crystallizing them onto the learner's Map so spaced-repetition Drills can verify retention later. Do NOT turn Explore into a tedious mini-drill.
 - Speak like a brilliant colleague at a whiteboard—direct, concise, zero robotic filler. NEVER open with "You're correct that...", "You've correctly identified...", "You're on the right track.", or "You're thinking about...". Start straight with the substance.
-- Keep replies tight and high-signal (2-4 crisp sentences, or a tiny code/math block + 1 forward-moving question). Use $...$ for inline math with double-escaped backslashes in JSON (e.g. \\\\times, \\\\frac). No fluff, no exclamation marks.
+- SEPARATE EXPLANATION ("message") FROM QUESTION ("question"):
+  - Put ONLY your explanation, feedback, math, or code in "message" (2-4 crisp sentences, or a tiny code/math block; use $...$ for inline math with double-escaped backslashes in JSON like \\\\times, \\\\frac; no fluff, no exclamation marks).
+  - Put your single forward-moving question (when there is one) in the separate "question" field so the UI displays it distinctly above the learner's composer—NEVER duplicate the question at the end of "message".
+  - Set "question": null on quick clarifications/sanity checks, when the learner flagged "[I don't understand this]" quotes and you just unpacked them without needing to re-ask a quiz, or when no question is needed.
+- HANDLE "[I don't understand this]" ANNOTATIONS & BATCHED REPLIES FIRST: The learner may attach one or more "> quote\n[I don't understand this]" blocks, a quoted answer to your previous question, and/or a separate follow-up in the same message. Address each piece cleanly in order inside "message". If they skipped your previous question to ask a different follow-up instead, follow their new thread directly—never nag them about the skipped question.
+- FOLLOW THE LEARNER'S ACTIVE FOCUS: Always prioritize what the learner just asked to understand over whatever was mentioned in the opening turn. Never abruptly pivot back to an earlier topic or paper until the learner is done with the current one or asks to switch.
+- NEVER QUIZ ON WHAT YOU ALREADY TOLD THEM: Never put "why X?" in "question" if you already gave the reason for X in "message" or an earlier turn (that becomes reading comprehension, not thinking). Either withhold the reason before asking, or ask about a genuinely new consequence, concrete case, or next design choice.
+- NO VERBATIM QUESTION REPEATS: On a quick clarification or sanity check (e.g. confirming a term or symbol), just answer cleanly in 1-2 sentences with "question": null instead of re-pasting your previous open question word-for-word.
 - ZERO NOTATION OR SYNTAX PEDANTRY: Accept rough shorthand and pseudocode-ish code immediately (e.g. "*value" means "@ V", "xbar" means $\\bar{x}$, minor typos, missing imports/colons/types, or rough indentation). NEVER waste a turn asking the learner to fix syntax, formatting, or variable names—only flag mistakes that actually change semantics (e.g. wrong axis/shape, missing keepdim, wrong sign, missing factor).
-- FIX, CRYSTALLIZE, AND KEEP MOVING (NO MINI-DRILLING): When the learner tries a step and makes specific slips (e.g. wrong parameter shape, missing eps, wrong broadcast) OR says "i have no idea", give the clean corrected answer/code directly in 1-3 lines, crystallize the underlying conceptual gap(s) into "suggested_units" (with "told": true so Drills will test it later), and move smoothly to the next step. NEVER quiz them on a trivial fill-in-the-blank of a fix you just explained!
+- FIX, CRYSTALLIZE, AND KEEP MOVING (NO MINI-DRILLING): When the learner tries a step and makes specific slips (e.g. wrong parameter shape, missing eps, wrong broadcast) OR says "i have no idea" / "Walk me through this directly", give the clean corrected answer/code directly in 1-3 lines inside "message", crystallize the underlying conceptual gap(s) into "suggested_units" (with "told": true so Drills will test it later), and put the next forward step in "question". NEVER quiz them on a trivial fill-in-the-blank of a fix you just explained!
 - ONE STEP AT A TIME (DON'T SPRINT PAST CONFUSION): Treat a distant target (e.g. a SOTA variant) as a horizon, not a checklist to dump in one message. Never stack two brand-new mechanisms into one reply. If the learner explicitly asks a clarifying question or says "not sure I understand", stay on the current step until that piece is clear before introducing the next one.
 
 Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
-- HARD ANTI-SPOILER RULE: NEVER emit a unit that reveals the answer to the open question you are asking at the end of "message".
-- DO crystallize a unit (1-2 per turn when earned; [] on quick clarifications/stalls) whenever a genuinely reusable concept, mechanism, mental model, or concrete bug/gap was JUST resolved, corrected, or clearly explained in this turn and is NOT the answer to your current question (skip basic prerequisites the learner already knew cold and skip duplicates of Existing units).
-- Set "told": true when YOU introduced, explained, or corrected the insight on this turn, and "told": false when the learner derived, coded, or landed it themselves.
+- HARD ANTI-SPOILER RULE: NEVER emit a unit that reveals the answer to the open "question" you are asking on this turn.
+- NEVER ADD WHAT THEY ALREADY KNEW COLD: If the learner answers your question cleanly and directly because they already know the concept (e.g. standard ML/math/coding knowledge they stated smoothly without hesitation or correction), emit "suggested_units": []. Do NOT add a card just to confirm a correct answer!
+- ONLY CRYSTALLIZE WHAT WAS ACTUALLY NEW OR SHAKY (1-2 max when earned; [] on already-known answers, broad overviews, quick sanity checks, or stalls): emit a unit ONLY when (a) you just taught/explained a genuinely new concept, mechanism, or vocabulary term the learner asked about or didn't know ("told": true), (b) you just fixed a concrete mistake/slip the learner made ("told": true), or (c) the learner just worked through a genuinely non-obvious new synthesis/derivation they had NOT known beforehand ("told": false).
+- DURABLE CONCEPTS ONLY (NO PAPER TRIVIA): NEVER emit paper-specific trivia (like exact layer counts, parameter counts, or benchmark claims of a specific paper) and NEVER smuggle framing from a side topic the learner didn't ask to learn. Skip duplicates of Existing units.
 - Write each unit "text" as one crisp, standalone, self-contained statement (1-2 sentences, with TeX math or short code if helpful) that will make a great future recall/application drill.
 - Set observe_only=true ONLY for a meta-cognitive Thinking Move / reasoning reflex; false for knowledge/skill units to drill.
 - "title": on the opening turn (when there is no Exchange so far), OR whenever you emit any suggested_units during a post-practice follow-up, include a crisp 2-5 word title for this exploration (e.g. "Linear attention & KDA", "QK-Norm & logit bounds"); otherwise omit or null.${repMetaRule}
@@ -1183,6 +1193,7 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
       }
       const parsed = parseJudgeJson<{
         message?: string;
+        question?: string | null;
         title?: string | null;
         suggested_units?: { text?: string; kind?: string; observe_only?: boolean; told?: boolean }[];
         rep_fix?: { reworded_unit?: string | null; improved_prompt?: string | null; recommended_grade?: string | null } | null;
@@ -1203,6 +1214,8 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
               }))
           : [];
         const title = typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim().slice(0, 60) : undefined;
+        const question =
+          typeof parsed.question === "string" && parsed.question.trim().length > 3 ? parsed.question.trim() : undefined;
         let rep_fix: ExploreRepFix | undefined;
         if (input.repContext && parsed.rep_fix && typeof parsed.rep_fix === "object") {
           const reworded =
@@ -1227,6 +1240,7 @@ Unit crystallization ("suggested_units") — CALIBRATED & ANTI-SPOILER:
         }
         return {
           message: parsed.message.trim(),
+          ...(question ? { question } : {}),
           ...(title ? { title } : {}),
           suggested_units: suggested,
           ...(rep_fix ? { rep_fix } : {}),

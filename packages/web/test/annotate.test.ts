@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { buildAnnotatedLines, isAnnotationEdited, isCoachMessageRedundant, locateAnnotation } from "../src/annotate.js";
+import {
+  buildAnnotatedLines,
+  buildEditHighlightSegments,
+  isAnnotationEdited,
+  isCoachMessageRedundant,
+  locateAnnotation,
+} from "../src/annotate.js";
 
 describe("inline annotation grounding", () => {
   it("locates exact and whitespace-tolerant substrings cleanly", () => {
@@ -44,5 +50,20 @@ describe("inline annotation grounding", () => {
         { quote, note: "Should this be minus?", kind: "slip" },
       ]),
     ).toBe(false);
+  });
+
+  it("splits live edit drafts into highlighted action spans and clears them once edited", () => {
+    const anns = [
+      { quote: "std (+eps)", note: "Check where ε sits relative to the square root.", kind: "slip" as const },
+      { quote: "learned gamma", note: "Good detail.", kind: "move" as const },
+    ];
+    const before = buildEditHighlightSegments("dividing by the std (+eps) and learned gamma", anns);
+    expect(before).toEqual([
+      { text: "dividing by the " },
+      { text: "std (+eps)", kind: "slip" },
+      { text: " and learned gamma" },
+    ]);
+    const after = buildEditHighlightSegments("dividing by sqrt(var + eps) and learned gamma", anns);
+    expect(after).toEqual([{ text: "dividing by sqrt(var + eps) and learned gamma" }]);
   });
 });

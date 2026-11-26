@@ -67,6 +67,7 @@ export interface StoredBriefingCrux {
 export interface StoredBriefingTurn {
   user: string;
   coach: string;
+  question?: string;
   added?: { unit_id: string; text: string; kind: string; observe_only: boolean }[];
 }
 

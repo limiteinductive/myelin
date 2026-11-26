@@ -5,8 +5,10 @@ import { uuidv7, type Grade } from "@myelin/core";
 import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, snapshot, Switch, useContext } from "solid-js";
 import {
   buildAnnotatedLines,
+  buildEditHighlightSegments,
   isAnnotationEdited,
   isCoachMessageRedundant,
+  locateAnnotation,
   type InlineAnnotation,
 } from "./annotate.js";
 import { citationLabel, extractSelectionText, formatCitedMessage, type Citation } from "./cite.js";
@@ -183,9 +185,14 @@ function BeatCitations(props: { items?: readonly Citation[] | undefined }) {
       <div class="v2-beat-cites">
         <For each={props.items ?? []} keyed={(c) => c.id}>
           {(c) => (
-            <div class="v2-beat-cite">
+            <div class={{ "v2-beat-cite": true, "is-confused": c().kind === "confused" }}>
               <div class="v2-beat-cite-quote">
-                <QuoteIcon />
+                <Show
+                  when={c().kind === "confused"}
+                  fallback={<QuoteIcon />}
+                >
+                  <span class="v2-cite-qmark" data-tip="I don't understand this">???</span>
+                </Show>
                 <span class="v2-beat-cite-text">{inline(c().text)}</span>
               </div>
               <Show when={c().comment.trim().length > 0}>
@@ -247,6 +254,7 @@ export function DrillView() {
   const [bumpOpen, setBumpOpen] = createSignal(false);
   const [editingBeatIdx, setEditingBeatIdx] = createSignal<number | null>(null);
   const [editDraft, setEditDraft] = createSignal("");
+  const [questionReply, setQuestionReply] = createSignal("");
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -361,6 +369,7 @@ export function DrillView() {
   let stageEl!: HTMLDivElement;
   let textarea!: HTMLTextAreaElement;
   let editTextarea!: HTMLTextAreaElement;
+  let questionInputEl: HTMLTextAreaElement | undefined;
   let postInputEl!: HTMLInputElement;
   let citeTextarea!: HTMLTextAreaElement;
   let padEl!: HTMLDivElement;
@@ -372,9 +381,15 @@ export function DrillView() {
 
   const autoGrow = () => {
     if (!textarea) return;
-    const minH = beats().length > 0 ? 78 : 140;
+    const minH = beats().length > 0 ? 36 : isExploreMode() ? 72 : 120;
     textarea.style.height = "auto";
     textarea.style.height = `${Math.min(360, Math.max(minH, textarea.scrollHeight))}px`;
+  };
+
+  const autoGrowQuestion = () => {
+    if (!questionInputEl) return;
+    questionInputEl.style.height = "auto";
+    questionInputEl.style.height = `${Math.min(160, Math.max(24, questionInputEl.scrollHeight))}px`;
   };
 
   const scrollPadIntoView = () => {
@@ -478,6 +493,7 @@ export function DrillView() {
     setPostBusy(false);
     setEditingBeatIdx(null);
     setEditDraft("");
+    setQuestionReply("");
     setCitePill(null);
     setCiteEditor(null);
     setCiteComment("");
@@ -647,11 +663,28 @@ export function DrillView() {
       setCitePill(null);
       return;
     }
-    const left = Math.min(window.innerWidth - 82, Math.max(82, rect.left + rect.width / 2));
+    const left = Math.min(window.innerWidth - 116, Math.max(116, rect.left + rect.width / 2));
     const below = rect.bottom + 10;
     const top = below > window.innerHeight - 48 ? Math.max(12, rect.top - 38) : below;
     setPinnedMap(false);
     setCitePill({ text, top, left });
+  };
+
+  const addConfusedCite = () => {
+    const pill = citePill();
+    if (!pill) return;
+    const key = sessionKey();
+    updateCitationsFor(key, (list) => {
+      list.push({ id: uuidv7(), kind: "confused", text: pill.text, comment: "" });
+    });
+    setCitePill(null);
+    setCiteEditor(null);
+    clearSelectedMath();
+    window.getSelection()?.removeAllRanges();
+    requestAnimationFrame(() => {
+      if (passedVerdict()?.ok) postInputEl?.focus();
+      else textarea?.focus();
+    });
   };
 
   const pinSelectionToMap = async () => {
@@ -830,7 +863,8 @@ export function DrillView() {
   const canSubmit = () => {
     if (busy()) return false;
     if (!isNonUnit() && passedVerdict()?.ok) return false;
-    return draft().trim().length > 0 || citations().length > 0 || (sketchOpen() && hasInk());
+    const hasQuestionAnswer = Boolean(activeExploreQuestion() && questionReply().trim().length > 0);
+    return draft().trim().length > 0 || hasQuestionAnswer || citations().length > 0 || (sketchOpen() && hasInk());
   };
 
   const triggerComplete = (
@@ -888,6 +922,7 @@ export function DrillView() {
     | {
         kind: "explore";
         message: string;
+        question?: string;
         added: AddedUnit[];
         frontier?: Frontier;
         exploration?: { id: string; title: string };
@@ -904,7 +939,8 @@ export function DrillView() {
       for (const b of cleanPrior) {
         const u = beatUserPayload(b);
         if (u) turns.push({ role: "user", text: u });
-        if (b.coach) turns.push({ role: "assistant", text: b.coach });
+        const coachFull = b.question ? `${b.coach}\n\n${b.question}` : b.coach;
+        if (coachFull) turns.push({ role: "assistant", text: coachFull });
       }
       const initial = cleanPrior.length === 0 ? opts.payloadText : beatUserPayload(cleanPrior[0]!);
       const priorAfterFirst = cleanPrior.length === 0 ? [] : turns.slice(1);
@@ -922,6 +958,7 @@ export function DrillView() {
       return {
         kind: "explore",
         message: res.message,
+        ...(res.question ? { question: res.question } : {}),
         added: res.added_units,
         frontier: res.frontier,
         exploration: res.exploration,
@@ -1004,16 +1041,25 @@ export function DrillView() {
     return { kind: "drill", res };
   };
 
-  const submitBeat = async () => {
-    if (!canSubmit()) return;
+  const submitBeat = async (overrideText?: string) => {
+    const hasOverride = typeof overrideText === "string" && overrideText.trim().length > 0;
+    if (!hasOverride && !canSubmit()) return;
+    if (hasOverride && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
     const ownerKey = sessionKey();
     const isFreshExplore = isExplore();
     const savedExp = activeExploration();
     const modeExplore = isExploreMode();
     const frontier = activeFrontier();
     const unitRep = rep();
-    const text = draft().trim();
-    const pendingCitations = snapshot(citations());
+    const prevDraft = draft().trim();
+    const text = hasOverride ? overrideText.trim() : prevDraft;
+    const activeQ = activeExploreQuestion();
+    const qAns = hasOverride ? "" : questionReply().trim();
+    const rawCitations = snapshot(citations());
+    const pendingCitations: Citation[] =
+      activeQ && qAns
+        ? [{ id: uuidv7(), text: activeQ, comment: qAns }, ...rawCitations]
+        : rawCitations;
     const payloadText = formatCitedMessage(pendingCitations, text);
     const sketch = exportSketch();
     const priorBeats = snapshot(beats());
@@ -1025,6 +1071,7 @@ export function DrillView() {
     activeAbort = ctrl;
     setCitePill(null);
     setCiteEditor(null);
+    setQuestionReply("");
     setBusy(true);
     setError(null);
 
@@ -1085,10 +1132,11 @@ export function DrillView() {
           if (idx >= 0) list.splice(idx, 1);
         });
         if (!disposed) {
-          setDraftFor(ownerKey, text);
-          if (pendingCitations.length > 0) {
+          setDraftFor(ownerKey, hasOverride ? prevDraft : text);
+          if (qAns) setQuestionReply(qAns);
+          if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
-              if (list.length === 0) list.push(...pendingCitations);
+              if (list.length === 0) list.push(...rawCitations);
             });
           }
         }
@@ -1109,6 +1157,7 @@ export function DrillView() {
       }
 
       const message = out.kind === "drill" ? out.res.message : out.message;
+      const question = out.kind === "explore" ? out.question : undefined;
       const annotations = out.kind === "drill" ? out.res.annotations : undefined;
       const added = out.kind === "drill" ? out.res.added_units : out.added;
       const failed = out.kind === "drill" ? Boolean(out.res.failed) : out.failed;
@@ -1118,6 +1167,7 @@ export function DrillView() {
         ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
         sketch,
         coach: message,
+        ...(question ? { question } : {}),
         ...(annotations && annotations.length > 0 ? { annotations } : {}),
         ...(added && added.length > 0 ? { added } : {}),
         ...(failed ? { failed: true } : {}),
@@ -1147,10 +1197,11 @@ export function DrillView() {
           if (idx >= 0) list.splice(idx, 1);
         });
         if (!disposed) {
-          setDraftFor(ownerKey, text);
-          if (pendingCitations.length > 0) {
+          setDraftFor(ownerKey, hasOverride ? prevDraft : text);
+          if (qAns) setQuestionReply(qAns);
+          if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
-              if (list.length === 0) list.push(...pendingCitations);
+              if (list.length === 0) list.push(...rawCitations);
             });
           }
         }
@@ -1255,6 +1306,7 @@ export function DrillView() {
       }
 
       const message = out.kind === "drill" ? out.res.message : out.message;
+      const question = out.kind === "explore" ? out.question : undefined;
       const annotations = out.kind === "drill" ? out.res.annotations : undefined;
       const added = out.kind === "drill" ? out.res.added_units : out.added;
       const failed = out.kind === "drill" ? Boolean(out.res.failed) : out.failed;
@@ -1266,6 +1318,7 @@ export function DrillView() {
             ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
             ...(target.sketch ? { sketch: target.sketch } : {}),
             coach: message,
+            ...(question ? { question } : {}),
             ...(annotations && annotations.length > 0 ? { annotations } : {}),
             ...(added && added.length > 0 ? { added } : {}),
             ...(failed ? { failed: true } : {}),
@@ -1354,6 +1407,24 @@ export function DrillView() {
     }
   };
 
+  let editBackdrop: HTMLDivElement | undefined;
+
+  const syncEditBackdropScroll = () => {
+    if (editBackdrop && editTextarea) {
+      editBackdrop.scrollTop = editTextarea.scrollTop;
+    }
+  };
+
+  const focusEditAnnotation = (quote: string) => {
+    if (!editTextarea) return;
+    const hit = locateAnnotation(editTextarea.value, quote);
+    editTextarea.focus();
+    if (hit) {
+      editTextarea.setSelectionRange(hit.start, hit.end);
+      syncEditBackdropScroll();
+    }
+  };
+
   const startEditingBeat = (beatIdx: number) => {
     if (busy() || isNonUnit() || passedVerdict()?.ok) return;
     const target = snapshot(beats())[beatIdx];
@@ -1362,12 +1433,21 @@ export function DrillView() {
     setCiteEditor(null);
     setEditDraft(target.user);
     setEditingBeatIdx(beatIdx);
+    const firstAction =
+      target.annotations?.find((a) => a.kind === "slip") ??
+      target.annotations?.find((a) => a.kind === "question");
+    const initialHit = firstAction ? locateAnnotation(target.user, firstAction.quote) : null;
     requestAnimationFrame(() => {
       autoGrowEdit();
       if (editTextarea) {
         editTextarea.focus();
-        const len = editTextarea.value.length;
-        editTextarea.setSelectionRange(len, len);
+        if (initialHit) {
+          editTextarea.setSelectionRange(initialHit.start, initialHit.end);
+        } else {
+          const len = editTextarea.value.length;
+          editTextarea.setSelectionRange(len, len);
+        }
+        syncEditBackdropScroll();
       }
     });
   };
@@ -1613,7 +1693,8 @@ export function DrillView() {
       if (b.pending || isFailedBeat(b)) continue;
       const u = beatUserPayload(b);
       if (u) priorTurns.push({ role: "user", text: u });
-      if (b.coach) priorTurns.push({ role: "assistant", text: b.coach });
+      const coachFull = b.question ? `${b.coach}\n\n${b.question}` : b.coach;
+      if (coachFull) priorTurns.push({ role: "assistant", text: coachFull });
     }
 
     const pendingId = uuidv7();
@@ -1656,6 +1737,7 @@ export function DrillView() {
           prior_post_turns: cleanPriorPost.map((b) => ({
             user: beatUserPayload(b),
             coach: b.coach,
+            ...(b.question ? { question: b.question } : {}),
             ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
           })),
           rep_context: {
@@ -1685,6 +1767,7 @@ export function DrillView() {
         user: q,
         ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
         coach: coachMessage,
+        ...(res.question ? { question: res.question } : {}),
         ...(res.added_units.length > 0 ? { added: res.added_units } : {}),
         ...(res.failed ? { failed: true } : {}),
       };
@@ -1784,6 +1867,7 @@ export function DrillView() {
         turns: promotedBeats.map((b) => ({
           user: beatUserPayload(b),
           coach: b.coach,
+          ...(b.question ? { question: b.question } : {}),
           ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
         })),
       });
@@ -1872,18 +1956,45 @@ export function DrillView() {
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
 
+  const activeExploreQuestion = () => {
+    if (!isExploreMode() || busy() || passedVerdict()?.ok || editingBeatIdx() !== null) return null;
+    const list = beats();
+    const last = list[list.length - 1];
+    if (!last || last.pending || isFailedBeat(last) || !last.question?.trim()) return null;
+    return last.question.trim();
+  };
+
+  const tellMeDirectly = () => {
+    if (busy()) return;
+    const msg = "Walk me through this directly.";
+    // If the learner is already drafting a follow-up in the main pad, queue this under the question
+    // so it batches cleanly with their follow-up; otherwise send immediately in 1 click.
+    if (draft().trim().length > 0) {
+      setQuestionReply(msg);
+      requestAnimationFrame(autoGrowQuestion);
+      return;
+    }
+    setQuestionReply(msg);
+    void submitBeat();
+  };
+
   const ComposerCitationChips = () => (
     <Show when={citations().length > 0}>
       <div class="v2-cite-chips">
         <For each={citations()} keyed={(c) => c.id}>
           {(c) => (
-            <span class="v2-cite-chip" title={c().text}>
+            <span
+              class={{ "v2-cite-chip": true, "is-confused": c().kind === "confused" }}
+              data-tip={c().kind === "confused" ? `I don't understand: ${c().text}` : c().text}
+            >
               <button
                 type="button"
                 class="v2-cite-chip-main"
                 onClick={(e) => openEditCiteEditor(c(), e.currentTarget)}
               >
-                <QuoteIcon />
+                <Show when={c().kind === "confused"} fallback={<QuoteIcon />}>
+                  <span class="v2-cite-qmark" aria-hidden="true">???</span>
+                </Show>
                 <span class="v2-cite-chip-label">{inline(citationLabel(c()))}</span>
                 <svg class="v2-cite-chip-edit" width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M11.5 2.5l2 2L5.5 12.5H3.5v-2l8-8z" />
@@ -1895,7 +2006,9 @@ export function DrillView() {
                 aria-label="Remove citation"
                 onClick={() => removeCitation(c().id)}
               >
-                ×
+                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                  <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
+                </svg>
               </button>
             </span>
           )}
@@ -1922,7 +2035,8 @@ export function DrillView() {
                     "is-current": isCurrent() && !isPop(),
                     "is-pop": isPop(),
                   }}
-                  title={item.text}
+                  data-tip={item.text}
+                  data-tip-side="bottom"
                   aria-label={item.text}
                   onClick={() => practice.selectUnit(item.unit_id)}
                 />
@@ -1932,7 +2046,8 @@ export function DrillView() {
           <button
             type="button"
             class={{ "v2-pip-plus": true, "is-active": isExplore() }}
-            title="New exploration"
+            data-tip="New exploration"
+            data-tip-side="bottom"
             aria-label="New exploration"
             aria-pressed={isExplore() ? "true" : "false"}
             onClick={() => {
@@ -2074,42 +2189,61 @@ export function DrillView() {
                       when={!isEditing()}
                       fallback={
                         <div class="v2-inline-edit v2-textured">
-                          <textarea
-                            ref={editTextarea}
-                            class="v2-pad-input v2-inline-edit-input"
-                            spellcheck="false"
-                            autocorrect="off"
-                            autocapitalize="off"
-                            value={editDraft()}
-                            onInput={(e) => {
-                              recordActivity();
-                              setEditDraft(e.currentTarget.value);
-                              autoGrowEdit();
-                            }}
-                            onKeyDown={(e) => {
-                              if (
-                                handlePadIndentKey(e, (next) => {
-                                  recordActivity();
-                                  setEditDraft(next);
-                                  autoGrowEdit();
-                                })
-                              ) {
-                                return;
-                              }
-                              if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
-                                e.preventDefault();
-                                void tidyPadText("edit");
-                                return;
-                              }
-                              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                                e.preventDefault();
-                                void submitEditedBeat(idx());
-                              } else if (e.key === "Escape") {
-                                e.preventDefault();
-                                cancelEditingBeat();
-                              }
-                            }}
-                          />
+                          <div class="v2-edit-area">
+                            <Show when={beat.annotations && beat.annotations.some((a) => a.kind !== "move")}>
+                              <div ref={editBackdrop} class="v2-edit-backdrop" aria-hidden="true">
+                                <For each={buildEditHighlightSegments(editDraft(), beat.annotations ?? [])}>
+                                  {(seg) =>
+                                    seg.kind ? (
+                                      <mark class={{ "v2-edit-mark": true, [`is-${seg.kind}`]: true }}>{seg.text}</mark>
+                                    ) : (
+                                      seg.text
+                                    )
+                                  }
+                                </For>
+                                {editDraft().endsWith("\n") ? " " : ""}
+                              </div>
+                            </Show>
+                            <textarea
+                              ref={editTextarea}
+                              class="v2-pad-input v2-inline-edit-input"
+                              spellcheck="false"
+                              autocorrect="off"
+                              autocapitalize="off"
+                              value={editDraft()}
+                              onScroll={syncEditBackdropScroll}
+                              onInput={(e) => {
+                                recordActivity();
+                                setEditDraft(e.currentTarget.value);
+                                autoGrowEdit();
+                                syncEditBackdropScroll();
+                              }}
+                              onKeyDown={(e) => {
+                                if (
+                                  handlePadIndentKey(e, (next) => {
+                                    recordActivity();
+                                    setEditDraft(next);
+                                    autoGrowEdit();
+                                    syncEditBackdropScroll();
+                                  })
+                                ) {
+                                  return;
+                                }
+                                if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
+                                  e.preventDefault();
+                                  void tidyPadText("edit");
+                                  return;
+                                }
+                                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                                  e.preventDefault();
+                                  void submitEditedBeat(idx());
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  cancelEditingBeat();
+                                }
+                              }}
+                            />
+                          </div>
                           <Show when={beat.annotations && beat.annotations.some((a) => a.kind !== "move")}>
                             <div class="v2-edit-pins">
                               <For each={(beat.annotations ?? []).filter((a) => a.kind !== "move")}>
@@ -2117,7 +2251,15 @@ export function DrillView() {
                                   const resolved = () => isAnnotationEdited(editDraft(), pin.quote);
                                   return (
                                     <div class={{ "v2-edit-pin": true, "is-resolved": resolved() }}>
-                                      <span class="v2-edit-pin-quote">{pin.quote}</span>
+                                      <button
+                                        type="button"
+                                        class={{ "v2-edit-pin-quote": true, [`is-${pin.kind}`]: true }}
+                                        disabled={resolved()}
+                                        data-tip={resolved() ? "Edited" : "Jump to this span"}
+                                        onClick={() => focusEditAnnotation(pin.quote)}
+                                      >
+                                        {pin.quote}
+                                      </button>
                                       <span class="v2-edit-pin-note">{inline(pin.note)}</span>
                                       <Show when={resolved()}>
                                         <span class="v2-edit-pin-state">Edited</span>
@@ -2137,7 +2279,7 @@ export function DrillView() {
                                 type="button"
                                 class="v2-btn-secondary"
                                 disabled={tidying() || busy()}
-                                title="Cosmetic format & typo tidy (⌘⇧F) — never changes your logic, ⌘Z undoes"
+                                data-tip="Format & typo tidy (⌘⇧F) · ⌘Z undoes"
                                 onClick={() => void tidyPadText("edit")}
                               >
                                 <Show
@@ -2171,7 +2313,7 @@ export function DrillView() {
                             <button
                               type="button"
                               class={{ "v2-beat-edit-btn": true, "is-suggested": annoSummary().hasActionPin }}
-                              title="Edit derivation in place"
+                              data-tip="Edit derivation in place"
                               onClick={() => startEditingBeat(idx())}
                             >
                               Edit
@@ -2259,6 +2401,19 @@ export function DrillView() {
                           </Match>
                         </Switch>
 
+                        <Show
+                          when={
+                            beat.question &&
+                            !beat.pending &&
+                            !failed() &&
+                            !(isExploreMode() && idx() === beats().length - 1 && activeExploreQuestion())
+                          }
+                        >
+                          <div class="v2-beat-question-past" data-citable="true">
+                            <Body text={beat.question!} />
+                          </div>
+                        </Show>
+
                         <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
 
                         <Show when={isFinalPass()}>
@@ -2279,7 +2434,7 @@ export function DrillView() {
                                     type="button"
                                     class={{ "v2-interval-btn": true, "is-open": bumpOpen() }}
                                     disabled={overriding()}
-                                    title="Adjust when this comes back"
+                                    data-tip="Adjust when this comes back"
                                     aria-expanded={bumpOpen() ? "true" : "false"}
                                     onClick={() => setBumpOpen((v) => !v)}
                                   >
@@ -2391,6 +2546,11 @@ export function DrillView() {
                             </div>
                           </Match>
                         </Switch>
+                        <Show when={beat.question && !beat.pending && !failed()}>
+                          <div class="v2-beat-question-past" data-citable="true">
+                            <Body text={beat.question!} />
+                          </div>
+                        </Show>
                         <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
                       </div>
                     </div>
@@ -2430,7 +2590,7 @@ export function DrillView() {
                 <button
                   type="button"
                   class="v2-post-promote"
-                  title="Continue this follow-up as a full exploration"
+                  data-tip="Continue as a full exploration"
                   onClick={() => void openPostAsExploration()}
                 >
                   Open as exploration ↗
@@ -2466,7 +2626,7 @@ export function DrillView() {
                     type="button"
                     class="v2-wrap-nudge-dismiss"
                     aria-label="Keep exploring for now"
-                    title="Keep exploring for now"
+                    data-tip="Keep exploring for now"
                     onClick={() => setWrapDismissed(true)}
                   >
                     ×
@@ -2477,6 +2637,84 @@ export function DrillView() {
           }}
         </Show>
 
+        {/* Explicit active question card in Explore mode: quiet header + inline batchable answer strip */}
+        <Show when={activeExploreQuestion()}>
+          {(q) => (
+            <div class={{ "v2-explore-q": true, "has-answer": questionReply().trim().length > 0 }}>
+              <div class="v2-explore-q-head">
+                <span class="v2-explore-q-label">Question</span>
+                <div class="v2-explore-q-actions">
+                  <Show
+                    when={questionReply().trim().length > 0}
+                    fallback={
+                      <button
+                        type="button"
+                        class="v2-explore-q-tell"
+                        disabled={busy()}
+                        data-tip={draft().trim() ? "Queue 'Tell me' with your follow-up" : "Walk me through this directly"}
+                        onClick={tellMeDirectly}
+                      >
+                        Tell me
+                      </button>
+                    }
+                  >
+                    <span class="v2-explore-q-queued" data-tip="Sent as an annotation with your reply (⌘↵)">
+                      Batched
+                    </span>
+                    <button
+                      type="button"
+                      class="v2-explore-q-clear"
+                      aria-label="Clear answer"
+                      data-tip="Clear answer"
+                      onClick={() => {
+                        setQuestionReply("");
+                        requestAnimationFrame(() => {
+                          autoGrowQuestion();
+                          questionInputEl?.focus();
+                        });
+                      }}
+                    >
+                      <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true">
+                        <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
+                      </svg>
+                    </button>
+                  </Show>
+                </div>
+              </div>
+              <div class="v2-explore-q-body" data-citable="true">
+                <Body text={q()} />
+              </div>
+              <div class="v2-explore-q-bar">
+                <textarea
+                  ref={questionInputEl}
+                  rows={1}
+                  class="v2-explore-q-input"
+                  placeholder="Answer this, or leave blank to skip…"
+                  spellcheck="false"
+                  autocorrect="off"
+                  autocapitalize="off"
+                  value={questionReply()}
+                  disabled={busy()}
+                  onInput={(e) => {
+                    setQuestionReply(e.currentTarget.value);
+                    autoGrowQuestion();
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void submitBeat();
+                    } else if (e.key === "Escape" && questionReply().length > 0) {
+                      e.preventDefault();
+                      setQuestionReply("");
+                      requestAnimationFrame(autoGrowQuestion);
+                    }
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </Show>
+
         {/* The ONE active pad at the bottom (hidden once rep passes or while editing a derivation in place) */}
         <Show when={!passedVerdict()?.ok && editingBeatIdx() === null}>
           <div
@@ -2485,6 +2723,7 @@ export function DrillView() {
               "v2-pad": true,
               "v2-textured": true,
               "is-compact": beats().length > 0,
+              "is-explore": isExploreMode() || Boolean(activeFrontier()),
               "is-checking": busy(),
             }}
           >
@@ -2494,13 +2733,15 @@ export function DrillView() {
                 ref={textarea}
                 class="v2-pad-input"
                 placeholder={
-                  beats().length > 0
-                    ? "Continue, answer, or ask…"
-                    : isExploreMode()
-                      ? "Drop a question, derivation, paper, file path, or topic to work through…"
-                      : activeFrontier()
-                        ? "Cite a line above, ask a question, or explain it back…"
-                        : "Write your attempt or ask anything…"
+                  activeExploreQuestion()
+                    ? "Ask a follow-up…"
+                    : beats().length > 0
+                      ? "Continue, or ask…"
+                      : isExploreMode()
+                        ? "Drop a question, derivation, paper, file path, or topic to work through…"
+                        : activeFrontier()
+                          ? "Cite a line above, ask a question, or explain it back…"
+                          : "Write your attempt or ask anything…"
                 }
                 spellcheck="false"
                 autocorrect="off"
@@ -2597,7 +2838,7 @@ export function DrillView() {
                     type="button"
                     class="v2-btn-secondary"
                     disabled={tidying() || busy()}
-                    title="Cosmetic format & typo tidy (⌘⇧F) — never changes your logic, ⌘Z undoes"
+                    data-tip="Format & typo tidy (⌘⇧F) · ⌘Z undoes"
                     onClick={() => void tidyPadText("main")}
                   >
                     <Show
@@ -2617,7 +2858,7 @@ export function DrillView() {
                   type="button"
                   class={{ "v2-btn-primary": true, "is-busy": busy() }}
                   disabled={!busy() && !canSubmit()}
-                  title={busy() ? "Click or press Esc to cancel" : undefined}
+                  data-tip={busy() ? "Click or press Esc to cancel" : undefined}
                   onClick={() => (busy() ? cancelPending() : void submitBeat())}
                 >
                   <Show
@@ -2652,7 +2893,7 @@ export function DrillView() {
         </Show>
       </Show>
 
-      {/* Floating T3-style selection pill: Cite or pin to Map */}
+      {/* Floating T3-style selection pill: Cite, ???, or pin to Map */}
       <Show when={citePill()}>
         {(pill) => (
           <div
@@ -2660,14 +2901,32 @@ export function DrillView() {
             style={{ top: `${pill().top}px`, left: `${pill().left}px` }}
             onMouseDown={(e) => e.preventDefault()}
           >
-            <button type="button" class="v2-cite-pill-btn" onClick={openNewCiteEditor}>
+            <button
+              type="button"
+              class="v2-cite-pill-btn"
+              data-tip="Quote with a note"
+              data-tip-side="bottom"
+              onClick={openNewCiteEditor}
+            >
               <QuoteIcon />
               <span>Cite</span>
             </button>
             <span class="v2-cite-pill-sep" aria-hidden="true" />
             <button
               type="button"
+              class="v2-cite-pill-btn is-confused"
+              data-tip="I don't understand this"
+              data-tip-side="bottom"
+              onClick={addConfusedCite}
+            >
+              <span class="v2-cite-pill-qmark">???</span>
+            </button>
+            <span class="v2-cite-pill-sep" aria-hidden="true" />
+            <button
+              type="button"
               class={{ "v2-cite-pill-btn": true, "is-done": pinnedMap() }}
+              data-tip="Add to map"
+              data-tip-side="bottom"
               disabled={pinningMap()}
               onClick={() => void pinSelectionToMap()}
             >

@@ -38,6 +38,8 @@ export interface Beat {
   citations?: Citation[];
   sketch?: string | null;
   coach: string;
+  /** Optional explicit forward-moving question from Explore mode (rendered in its own band). */
+  question?: string;
   annotations?: InlineAnnotation[];
   added?: AddedUnit[];
   pending?: boolean;
@@ -639,7 +641,12 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       const record: SavedExploration = {
         id: exp.id,
         title: exp.title,
-        turns: beats.map((b) => ({ user: b.user, coach: b.coach, ...(b.added ? { added: b.added } : {}) })),
+        turns: beats.map((b) => ({
+          user: b.user,
+          coach: b.coach,
+          ...(b.question ? { question: b.question } : {}),
+          ...(b.added ? { added: b.added } : {}),
+        })),
         created_at: now,
         updated_at: now,
       };
@@ -679,6 +686,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
         turns: promotedBeats.map((b) => ({
           user: b.user,
           coach: b.coach,
+          ...(b.question ? { question: b.question } : {}),
           ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
         })),
         created_at: now,
@@ -787,6 +795,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
             sess.beats = restored.turns.map((t) => ({
               user: t.user,
               coach: t.coach,
+              ...(t.question ? { question: t.question } : {}),
               ...(t.added && t.added.length > 0 ? { added: t.added } : {}),
             }));
             s.sessions[eKey] = sess;
@@ -1178,6 +1187,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
             restored.beats = e.turns.map((t) => ({
               user: t.user,
               coach: t.coach,
+              ...(t.question ? { question: t.question } : {}),
               ...(t.added && t.added.length > 0 ? { added: t.added } : {}),
             }));
             s.sessions[eKey] = restored;
@@ -1189,15 +1199,21 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
                 ...(existing.beats[i] ?? {}),
                 user: t.user,
                 coach: t.coach,
+                ...(t.question ? { question: t.question } : {}),
                 ...(t.added && t.added.length > 0 ? { added: t.added } : {}),
               }));
               stageChanged = true;
             } else {
               for (let i = 0; i < e.turns.length; i++) {
-                const srvAdded = e.turns[i]?.added;
+                const srvTurn = e.turns[i];
+                const srvAdded = srvTurn?.added;
                 const localBeat = existing.beats[i];
                 if (localBeat && srvAdded && srvAdded.length > (localBeat.added?.length ?? 0)) {
                   localBeat.added = srvAdded;
+                  stageChanged = true;
+                }
+                if (localBeat && srvTurn?.question && !localBeat.question) {
+                  localBeat.question = srvTurn.question;
                   stageChanged = true;
                 }
               }

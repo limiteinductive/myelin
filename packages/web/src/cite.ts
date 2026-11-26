@@ -6,6 +6,8 @@ export interface Citation {
   text: string;
   /** Optional learner-authored comment or question attached to this quote. */
   comment: string;
+  /** "confused" marks a 1-click `???` ("I don't understand this") annotation; defaults to "cite". */
+  kind?: "cite" | "confused";
 }
 
 function texOfMathEl(el: Element): string | null {
@@ -121,7 +123,11 @@ export function formatCitedMessage(citations: readonly Citation[], body: string)
       .map((line) => `> ${line}`)
       .join("\n");
     const comment = c.comment.trim();
-    parts.push(comment ? `${quoted}\n${comment}` : quoted);
+    if (c.kind === "confused") {
+      parts.push(comment ? `${quoted}\n[I don't understand this] ${comment}` : `${quoted}\n[I don't understand this]`);
+    } else {
+      parts.push(comment ? `${quoted}\n${comment}` : quoted);
+    }
   }
   const rest = body.trim();
   if (rest) parts.push(rest);

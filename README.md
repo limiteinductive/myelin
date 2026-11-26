@@ -1,32 +1,80 @@
-# Myelin handoff
+# Myelin
 
-Everything needed to start building Myelin with Claude Code, as of 20 November 2026.
+**Accelerating human understanding.**
 
-| Path | What it is |
+Myelin is a local-first, domain-agnostic workspace for learning hard ideas with an LLM—math, ML, research papers, codebases, systems, science, or writing. Instead of passive chat transcripts you forget by tomorrow, Myelin turns live exploration into durable understanding:
+
+- **Explore** — Work through papers, derivations, code, or concepts with a peer-level reasoning partner.
+  - Highlight any confusing phrase and click **`???`** (`Cite | ??? | + Map`) to queue a 1-click *"I don't understand this"* annotation alongside your other citations and main reply.
+  - Coach responses separate pure explanation from an explicit **Question** card with an inline batchable answer input, 1-click **Tell me**, or zero-friction skip when you want to pursue your own tangent.
+  - Only genuinely new concepts or real gaps get crystallized onto your knowledge map—never things you already knew cold.
+- **Practice** — Fast, targeted drills (`recall`, `rebuild`, `explain`, `use`) scheduled by **RWKV-Instant** with foundation-first DAG ordering.
+  - Grounded inline highlights anchor feedback directly to exact spans in your attempt, with in-place editing that highlights and jumps straight to unresolved slips.
+  - Optional cosmetic formatting (`Tidy ⌘⇧F`), sketch canvas, and self-healing post-pass follow-ups (clarify a rep, reword a unit, or adjust grading in place).
+- **Map & Learner Memory** — Inspect your concept dependency tree (`⌘M`), recall estimates, and a lean cognitive profile automatically consolidated via background **dreaming** (promoting recurring blind spots and pruning mastered ones).
+
+## Architecture
+
+TypeScript monorepo (`Node >= 22`):
+
+| Package | Role |
 | --- | --- |
-| `CLAUDE.md` | Instructions Claude Code reads on its own: settled decisions, product rules and how to work |
-| `docs/spec.md` | The design spec, version 0.2, including the nine-milestone build order |
-| `docs/storyboard.md` | The ten-moment user story in words |
-| `prompts/tutor.md` | First draft of the tutor's system prompt |
-| `design/` | The design system: rules, tokens, stylesheet, component guidelines with previews, and the logo files |
+| [`packages/core`](packages/core) | Event-sourced knowledge graph, spaced-repetition scheduler, unit/run state machine |
+| [`packages/server`](packages/server) | Hono HTTP + SSE server, SQLite store, RWKV-Instant recall scorer, System 1/2 judge cascade, Explore & Dream pipelines |
+| [`packages/web`](packages/web) | Solid 2.0 web app (Explore, Practice, Map, KaTeX math, selection citations, styled tooltips) |
+| [`packages/cli`](packages/cli) | `myelin` CLI (`up`, `deploy`, `invite`, `import`, `metrics`) |
 
-## Starting
+## Quick start
 
-1. Create an empty repository and copy this folder's contents into its root.
-2. Open Claude Code there and ask it to read `CLAUDE.md` and `docs/spec.md`, then implement milestone 1 (Core).
+```bash
+npm install
+cp .env.example .env
+# Add your model key in .env (e.g. GEMINI_API_KEY or MYELIN_MODEL)
+npm run build
+node packages/cli/dist/main.js up
+```
 
-## Keeping it current
+Then open the one-time sign-in link printed in the terminal (default `http://127.0.0.1:4317`).
 
-`docs/spec.md` and `design/` are snapshots of two living documents:
+For local development with automatic server reloads after rebuilds:
 
-- Spec: https://claude.ai/artifact/6pKnyCQQNiXf8NhcNkrU4b
-- Design system: https://claude.ai/artifact/1sTptRJP1RVcYB5WYjWw45
+```bash
+npm run watch:server
+```
 
-If either changes, replace the snapshot. The spec can be exported from its own menu as Markdown.
+## Configuration
 
-## Known gaps
+Put environment variables in `.env` (never committed):
 
-- The tutor prompt has not been run against a model.
-- Embedding Pi and the Solid 2.0 APIs are taken from documentation and have not been tried.
-- The design system has been checked as rendered previews, not in a built app or on a phone.
-- Whether friends use the host's model API key or their own is undecided. It matters at milestone 9.
+- `GEMINI_API_KEY` — API key for the default Gemini model
+- `MYELIN_MODEL` — Model selector (`provider/model`, e.g. `google/gemini-4-neon`)
+- `MYELIN_JUDGE_MODEL` — Optional override for the drill/explore judge model
+- `MYELIN_DATA` — Data directory (defaults to `~/.myelin/data`)
+
+## Shortcuts
+
+| Shortcut | Action |
+| --- | --- |
+| `⌘↵` / `Ctrl+↵` | Check / Send / Next |
+| `⌘⇧F` | Cosmetically tidy draft (`⌘Z` undoes) |
+| `⌘\` | Toggle sidebar |
+| `⌘M` | Toggle Map |
+| `⌘[` / `⌘]` (or `⌥←` / `⌥→`) | Navigate Back / Forward |
+| `Esc` | Cancel in-flight request or close popover / Map |
+
+## Verification
+
+```bash
+npm run typecheck
+npm run build
+npm test
+```
+
+## CLI commands
+
+```bash
+node packages/cli/dist/main.js up [--port 4317] [--host 127.0.0.1] [--data DIR]
+node packages/cli/dist/main.js invite <name> [--url URL]
+node packages/cli/dist/main.js metrics [name]
+node packages/cli/dist/main.js deploy <ssh-host> [--domain D]
+```
