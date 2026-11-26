@@ -280,6 +280,11 @@ export function DrillView() {
   const rep = () => (isNonUnit() ? null : (unitSession()?.rep ?? null));
   const beats = () => (isExplore() ? practice.state.explore.beats : (unitSession()?.beats ?? []));
   const postBeats = () => (isNonUnit() ? [] : (unitSession()?.postBeats ?? []));
+  // "Open as exploration" is offered once the latest follow-up has a settled reply.
+  const canPromotePost = () => {
+    const last = postBeats().at(-1);
+    return Boolean(last) && !postBusy() && !last!.pending && !isFailedBeat(last!);
+  };
   const draft = () => (isExplore() ? practice.state.explore.draft : (unitSession()?.draft ?? ""));
   const postInput = () => (isNonUnit() ? "" : (unitSession()?.postInput ?? ""));
   const citations = () => (isExplore() ? practice.state.explore.citations : (unitSession()?.citations ?? []));
@@ -2553,21 +2558,6 @@ export function DrillView() {
                           </div>
                         </Show>
                         <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
-                        <Show when={!postBusy() && idx() === postBeats().length - 1 && !beat.pending && !failed()}>
-                          <div class="v2-post-coach-foot">
-                            <button
-                              type="button"
-                              class="v2-post-promote"
-                              data-tip="Continue this thread as a full exploration"
-                              onClick={() => void openPostAsExploration()}
-                            >
-                              <span>Open as exploration</span>
-                              <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                <path d="M3.5 8.5l5-5M4.75 3.5H8.5v3.75" />
-                              </svg>
-                            </button>
-                          </div>
-                        </Show>
                       </div>
                     </div>
                   );
@@ -2599,6 +2589,19 @@ export function DrillView() {
                 <button type="submit" class="v2-post-send" aria-label="Send follow-up">
                   <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
+                  </svg>
+                </button>
+              </Show>
+              <Show when={canPromotePost() && postInput().trim().length === 0 && citations().length === 0}>
+                <button
+                  type="button"
+                  class="v2-post-promote"
+                  data-tip="Continue this thread as a full exploration"
+                  onClick={() => void openPostAsExploration()}
+                >
+                  <span>Open as exploration</span>
+                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M3.5 8.5l5-5M4.75 3.5H8.5v3.75" />
                   </svg>
                 </button>
               </Show>
