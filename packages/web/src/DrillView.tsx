@@ -218,7 +218,7 @@ function AddedUnitsList(props: { items?: readonly AddedUnit[] | undefined; remov
             return (
               <div class={{ "v2-added-row": true, "is-removed": removed() }}>
                 <div class="v2-added-head">
-                  <span class="v2-added-tag">{removed() ? "Removed" : u().observe_only ? "Added move" : "Added to map"}</span>
+                  <span class="v2-added-tag">{removed() ? "Removed" : u().observe_only ? "Added move" : "Added to practice"}</span>
                   <Show when={!removed()}>
                     <button
                       type="button"
@@ -265,7 +265,7 @@ export function DrillView() {
   const [citeComment, setCiteComment] = createSignal("");
   const [pinningMap, setPinningMap] = createSignal(false);
   const [pinnedMap, setPinnedMap] = createSignal(false);
-  const [manualAddedCount, setManualAddedCount] = createSignal(0);
+  const [manualAddedIds, setManualAddedIds] = createSignal<string[]>([]);
   const [wrapDismissed, setWrapDismissed] = createSignal(false);
 
   const EXPLORE_WRAP_THRESHOLD = 6;
@@ -298,16 +298,19 @@ export function DrillView() {
         if (!practice.state.removedUnits[u.unit_id]) ids.add(u.unit_id);
       }
     }
+    for (const id of manualAddedIds()) {
+      if (!practice.state.removedUnits[id]) ids.add(id);
+    }
     return ids;
   });
-  const exploreAddedCount = createMemo(() => exploreAddedIds().size + manualAddedCount());
   const dueFromExplore = createMemo(() => {
     const ids = exploreAddedIds();
-    const due = practice.dueQueue();
     if (ids.size === 0) return [];
-    return due.filter((u) => ids.has(u.unit_id));
+    return practice.state.queue.filter(
+      (u) => u.due && !practice.state.sittingCompletedIds[u.unit_id] && ids.has(u.unit_id),
+    );
   });
-  const firstDueForBatch = () => dueFromExplore()[0] ?? practice.dueQueue()[0] ?? null;
+  const firstDueForBatch = () => dueFromExplore()[0] ?? null;
 
   // Mutators targeting the current stage (or an explicitly captured ownerKey for async requests).
   const setDraftFor = (key: string, value: string) => {
@@ -501,7 +504,7 @@ export function DrillView() {
     setPinningMap(false);
     setPinnedMap(false);
     setBumpOpen(false);
-    setManualAddedCount(0);
+    setManualAddedIds([]);
     setWrapDismissed(false);
     setError(null);
     clearSketch();
@@ -696,9 +699,9 @@ export function DrillView() {
     setPinningMap(true);
     try {
       const topic = activeExploration()?.title ?? activeFrontier()?.title ?? null;
-      await createQuickUnit({ text: pill.text, topic, told: true });
+      const created = await createQuickUnit({ text: pill.text, topic, told: true });
       if (disposed) return;
-      setManualAddedCount((n) => n + 1);
+      setManualAddedIds((prev) => (prev.includes(created.unit_id) ? prev : [...prev, created.unit_id]));
       setPinnedMap(true);
       void practice.refreshQueue({ preserveOrder: true });
       setTimeout(() => {
@@ -2606,15 +2609,15 @@ export function DrillView() {
           </div>
         </Show>
 
-        {/* Warm overload nudge once an exploration has accumulated a batch of new units */}
-        <Show when={isExploreMode() && exploreAddedCount() >= EXPLORE_WRAP_THRESHOLD && !wrapDismissed() && firstDueForBatch()}>
+        {/* Warm overload nudge once an exploration has accumulated a batch of still-unpracticed due units */}
+        <Show when={isExploreMode() && dueFromExplore().length >= EXPLORE_WRAP_THRESHOLD && !wrapDismissed() && firstDueForBatch()}>
           {(target) => {
-            const batchCount = () => dueFromExplore().length || exploreAddedCount();
+            const batchCount = () => dueFromExplore().length;
             return (
               <div class="v2-wrap-nudge" role="status">
                 <div class="v2-wrap-nudge-copy">
                   <span class="v2-wrap-nudge-title">
-                    {exploreAddedCount()} new cards queued — drill this batch before adding more.
+                    {batchCount()} unpracticed cards from this thread — drill this batch before adding more.
                   </span>
                   <span class="v2-wrap-nudge-sub">
                     This thread stays saved in the sidebar so you can always come right back to it.
@@ -2626,7 +2629,7 @@ export function DrillView() {
                     class="v2-wrap-nudge-btn is-primary"
                     onClick={() => practice.selectUnit(target().unit_id)}
                   >
-                    Drill these {batchCount()}
+                    Practice these {batchCount()}
                   </button>
                   <button
                     type="button"
@@ -2833,8 +2836,8 @@ export function DrillView() {
 
             <div class="v2-pad-foot">
               <div class="v2-pad-tools">
-                <Show when={(isExploreMode() || activeFrontier()) && exploreAddedCount() > 0}>
-                  <span class="v2-pad-map-count">{exploreAddedCount()} queued</span>
+                <Show when={(isExploreMode() || activeFrontier()) && dueFromExplore().length > 0}>
+                  <span class="v2-pad-map-count">{dueFromExplore().length} to practice</span>
                 </Show>
               </div>
 
