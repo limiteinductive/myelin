@@ -378,11 +378,17 @@ export function extractStreamingJsonMessage(raw: string): string | null {
   return extractStreamingJsonMessageState(raw)?.text ?? null;
 }
 
-function trimLearnerMemory(mem: string | null | undefined, maxChars = 1600): string {
+function trimLearnerMemory(mem: string | null | undefined, maxChars = 3200): string {
   const clean = (mem ?? "").trim();
   if (!clean) return "";
   if (clean.length <= maxChars) return clean;
-  return `${clean.slice(0, maxChars).trimEnd()}…`;
+  const slice = clean.slice(0, maxChars);
+  const lastNewline = slice.lastIndexOf("\n");
+  if (lastNewline >= maxChars * 0.7) return slice.slice(0, lastNewline).trimEnd();
+  const lastPeriod = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf(".\n"));
+  if (lastPeriod >= maxChars * 0.7) return slice.slice(0, lastPeriod + 1).trimEnd();
+  const lastSpace = slice.lastIndexOf(" ");
+  return `${(lastSpace >= maxChars * 0.7 ? slice.slice(0, lastSpace) : slice).trimEnd()}…`;
 }
 
 function isAbortError(err: unknown): boolean {
@@ -2692,7 +2698,7 @@ Return ONLY valid JSON:
       }),
     );
     return {
-      memory: parsed.memory.trim().slice(0, 1800),
+      memory: trimLearnerMemory(parsed.memory, 3200),
       summary: typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : "Consolidated recent learning patterns.",
       promoted: toList(parsed.promoted),
       graduated: toList(parsed.graduated),

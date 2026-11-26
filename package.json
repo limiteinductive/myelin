@@ -10,6 +10,7 @@
     "test": "npm test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "perf": "node packages/cli/dist/main.js perf --data data/m4",
+    "memory": "node packages/cli/dist/main.js memory --data data/m4",
     "watch:server": "node --watch --watch-path=packages/cli/dist --watch-path=packages/server/dist --watch-path=packages/core/dist packages/cli/dist/main.js up --data data/m4"
   },
   "engines": {

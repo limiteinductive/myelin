@@ -219,6 +219,41 @@ export function perfReport(opts: { data?: string; last?: number } = {}): { file:
   return { file, count: records.length, text: summarizePerf(records, quality) };
 }
 
+/** Prints the learner's Dream-consolidated `learner.md` memory and recent Dream logs. */
+export function memoryReport(opts: { data?: string; user?: string; last?: number } = {}): { user: User; text: string } {
+  const dir = dataDir(opts.data);
+  const registry = new Registry(dir);
+  const stores = new Stores(dir);
+  try {
+    const users = registry.users();
+    const user = opts.user ? registry.userByName(opts.user) : users.length === 1 ? users[0] : undefined;
+    if (!user) throw new Error(opts.user ? `no user named ${opts.user}` : `say which user (${users.map((u) => u.name).join(", ") || "none yet"})`);
+    const store = stores.get(user.id);
+    const mem = store.getAgentMemory("learner");
+    const logs = store.listDreamLogs(opts.last ?? 5);
+    const pending = store
+      .read(mem?.last_dream_seq ?? 0, 500)
+      .filter((e) => e.type === "unit.probed" || e.type === "unit.found" || e.type === "unit.reworded" || e.type === "unit.observed").length;
+    const updated = mem?.updated_at ? new Date(mem.updated_at).toLocaleString() : "never";
+    const lines: string[] = [
+      `Learner memory for ${user.name} (${mem?.dream_count ?? 0} dreams, last updated: ${updated}, pending events: ${pending})`,
+      "─".repeat(72),
+      mem?.content?.trim() || "(empty — no Dream consolidation yet)",
+    ];
+    if (logs.length > 0) {
+      lines.push("", `Recent Dream logs (${logs.length}):`, "─".repeat(72));
+      for (const l of logs) {
+        const when = new Date(l.created_at).toLocaleString();
+        lines.push(`[${when}] seq ${l.from_seq}→${l.to_seq}: ${l.summary}`);
+      }
+    }
+    return { user, text: lines.join("\n") };
+  } finally {
+    stores.close();
+    registry.close();
+  }
+}
+
 /**
  * The measures of whether Myelin works for one learner, as plain text for the person running the
  * server. Never shown in the thread.
