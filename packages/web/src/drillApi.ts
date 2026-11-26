@@ -492,6 +492,18 @@ export function overrideDrillGrade(payload: {
   });
 }
 
+/** Pure one-shot timing override: updates next due time without rewriting historical probe grades. */
+export function rescheduleDrillUnit(payload: {
+  unit_id: string;
+  delay_ms: number;
+}): Promise<{ ok: boolean; next_in_ms: number | null }> {
+  return req<{ ok: boolean; next_in_ms: number | null }>("/api/drill/override", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 export interface AuditRepResponse {
   analysis: string;
   changes: string[];

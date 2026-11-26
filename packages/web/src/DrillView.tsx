@@ -1,7 +1,7 @@
 // Progressive Solveit-style Practice, Briefing & Exploration stage:
 // Always ONE single active pad at the bottom. Reads and writes directly into the account-scoped
 // PracticeStore (zero duplicated session signals, zero module-level globals, zero flush races).
-import { uuidv7, type Grade } from "@myelin/core";
+import { uuidv7 } from "@myelin/core";
 import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, snapshot, Switch, useContext } from "solid-js";
 import {
   buildAnnotatedLines,
@@ -18,9 +18,8 @@ import {
   createQuickUnit,
   exploreDrill,
   fetchNextDrill,
-  overrideDrillGrade,
+  rescheduleDrillUnit,
   respondFrontier,
-  saveExploration,
   tidyDraft,
   waitExplorationSidecar,
   type AddedUnit,
@@ -35,6 +34,47 @@ type CitePillState = { text: string; top: number; left: number };
 type CiteEditorState =
   | { mode: "new"; text: string; top: number; left: number }
   | { mode: "edit"; id: string; text: string; top: number; left: number };
+
+const RELEARN_STOPS_MS = [
+  15 * 60_000,
+  30 * 60_000,
+  3_600_000,
+  2 * 3_600_000,
+  4 * 3_600_000,
+  8 * 3_600_000,
+  16 * 3_600_000,
+  24 * 3_600_000,
+  2 * 24 * 3_600_000,
+  4 * 24 * 3_600_000,
+  7 * 24 * 3_600_000,
+  14 * 24 * 3_600_000,
+  30 * 24 * 3_600_000,
+  60 * 24 * 3_600_000,
+] as const;
+
+function nearestStopIdx(ms: number | null | undefined): number {
+  const target = typeof ms === "number" && Number.isFinite(ms) && ms > 0 ? ms : 20 * 60_000;
+  let best = 0;
+  let bestDist = Infinity;
+  const logT = Math.log(target);
+  for (let i = 0; i < RELEARN_STOPS_MS.length; i++) {
+    const d = Math.abs(Math.log(RELEARN_STOPS_MS[i]!) - logT);
+    if (d < bestDist) {
+      bestDist = d;
+      best = i;
+    }
+  }
+  return best;
+}
+
+function starterAnchorLine(starter: string | null | undefined): string {
+  if (!starter) return "";
+  for (const line of starter.split("\n")) {
+    const t = line.trim();
+    if (t.length >= 6) return t;
+  }
+  return starter.trim();
+}
 
 function beatUserPayload(b: Beat): string {
   return formatCitedMessage(b.citations ?? [], b.user);
@@ -250,6 +290,7 @@ export function DrillView() {
   const [removingId, setRemovingId] = createSignal<string | null>(null);
   const [overriding, setOverriding] = createSignal(false);
   const [bumpOpen, setBumpOpen] = createSignal(false);
+  const [previewDelayMs, setPreviewDelayMs] = createSignal<number | null>(null);
   const [editingBeatIdx, setEditingBeatIdx] = createSignal<number | null>(null);
   const [editDraft, setEditDraft] = createSignal("");
   const [tidying, setTidying] = createSignal(false);
@@ -277,11 +318,6 @@ export function DrillView() {
   const rep = () => (isNonUnit() ? null : (unitSession()?.rep ?? null));
   const beats = () => (isExplore() ? practice.state.explore.beats : (unitSession()?.beats ?? []));
   const postBeats = () => (isNonUnit() ? [] : (unitSession()?.postBeats ?? []));
-  // "Open as exploration" is offered once the latest follow-up has a settled reply.
-  const canPromotePost = () => {
-    const last = postBeats().at(-1);
-    return Boolean(last) && !postBusy() && !last!.pending && !isFailedBeat(last!);
-  };
   const draft = () => (isExplore() ? practice.state.explore.draft : (unitSession()?.draft ?? ""));
   const postInput = () => (isNonUnit() ? "" : (unitSession()?.postInput ?? ""));
   const citations = () => (isExplore() ? practice.state.explore.citations : (unitSession()?.citations ?? []));
@@ -493,6 +529,7 @@ export function DrillView() {
     setPinningMap(false);
     setPinnedMap(false);
     setBumpOpen(false);
+    setPreviewDelayMs(null);
     setManualAddedIds([]);
     setError(null);
     clearSketch();
@@ -1059,7 +1096,7 @@ export function DrillView() {
       : hasOverride
         ? overrideText.trim()
         : showPivot
-          ? prevDraft || "Show me the pivot."
+          ? prevDraft || "Show answer."
           : prevDraft;
     const activeQ = activeExploreQuestion();
     const qAns = tellMe ? "Walk me through this directly." : "";
@@ -1553,6 +1590,8 @@ export function DrillView() {
           turns: middleTurns,
           question: edited,
           revised_attempt: true,
+          ...(r.modality ? { modality: r.modality } : {}),
+          ...(r.bundled_unit_ids && r.bundled_unit_ids.length > 0 ? { bundled_unit_ids: r.bundled_unit_ids } : {}),
           sketch_data_url: target.sketch ?? null,
           latency_ms: latencyMs,
           hints_used: Math.max(1, cleanAll.length),
@@ -1889,38 +1928,6 @@ export function DrillView() {
     void sendPostFollowUp();
   };
 
-  const openPostAsExploration = async () => {
-    const r = rep();
-    const ownerKey = sessionKey();
-    if (!r || postBusy()) return;
-    const clean = snapshot(postBeats()).filter((b) => !b.pending && !isFailedBeat(b));
-    if (clean.length === 0) return;
-    const promotedBeats: Beat[] = [...clean];
-    const originCite: Citation = { id: `origin:${r.unit_id}`, text: r.prompt, comment: "" };
-    if (promotedBeats[0] && !(promotedBeats[0].citations ?? []).some((c) => c.text.trim() === r.prompt.trim())) {
-      promotedBeats[0] = { ...promotedBeats[0], citations: [originCite, ...(promotedBeats[0].citations ?? [])] };
-    }
-    try {
-      const saved = await saveExploration({
-        turns: promotedBeats.map((b) => ({
-          user: beatUserPayload(b),
-          coach: b.coach,
-          ...(b.question ? { question: b.question } : {}),
-          ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
-        })),
-      });
-      if (disposed) return;
-      practice.promotePostFollowUpToExploration(ownerKey, saved.exploration, promotedBeats);
-      requestAnimationFrame(() => {
-        autoGrow();
-        scrollPadIntoView();
-        textarea?.focus();
-      });
-    } catch (e) {
-      if (!disposed) setError(e instanceof Error ? e.message : "Could not open as exploration.");
-    }
-  };
-
   const handleUndoAddedUnit = async (u: AddedUnit) => {
     if (practice.state.removedUnits[u.unit_id] || removingId() === u.unit_id) return;
     setRemovingId(u.unit_id);
@@ -1931,38 +1938,33 @@ export function DrillView() {
     }
   };
 
-  const bumpInterval = async (grade: Grade) => {
+  const commitDelayOverride = async (delayMs: number) => {
     const r = rep();
     const v = passedVerdict();
     const ownerKey = sessionKey();
-    if (!r || !v?.probe_id || overriding()) return;
+    if (!r || !v?.ok || overriding()) return;
     setOverriding(true);
     setError(null);
-    const noteByGrade: Record<Grade, string> = {
-      again: "Learner bumped interval to soon",
-      hard: "Learner bumped interval shorter",
-      good: "Learner bumped interval to normal",
-      easy: "Learner bumped interval much later",
-    };
     try {
-      const res = await overrideDrillGrade({
+      const res = await rescheduleDrillUnit({
         unit_id: r.unit_id,
-        probe_id: v.probe_id,
-        grade,
-        note: noteByGrade[grade],
+        delay_ms: delayMs,
       });
       if (disposed) return;
+      const appliedMs = res.next_in_ms ?? delayMs;
       practice.updateUnitSession(ownerKey, (d) => {
         if (d.passedVerdict) {
-          d.passedVerdict.grade = res.grade ?? grade;
-          d.passedVerdict.next_in_ms = res.next_in_ms;
+          // Pure timing override: keep grade honest, only update next_in_ms.
+          d.passedVerdict.next_in_ms = appliedMs;
         }
         d.overridden = true;
       });
-      setBumpOpen(false);
+      practice.syncDueOverride(r.unit_id, appliedMs);
+      setPreviewDelayMs(null);
       void practice.refreshQueue({ preserveOrder: true });
     } catch (e) {
       if (!disposed) {
+        setPreviewDelayMs(null);
         setError(e instanceof Error ? e.message : "Could not update schedule right now.");
       }
     } finally {
@@ -1981,8 +1983,22 @@ export function DrillView() {
   const intervalLabel = () => {
     const v = passedVerdict();
     if (!v || !v.ok) return "";
+    const preview = previewDelayMs();
+    if (preview !== null) {
+      return v.grade === "again" && preview < 4 * 3_600_000
+        ? `back soon (~${fmtDur(preview)})`
+        : `next ~${fmtDur(preview)}`;
+    }
     if (v.grade === "again") {
-      return v.next_in_ms !== null && v.next_in_ms > 0 ? `back soon (~${fmtDur(v.next_in_ms)})` : "back soon";
+      if (!overridden() && practice.state.sittingRetryIds[sessionKey()]) {
+        return "end of sitting";
+      }
+      if (v.next_in_ms !== null && v.next_in_ms > 0) {
+        return v.next_in_ms < 4 * 3_600_000
+          ? `back soon (~${fmtDur(v.next_in_ms)})`
+          : `next ~${fmtDur(v.next_in_ms)}`;
+      }
+      return "back soon";
     }
     if (v.next_in_ms !== null && v.next_in_ms > 0) return `next ~${fmtDur(v.next_in_ms)}`;
     return overridden() ? "scheduled" : "";
@@ -2134,11 +2150,25 @@ export function DrillView() {
               )}
             </Match>
             <Match when={rep()}>
-              {(r) => (
-                <h1 class="v2-prompt" data-citable="true">
-                  {inline(r().prompt)}
-                </h1>
-              )}
+              {(r) => {
+                const anchor = () => starterAnchorLine(r().starter);
+                const showStarterRef = () =>
+                  Boolean(r().starter) &&
+                  beats().length > 0 &&
+                  !beats().some((b) => anchor() && b.user.includes(anchor()));
+                return (
+                  <>
+                    <h1 class="v2-prompt" data-citable="true">
+                      {inline(r().prompt)}
+                    </h1>
+                    <Show when={showStarterRef()}>
+                      <pre class="v2-prompt-starter" data-citable="true">
+                        {mathOnly(r().starter!)}
+                      </pre>
+                    </Show>
+                  </>
+                );
+              }}
             </Match>
           </Switch>
         </div>
@@ -2424,7 +2454,7 @@ export function DrillView() {
                               </Show>
                               <Show when={intervalLabel()}>
                                 <Show
-                                  when={passedVerdict()?.probe_id}
+                                  when={rep()?.unit_id}
                                   fallback={<span>{intervalLabel()}</span>}
                                 >
                                   <button
@@ -2433,10 +2463,17 @@ export function DrillView() {
                                     disabled={overriding()}
                                     data-tip="Adjust when this comes back"
                                     aria-expanded={bumpOpen() ? "true" : "false"}
-                                    onClick={() => setBumpOpen((v) => !v)}
+                                    onClick={() => {
+                                      setBumpOpen((open) => {
+                                        if (open) setPreviewDelayMs(null);
+                                        return !open;
+                                      });
+                                    }}
                                   >
                                     <span>{overriding() ? "updating…" : intervalLabel()}</span>
-                                    <span class="v2-interval-caret" aria-hidden="true">▾</span>
+                                    <svg class="v2-interval-caret" width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                      <path d="M2.5 3.75 5 6.25l2.5-2.5" />
+                                    </svg>
                                   </button>
                                 </Show>
                               </Show>
@@ -2456,30 +2493,39 @@ export function DrillView() {
                               </button>
                             </div>
                           </div>
-                          <Show when={bumpOpen() && passedVerdict()?.probe_id}>
-                            <div class="v2-bump-row" role="group" aria-label="Adjust next review time">
-                              <span class="v2-bump-label">Bring back:</span>
-                              {(
-                                [
-                                  ["again", "Soon"],
-                                  ["hard", "Shorter"],
-                                  ["good", "Normal"],
-                                  ["easy", "Much later"],
-                                ] as const
-                              ).map(([g, label]) => (
-                                <button
-                                  type="button"
-                                  class={{
-                                    "v2-bump-chip": true,
-                                    "is-active": passedVerdict()?.grade === g,
-                                  }}
-                                  disabled={overriding()}
-                                  onClick={() => void bumpInterval(g)}
-                                >
-                                  {label}
-                                </button>
-                              ))}
-                            </div>
+                          <Show when={bumpOpen() && rep()?.unit_id}>
+                            {(() => {
+                              const effectiveMs = () =>
+                                previewDelayMs() ??
+                                (passedVerdict()?.next_in_ms && passedVerdict()!.next_in_ms! > 0
+                                  ? passedVerdict()!.next_in_ms!
+                                  : 20 * 60_000);
+                              return (
+                                <div class="v2-bump-row" role="group" aria-label="Adjust next review time">
+                                  <span class="v2-bump-label">Bring back</span>
+                                  <input
+                                    type="range"
+                                    class="v2-bump-range"
+                                    min={0}
+                                    max={RELEARN_STOPS_MS.length - 1}
+                                    step={1}
+                                    value={nearestStopIdx(effectiveMs())}
+                                    disabled={overriding()}
+                                    aria-label="Bring back interval"
+                                    aria-valuetext={fmtDur(effectiveMs())}
+                                    onInput={(e) => {
+                                      const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
+                                      if (ms !== undefined) setPreviewDelayMs(ms);
+                                    }}
+                                    onChange={(e) => {
+                                      const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
+                                      if (ms !== undefined) void commitDelayOverride(ms);
+                                    }}
+                                  />
+                                  <span class="v2-bump-val">{fmtDur(effectiveMs())}</span>
+                                </div>
+                              );
+                            })()}
                           </Show>
                         </Show>
                       </div>
@@ -2586,19 +2632,6 @@ export function DrillView() {
                 <button type="submit" class="v2-post-send" aria-label="Send follow-up">
                   <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                     <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
-                  </svg>
-                </button>
-              </Show>
-              <Show when={canPromotePost() && postInput().trim().length === 0 && citations().length === 0}>
-                <button
-                  type="button"
-                  class="v2-post-promote"
-                  data-tip="Continue this thread as a full exploration"
-                  onClick={() => void openPostAsExploration()}
-                >
-                  <span>Open as exploration</span>
-                  <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M3.5 8.5l5-5M4.75 3.5H8.5v3.75" />
                   </svg>
                 </button>
               </Show>
@@ -2753,10 +2786,10 @@ export function DrillView() {
                   <button
                     type="button"
                     class="v2-btn-secondary"
-                    data-tip="Reveal the key move directly and wrap this rep"
+                    data-tip="Reveal the answer and bring this card back soon"
                     onClick={() => void submitBeat(undefined, { showPivot: true })}
                   >
-                    Show pivot
+                    Show answer
                   </button>
                 </Show>
                 <Show when={draft().trim().length >= 12}>
@@ -2857,7 +2890,12 @@ export function DrillView() {
               disabled={pinningMap()}
               onClick={() => void pinSelectionToMap()}
             >
-              <span>{pinnedMap() ? "Added" : pinningMap() ? "…" : "+ Practice"}</span>
+              <Show when={!pinnedMap() && !pinningMap()}>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.35" stroke-linecap="round" aria-hidden="true">
+                  <path d="M6 2.25v7.5M2.25 6h7.5" />
+                </svg>
+              </Show>
+              <span>{pinnedMap() ? "Added" : pinningMap() ? "…" : "Practice"}</span>
             </button>
           </div>
         )}
@@ -2873,7 +2911,6 @@ export function DrillView() {
             style={{ top: `${ed().top}px`, left: `${ed().left}px` }}
           >
             <div class="v2-cite-pop-quote">
-              <QuoteIcon />
               <span class="v2-cite-pop-quote-text">{inline(ed().text)}</span>
             </div>
             <textarea
@@ -2901,7 +2938,7 @@ export function DrillView() {
                 Cancel
               </button>
               <button type="button" class="v2-cite-btn-save" onClick={saveCitation}>
-                Save
+                Save <span class="v2-kbd">↵</span>
               </button>
             </div>
           </div>

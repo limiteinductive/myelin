@@ -415,4 +415,122 @@ describe("PracticeStore (Solid 2.0)", () => {
       dispose();
     }
   });
+
+  it("re-queues a missed card once at the tail of the sitting when >=2 other cards remain, and lets syncDueOverride supersede it", async () => {
+    const items = ["u1", "u2", "u3", "u4"].map((unit_id, i) => ({
+      unit_id,
+      text: `Unit ${i + 1}`,
+      prompt: `Q${i + 1}?`,
+      kind: "move",
+      topic: null,
+      depth: "recall" as const,
+      p_imm: 0.5,
+      reviews: 1,
+      next_in_ms: 0,
+      due: true,
+    }));
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/frontiers") || url.startsWith("/api/explorations")) {
+        return new Response(JSON.stringify({ frontiers: [], explorations: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ scheduler: "rwkv+fsrs85", total_units: items.length, items }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    let store!: PracticeStore;
+    const dispose = createRoot((d) => {
+      store = createPracticeStore("user_relearn", { autoLoad: false });
+      return d;
+    });
+
+    try {
+      await store.refreshQueue({ selectInitial: true });
+      flush();
+
+      // Miss u1 while u2, u3, u4 remain (>= 2 others): schedules one tail-of-sitting retry.
+      store.updateUnitSession("u1", (d) => {
+        d.passedVerdict = {
+          ok: true,
+          grade: "again",
+          message: "Answer shown.",
+          tier: "system2",
+          probe_id: "p1",
+          latency_ms: 5000,
+          prev_latency_ms: null,
+          next_in_ms: 20 * 60_000,
+          scheduler: "rwkv+fsrs85",
+        };
+      });
+      store.markUnitCompleted("u1");
+      flush();
+      expect(store.state.sittingRetryIds["u1"]).toBe(true);
+      expect(store.state.sittingIds).toEqual(["u2", "u3", "u4", "u1"]);
+
+      // Advancing from u1 clears its old session so the tail retry loads fresh and moves to u2.
+      store.advanceFromUnit("u1");
+      flush();
+      expect(store.state.sessions["u1"]).toBeUndefined();
+      expect(store.state.stage).toEqual({ kind: "unit", unitId: "u2" });
+
+      // Miss u2, then explicitly apply a learner timing override via syncDueOverride -> cancels tail retry.
+      store.updateUnitSession("u2", (d) => {
+        d.passedVerdict = {
+          ok: true,
+          grade: "again",
+          message: "Answer shown.",
+          tier: "system2",
+          probe_id: "p2",
+          latency_ms: 4000,
+          prev_latency_ms: null,
+          next_in_ms: 20 * 60_000,
+          scheduler: "rwkv+fsrs85",
+        };
+      });
+      store.markUnitCompleted("u2");
+      flush();
+      expect(store.state.sittingRetryIds["u2"]).toBe(true);
+      store.syncDueOverride("u2", 4 * 3_600_000);
+      flush();
+      expect(store.state.sittingRetryIds["u2"]).toBeUndefined();
+      expect(store.state.sittingCompletedIds["u2"]).toBe(true);
+      expect(store.state.queue.find((u) => u.unit_id === "u2")?.next_in_ms).toBe(4 * 3_600_000);
+
+      // Finish u2 -> u3 -> u4 -> lands on u1 for its single retry.
+      store.advanceFromUnit("u2");
+      store.markUnitCompleted("u3");
+      store.advanceFromUnit("u3");
+      store.markUnitCompleted("u4");
+      store.advanceFromUnit("u4");
+      flush();
+      expect(store.state.stage).toEqual({ kind: "unit", unitId: "u1" });
+
+      // Missing u1 a SECOND time must NOT re-queue it again (bounded 1 retry per sitting).
+      store.updateUnitSession("u1", (d) => {
+        d.passedVerdict = {
+          ok: true,
+          grade: "again",
+          message: "Still missed.",
+          tier: "system2",
+          probe_id: "p3",
+          latency_ms: 6000,
+          prev_latency_ms: null,
+          next_in_ms: 45 * 60_000,
+          scheduler: "rwkv+fsrs85",
+        };
+      });
+      store.markUnitCompleted("u1");
+      flush();
+      expect(store.state.sittingRetryIds["u1"]).toBeUndefined();
+      expect(store.state.sittingCompletedIds["u1"]).toBe(true);
+
+      store.advanceFromUnit("u1");
+      flush();
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+    } finally {
+      dispose();
+    }
+  });
 });

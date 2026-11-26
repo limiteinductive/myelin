@@ -97,12 +97,29 @@ print(json.dumps(out))
     ];
     const state = replay(events, fsrsScheduler(), emptyState(fsrsScheduler()));
     const cal = computeCalibratedIntervals(state, t0 + 10_000);
-    expect(cal.get(uLapse)!.next_in_ms).toBeGreaterThanOrEqual(3.9 * 3600_000);
-    expect(cal.get(uLapse)!.next_in_ms).toBeLessThan(24 * 3600_000);
+    expect(cal.get(uLapse)!.next_in_ms).toBeGreaterThanOrEqual(19 * 60_000);
+    expect(cal.get(uLapse)!.next_in_ms).toBeLessThanOrEqual(46 * 60_000);
     expect(cal.get(uGood)!.next_in_ms).toBeGreaterThanOrEqual(24 * 3600_000);
     expect(pickDrillDepth(state.units[uTold]!, state)).toBe("explain");
 
-    // Grade overrides (Soon / Shorter / Normal / Much later) must produce strictly distinct intervals even on assisted/told probes
+    // Two-stage relearning: miss -> 20m retry -> same-day pass -> overnight (20h, NOT ts-fsrs +72h!)
+    const uRelearn = uuidv7(t0 + 15);
+    const relearnEvs = [
+      makeEvent("unit.found", { unit_id: uRelearn, text: "RMSNorm omits mean subtraction.", kind: "mechanism", topic: "Norms", rests_on: [], origin: "need", told: true, observe_only: false, message_id: null }, { id: uuidv7(t0 + 15), device_id: "server:drill", ts: t0 + 15, seq: 1 }),
+      makeEvent("unit.probed", { unit_id: uRelearn, depth: "recall", slot: "seam", prompt: "RMSNorm dx?", answer_message_id: null, grade: "again", corrected_grade: null, hints: 1, latency_ms: 40_000, scheduler: "rwkv", predicted_recall: 0 }, { id: uuidv7(t0 + 20_000), device_id: "server:drill", ts: t0 + 20_000, seq: 2 }),
+      makeEvent("unit.probed", { unit_id: uRelearn, depth: "recall", slot: "seam", prompt: "RMSNorm dx v2?", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 18_000, scheduler: "rwkv", predicted_recall: 0.4 }, { id: uuidv7(t0 + 20_000 + 20 * 60_000), device_id: "server:drill", ts: t0 + 20_000 + 20 * 60_000, seq: 3 }),
+    ];
+    const relearnSt = replay(relearnEvs, fsrsScheduler(), emptyState(fsrsScheduler()));
+    const relearnCal = computeCalibratedIntervals(relearnSt, t0 + 20_000 + 20 * 60_000 + 1000).get(uRelearn)!;
+    expect(relearnCal.next_in_ms).toBeGreaterThanOrEqual(19 * 3600_000);
+    expect(relearnCal.next_in_ms).toBeLessThanOrEqual(21 * 3600_000);
+
+    // One-shot timing override shifts due time cleanly without mutating grade evidence, and yields to newer probes
+    const overrideMap = new Map([[uRelearn, { due_at: t0 + 20_000 + 20 * 60_000 + 7 * 86_400_000, created_at: t0 + 20_000 + 20 * 60_000 + 500 }]]);
+    const overriddenCal = computeCalibratedIntervals(relearnSt, t0 + 20_000 + 20 * 60_000 + 1000, overrideMap).get(uRelearn)!;
+    expect(overriddenCal.next_in_ms).toBeGreaterThanOrEqual(6.9 * 86_400_000);
+
+    // Grade overrides still produce strictly increasing intervals (again < hard < good < easy)
     const uOverride = uuidv7(t0 + 20);
     const probeId = uuidv7(t0 + 21_000);
     const intervalFor = (grade: "again" | "hard" | "good" | "easy") => {
@@ -118,7 +135,7 @@ print(json.dumps(out))
     const tHard = intervalFor("hard");
     const tGood = intervalFor("good");
     const tEasy = intervalFor("easy");
-    expect(tAgain).toBeGreaterThanOrEqual(3.9 * 3600_000);
+    expect(tAgain).toBeGreaterThanOrEqual(19 * 60_000);
     expect(tAgain).toBeLessThan(tHard);
     expect(tHard).toBeLessThan(tGood);
     expect(tGood).toBeLessThan(tEasy);

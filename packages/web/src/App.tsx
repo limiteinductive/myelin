@@ -48,14 +48,14 @@ const PlusIcon = () => (
 );
 const CloseIcon = () => (
   <svg width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE}>
-    <path d="M3.25 3.25l5.5 5.5M8.75 3.25l-5.5 5.5" />
+    <path d="M3 3l6 6M9 3l-6 6" />
   </svg>
 );
 const ArchiveIcon = () => (
-  <svg width="13" height="13" viewBox="0 0 16 16" {...ICON_STROKE} stroke-width="1.35">
-    <rect x="2" y="2.5" width="12" height="3.25" rx="1" />
-    <path d="M3 5.75v6.25a1.5 1.5 0 0 0 1.5 1.5h7a1.5 1.5 0 0 0 1.5-1.5V5.75" />
-    <path d="M6.5 8.75h3" />
+  <svg width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE} stroke-width="1.2">
+    <rect x="2.25" y="2.25" width="7.5" height="2.5" rx=".75" />
+    <path d="M3 4.75v3.9a1.1 1.1 0 0 0 1.1 1.1h3.8A1.1 1.1 0 0 0 9 8.65v-3.9" />
+    <path d="M5 7h2" />
   </svg>
 );
 const ChevronIcon = () => (
@@ -65,7 +65,7 @@ const ChevronIcon = () => (
 );
 const BranchIcon = () => (
   <svg width="12" height="12" viewBox="0 0 12 12" {...ICON_STROKE}>
-    <path d="M3.5 8.5l5-5M4.75 3.5H8.5v3.75" />
+    <path d="M3 9l6-6M4.5 3H9v4.5" />
   </svg>
 );
 const SidebarToggleIcon = () => (

@@ -209,6 +209,11 @@ export class EventStore {
         graduated_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS unit_due_overrides (
+        unit_id TEXT PRIMARY KEY,
+        due_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
     `);
     const expCols = this.db.prepare("PRAGMA table_info(explorations)").all() as unknown as { name?: string }[];
     if (!expCols.some((c) => c.name === "archived")) {
@@ -615,5 +620,30 @@ export class EventStore {
       graduated: JSON.parse(String(r.graduated_json || "[]")) as string[],
       created_at: Number(r.created_at ?? 0),
     }));
+  }
+
+  /** Stores a one-shot learner timing preference without mutating historical probe grades. */
+  setUnitDueOverride(unitId: string, dueAt: number, createdAt = Date.now()): void {
+    this.db
+      .prepare(
+        `INSERT INTO unit_due_overrides (unit_id, due_at, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(unit_id) DO UPDATE SET
+          due_at = excluded.due_at,
+          created_at = excluded.created_at`,
+      )
+      .run(unitId, Math.round(dueAt), Math.round(createdAt));
+  }
+
+  listUnitDueOverrides(): Map<string, { due_at: number; created_at: number }> {
+    const rows = this.db.prepare("SELECT unit_id, due_at, created_at FROM unit_due_overrides").all() as unknown as Record<string, unknown>[];
+    const out = new Map<string, { due_at: number; created_at: number }>();
+    for (const r of rows) {
+      out.set(String(r.unit_id), {
+        due_at: Number(r.due_at ?? 0),
+        created_at: Number(r.created_at ?? 0),
+      });
+    }
+    return out;
   }
 }

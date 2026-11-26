@@ -853,17 +853,19 @@ Your goal is maximum genuine human understanding per minute—NOT exam proctorin
 - Accept messy shorthand, typos, unfinished formatting, and valid alternative routes.
 - CASUAL "?" ON A RIGHT ANSWER: If the learner writes the right core answer ending in "?" (e.g. "$\\sigma^2/n?$"), PASS it right away (ok=true, grade="hard") with a crisp 1-line confirmation instead of rejecting it and forcing a 90s proof! Only ask a follow-up if the guess is actually wrong, circular, or missing a load-bearing piece.
 
-2. FAST 2-TURN CEILING & DIRECT WHITEBOARD PIVOTS:
-- Turn 1 (Check):
-  - If they demonstrated what the prompt asked: set ok=true, grade="good"|"easy"|"hard", crisp confirmation (<=10 words).
-  - If there is ONE concrete crack/slip or they are stuck: set ok=false, grade="again", and give ONE surgical nudge (max 35 words) pointing directly at the single missing pivot (never telegraph the exact symbol/answer inside the question).
-- Turn 2+ (Follow-up) OR when "Resolution mode: DIRECT_PIVOT" is set:
-  - If they landed the crux themselves: set ok=true, grade="hard" (or "good" if Turn 1 was purely a clarifying question), crisp confirmation (<=10 words).
-  - If they STILL missed on Turn 2, OR clicked "Show pivot" (DIRECT_PIVOT): STOP quizzing! State the missing pivot cleanly in 1-2 crisp whiteboard sentences and CLOSE THE REP with ok=true AND grade="again" (never mark a revealed/missed rep as "hard" or "good").
+2. TARGET-SCOPED TURN LOOP (GRADE THE CRUX, NEVER RAW TURN COUNT):
+- Clarifying questions & partial sub-step checks (e.g. asking about notation/shapes/axes, or sanity-checking one intermediate piece like \`dbeta\` while main blanks like \`dx_ln\`/\`dx_rms\` remain unattempted):
+  - Answer or confirm ONLY that specific point in 1-2 crisp sentences.
+  - NEVER reveal or spoil the remaining unattempted blanks/crux!
+  - Keep the rep open (ok=false, grade="again"). Clarifying questions and partial progress do NOT count as failed crux attempts.
+- Substantive attempt at the full crux (or explicit stuckness like "idk"):
+  - If they landed what the prompt asked: set ok=true with a crisp confirmation (<=10 words).
+  - On the 1st crux miss/slip or stall: set ok=false, grade="again", and give ONE surgical nudge (max 35 words) pointing at the missing pivot without telegraphing the exact symbol/answer.
+  - On a 2nd failed attempt at the SAME crux, explicit give-up, clicking "Show answer" (SHOW_ANSWER), or HARD_TURN_CAP: STOP quizzing! State the clean answer in 1-3 whiteboard sentences and CLOSE THE REP with ok=true AND grade="again" (never mark a revealed/missed rep as "hard" or "good").
 - Decouple ok (rep closed) from grade (spaced-repetition consolidation rating):
-  - Clean unassisted production on Turn 1: grade="good" or "easy" (or "hard" if tentative/slow).
-  - Learner landed the crux themselves on Turn 2 after 1 surgical nudge: grade="hard" (or "good" if Turn 1 was purely a clarifying question).
-  - Learner still missed on Turn 2 (coach gave the answer) OR clicked "Show pivot": ok=true, grade="again" (schedules back soon for the next sitting, ~8h).
+  - Clean unassisted production (including after ONLY neutral prompt/setup clarifications): grade="good" or "easy" (or "hard" if tentative/slow).
+  - Learner landed the crux themselves after a sub-step explanation or 1 surgical slip nudge: grade="hard".
+  - Coach revealed the answer (2nd crux miss, give-up, SHOW_ANSWER, or HARD_TURN_CAP miss): ok=true, grade="again".
   - When ok=false: grade="again".
 
 General rules:
@@ -1446,7 +1448,7 @@ export class FastJudge {
       input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
       `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
-      input.showPivot ? 'Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the key pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true, grade="again").' : "",
+      input.showPivot ? 'Resolution mode: SHOW_ANSWER (learner clicked Show answer — state the clean answer in 1-3 whiteboard sentences and close the rep with ok=true, grade="again").' : "",
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
       jev ? `System-1 quick check: P(demonstrated)=${jev.demonstrated.toFixed(2)}, P(cot_gap)=${jev.cot_gap.toFixed(2)}` : "",
       historyBlock,
@@ -1648,11 +1650,11 @@ export class FastJudge {
       .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
       .join("\n");
     const mem = trimLearnerMemory(input.learnerMemory);
-    const forceDirectPivot = Boolean(input.showPivot) || input.turns.length >= 2;
+    const forceDirectPivot = Boolean(input.showPivot) || input.turns.length >= 6;
     const resolutionNote = input.showPivot
-      ? 'Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the missing pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true, grade="again").'
+      ? 'Resolution mode: SHOW_ANSWER (learner clicked Show answer — state the clean answer in 1-3 whiteboard sentences and close the rep with ok=true, grade="again").'
       : forceDirectPivot
-        ? 'Resolution mode: DIRECT_PIVOT (2-turn drill cap reached — if they got it themselves, confirm crisply with ok=true, grade="hard"; if they still missed, state the missing pivot cleanly in 1-2 sentences and close the rep with ok=true, grade="again" instead of quizzing further).'
+        ? 'Resolution mode: HARD_TURN_CAP (turn cap reached — if they landed the crux themselves, confirm crisply with ok=true, grade="hard"; if they still missed, state the clean answer in 1-3 whiteboard sentences and close the rep with ok=true, grade="again").'
         : "";
     const fullUser = [
       mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",

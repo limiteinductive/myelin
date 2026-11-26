@@ -185,7 +185,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     try {
       const now = Date.now();
       const state = store.state;
-      const { scores } = scoreAll(state, store.scheduler, now);
+      const { scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
       const activeUnits = Object.values(state.units).filter((u) => u.status === "active" && !u.observe_only);
 
       const masteredUnits = activeUnits
@@ -621,8 +621,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
   // --- Fast Micro-Production Drill (RWKV-Instant + Jev System 1 -> System 2 cascade) & Map ---
 
-  function scoreAll(state: State, scheduler: { name: string; recall(m: Unit["memory"], at: number): number }, now: number): { scheduler: string; scores: Map<string, RwkvUnitScore> } {
-    const calibrated = computeCalibratedIntervals(state, now);
+  function scoreAll(
+    state: State,
+    scheduler: { name: string; recall(m: Unit["memory"], at: number): number },
+    now: number,
+    dueOverrides?: ReadonlyMap<string, { due_at: number; created_at: number }>,
+  ): { scheduler: string; scores: Map<string, RwkvUnitScore> } {
+    const calibrated = computeCalibratedIntervals(state, now, dueOverrides);
     if (rwkv) {
       const rwkvScores = rwkv.scoreUnits(state, now);
       for (const [id, s] of rwkvScores) {
@@ -928,7 +933,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     store.catchUp();
     const state = store.state;
     const now = Date.now();
-    const { scheduler, scores } = scoreAll(state, store.scheduler, now);
+    const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const candidates = rankDrillCandidates(
       Object.values(state.units).filter((u) => u.status === "active" && !u.observe_only),
       state,
@@ -945,7 +950,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       return {
         unit_id: u.id,
         text: u.text,
-        prompt: judge.peekPrompt(u, depth, restsOn, stats.depthPasses),
+        prompt: judge.peekPrompt(u, depth, restsOn, stats.depthExposures),
         kind: u.kind,
         topic: u.topic,
         depth,
@@ -971,7 +976,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           unit: u,
           restsOn,
           depth,
-          variant: stats.depthPasses,
+          variant: stats.depthExposures,
           priorPrompts: stats.priorPrompts,
           delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
         };
@@ -1174,7 +1179,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     if (turns.length === 0 && !body?.reply?.trim() && !sketch && shouldAutoBrief(initial)) {
       ensureBriefingsMigrated(user.id, store);
       const now = Date.now();
-      const { scores } = scoreAll(state, store.scheduler, now);
+      const { scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
       const existingWithStrength = Object.values(state.units)
         .filter((u) => u.status === "active" && !u.observe_only)
         .map((u) => {
@@ -1302,7 +1307,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           ]);
           appliedGrade = res.rep_fix.recommended_grade;
           changes.push(`Adjusted grade → ${res.rep_fix.recommended_grade}`);
-          const after = scoreAll(store.state, store.scheduler, fixNow + 3);
+          const after = scoreAll(store.state, store.scheduler, fixNow + 3, store.listUnitDueOverrides());
           nextInMs = after.scores.get(repUnit.id)?.next_in_ms ?? null;
         }
         if (res.rep_fix.improved_prompt) {
@@ -1314,7 +1319,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             { id: repUnit.id, text: effectiveText },
             nextDepth,
             restsOn,
-            stats.depthPasses,
+            stats.depthExposures,
             res.rep_fix.improved_prompt,
           );
           changes.push("Updated prompt for next review");
@@ -1551,7 +1556,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const now = Date.now();
     const requestedId = c.req.query("unit_id");
     const excludeId = c.req.query("exclude");
-    const { scheduler, scores } = scoreAll(state, store.scheduler, now);
+    const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const habits = activeHabits(state).map((h) => ({ id: h.id, text: h.text }));
 
     const candidates = Object.values(state.units).filter((u) => u.status === "active" && !u.observe_only);
@@ -1592,9 +1597,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const bundledIds = bundledUnits.map((b) => b.id);
     const modality = pickRepModality(picked, state, depth, bundledUnits);
     const stats = unitExposureStats(state, picked.id, depth, now);
-    const cacheHit = judge.peekPromptEntry(picked, depth, restsOn, stats.depthPasses, modality, bundledIds) !== null;
+    const cacheHit = judge.peekPromptEntry(picked, depth, restsOn, stats.depthExposures, modality, bundledIds) !== null;
     const promptEntry = await judge.promptEntryFor(picked, restsOn, depth, {
-      variant: stats.depthPasses,
+      variant: stats.depthExposures,
       priorPrompts: stats.priorPrompts,
       delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
       learnerMemory: learnerMemoryOf(store),
@@ -1632,7 +1637,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             unit: u,
             restsOn: ro,
             depth: d,
-            variant: st.depthPasses,
+            variant: st.depthExposures,
             priorPrompts: st.priorPrompts,
             delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
             modality: m,
@@ -1705,8 +1710,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ? body.modality
         : pickRepModality(u, state, depth, bundledUnits);
     const cachedPromptEntry =
-      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses, reqModality, bundledIds) ??
-      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses);
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds) ??
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures);
     const prompt = body.prompt?.trim() || cachedPromptEntry?.prompt || (await judge.promptFor(u, restsOn, depth));
     const expectedCrux = cachedPromptEntry?.crux;
     const firstContact = u.told && preStats.passes === 0;
@@ -1744,7 +1749,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     }
 
     const now = Date.now();
-    const { scheduler, scores } = scoreAll(state, store.scheduler, now);
+    const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const preScore = scores.get(u.id);
     const trend = latencyTrend(state, u);
     const habits = activeHabits(state);
@@ -1860,7 +1865,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           }
         }
 
-        const after = scoreAll(store.state, store.scheduler, now + 12);
+        const after = scoreAll(store.state, store.scheduler, now + 12, store.listUnitDueOverrides());
         nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
         // Include any due rests_on prerequisites that became non-due via downward DAG credit.
         for (const pid of u.rests_on) {
@@ -1888,7 +1893,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               unit: item,
               restsOn: ro,
               depth: d,
-              variant: st.depthPasses,
+              variant: st.depthExposures,
               priorPrompts: st.priorPrompts,
               delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
             };
@@ -1980,8 +1985,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ? body.modality
         : pickRepModality(u, state, depth, bundledUnits);
     const expectedCrux =
-      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses, reqModality, bundledIds)?.crux ??
-      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses)?.crux;
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds)?.crux ??
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures)?.crux;
     const firstContact = u.told && preStats.passes === 0;
     const turns = Array.isArray(body.turns)
       ? body.turns.filter((t): t is { role: "user" | "assistant"; text: string } => (t?.role === "user" || t?.role === "assistant") && typeof t?.text === "string").slice(-20)
@@ -1993,7 +1998,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     }
 
     const now = Date.now();
-    const { scheduler, scores } = scoreAll(state, store.scheduler, now);
+    const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const preScore = scores.get(u.id);
     const trend = latencyTrend(state, u);
     const habits = activeHabits(state);
@@ -2046,6 +2051,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       let nextInMs: number | null = null;
       const creditedUnitIds: string[] = [];
       if (verdict.ok && !verdict.failed) {
+        const storedHints =
+          verdict.grade === "good" || verdict.grade === "easy"
+            ? Math.max(0, Math.round(body.hints_used ?? 0))
+            : assistanceCount;
         const ev = makeEvent(
           "unit.probed",
           {
@@ -2056,7 +2065,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             answer_message_id: null,
             grade: verdict.grade,
             corrected_grade: null,
-            hints: assistanceCount,
+            hints: storedHints,
             latency_ms: latencyMs,
             scheduler,
             predicted_recall: preScore ? preScore.p_imm : null,
@@ -2105,7 +2114,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             ]);
           }
         }
-        const after = scoreAll(store.state, store.scheduler, now + 12);
+        const after = scoreAll(store.state, store.scheduler, now + 12, store.listUnitDueOverrides());
         nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
         for (const pid of u.rests_on) {
           const beforeScore = scores.get(pid);
@@ -2132,7 +2141,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               unit: item,
               restsOn: ro,
               depth: d,
-              variant: st.depthPasses,
+              variant: st.depthExposures,
               priorPrompts: st.priorPrompts,
               delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
             };
@@ -2216,7 +2225,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const u = resolveUnit(state, body.unit_id);
     if (!u) return c.json({ error: "unknown unit" }, 404);
     const now = Date.now();
-    const { scheduler, scores } = scoreAll(state, store.scheduler, now);
+    const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const preScore = scores.get(u.id);
     const depth: Depth = body.depth && ["recall", "rebuild", "explain", "use"].includes(body.depth) ? body.depth : pickDrillDepth(u, state);
     const ev = makeEvent(
@@ -2237,7 +2246,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       { id: uuidv7(now), device_id: DRILL_DEVICE, ts: now },
     );
     store.append([ev]);
-    const after = scoreAll(store.state, store.scheduler, now + 1);
+    const after = scoreAll(store.state, store.scheduler, now + 1, store.listUnitDueOverrides());
     return c.json({ ok: true, probe_id: ev.id, next_in_ms: after.scores.get(u.id)?.next_in_ms ?? null });
   });
 
@@ -2245,17 +2254,30 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const { user } = c.get("session");
     const store = stores.get(user.id);
     store.catchUp();
-    const body = (await c.req.json().catch(() => null)) as { unit_id?: string; probe_id?: string; grade?: Grade; note?: string } | null;
-    if (!body?.unit_id || !body?.probe_id) return c.json({ error: "unit_id and probe_id required" }, 400);
-    const grade: Grade = body.grade && ["again", "hard", "good", "easy"].includes(body.grade) ? body.grade : "again";
+    const body = (await c.req.json().catch(() => null)) as {
+      unit_id?: string;
+      probe_id?: string;
+      grade?: Grade;
+      delay_ms?: number;
+      note?: string;
+    } | null;
+    if (!body?.unit_id) return c.json({ error: "unit_id required" }, 400);
     const now = Date.now();
+    // Pure one-shot timing override: shifts due time without rewriting historical probe accuracy.
+    if (typeof body.delay_ms === "number" && Number.isFinite(body.delay_ms)) {
+      const clampedMs = Math.max(5 * 60_000, Math.min(180 * 86_400_000, Math.round(body.delay_ms)));
+      store.setUnitDueOverride(body.unit_id, now + clampedMs, now);
+      return c.json({ ok: true, next_in_ms: clampedMs });
+    }
+    if (!body.probe_id) return c.json({ error: "probe_id or delay_ms required" }, 400);
+    const grade: Grade = body.grade && ["again", "hard", "good", "easy"].includes(body.grade) ? body.grade : "again";
     const ev = makeEvent(
       "unit.probed",
       { unit_id: body.unit_id, corrects: body.probe_id, grade, note: body.note ?? "Marked fragile by learner" },
       { id: uuidv7(now), device_id: DRILL_DEVICE, ts: now },
     );
     store.append([ev]);
-    const after = scoreAll(store.state, store.scheduler, now + 1);
+    const after = scoreAll(store.state, store.scheduler, now + 1, store.listUnitDueOverrides());
     scheduleIdleDream(user.id, store);
     return c.json({ ok: true, grade, next_in_ms: after.scores.get(body.unit_id)?.next_in_ms ?? null });
   });
@@ -2347,13 +2369,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           { id: u.id, text: effectiveText },
           nextDepth,
           restsOn,
-          stats.depthPasses,
+          stats.depthExposures,
           audit.improved_prompt,
         );
         changes.push("Updated prompt for next review");
       }
 
-      const after = scoreAll(store.state, store.scheduler, now + 6);
+      const after = scoreAll(store.state, store.scheduler, now + 6, store.listUnitDueOverrides());
       const nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
       scheduleIdleDream(user.id, store);
 
@@ -2383,7 +2405,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     store.catchUp();
     const state = store.state;
     const now = Date.now();
-    const { scheduler, scores } = scoreAll(state, store.scheduler, now);
+    const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
 
     const units = Object.values(state.units)
       .filter((u) => u.status === "active" && !u.observe_only)
@@ -2555,7 +2577,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
     const state = store.state;
     const now = Date.now();
-    const { scores } = scoreAll(state, store.scheduler, now);
+    const { scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const existingUnits = Object.values(state.units)
       .filter((u) => u.status === "active" && !u.observe_only)
       .map((u) => {

@@ -668,8 +668,8 @@ for await (const line of rl) {
     expect(pivotReview.ok).toBe(true);
     expect(pivotReview.grade).toBe("again");
 
-    // 4. Hard 2-turn ceiling in continueRep forces ok=true with grade="again" when model emits ok=false
-    const capped = await judge.continueRep({
+    // 4. Clarifying sub-step on Turn 2 stays open (no premature turn cap); Turn 5 hard cap forces ok=true, grade="again"
+    const openSubstep = await judge.continueRep({
       prompt: entry.prompt,
       expectedCrux: entry.crux,
       firstContact: false,
@@ -683,13 +683,37 @@ for await (const line of rl) {
         { role: "user", text: "n terms, so sigma^2?" },
         { role: "assistant", text: "And what happens to the 1/n factor outside Var?" },
       ],
+      reply: "wait, does n pull out squared?",
+      latencyMs: 25000,
+      hintsUsed: 0,
+    });
+    expect(openSubstep.ok).toBe(false);
+
+    const capped = await judge.continueRep({
+      prompt: entry.prompt,
+      expectedCrux: entry.crux,
+      firstContact: false,
+      unitText: unit.text,
+      unitKind: unit.kind,
+      depth: "recall",
+      restsOn: [],
+      attempt: "sigma^2 / n^2",
+      feedback: "Close — how many terms are in the sum?",
+      turns: [
+        { role: "user", text: "n terms, so sigma^2?" },
+        { role: "assistant", text: "And what happens to the 1/n factor outside Var?" },
+        { role: "user", text: "still 1/n?" },
+        { role: "assistant", text: "Remember Var(aX) = a^2 Var(X)." },
+        { role: "user", text: "hmm" },
+        { role: "assistant", text: "Try plugging a = 1/n." },
+      ],
       reply: "not sure",
       latencyMs: 25000,
       hintsUsed: 0,
     });
     expect(capped.ok).toBe(true);
     expect(capped.grade).toBe("again");
-    expect(calls[calls.length - 1]?.body).toContain("DIRECT_PIVOT");
+    expect(calls[calls.length - 1]?.body).toContain("HARD_TURN_CAP");
   });
 
   it("generates adaptive fix_bug starters via promptEntryFor and parses Dream map compaction proposals", async () => {

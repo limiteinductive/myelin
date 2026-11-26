@@ -833,6 +833,8 @@ export interface UnitExposureStats {
   passes: number;
   /** Number of passed probes at the requested depth. */
   depthPasses: number;
+  /** Total graded probes at the requested depth (including misses) for prompt variant rotation. */
+  depthExposures: number;
   /** Distinct prompts already shown on previous probes (newest last, max 4). */
   priorPrompts: string[];
   /** Timestamp of the most recent probe (or null if never probed). */
@@ -844,7 +846,7 @@ export interface UnitExposureStats {
 /** Summarizes a unit's demonstrated passes, prior prompts, and recency for depth promotion & transfer prompt rotation. */
 export function unitExposureStats(state: State, unitId: string, depth?: Depth, now = Date.now()): UnitExposureStats {
   const u = state.units[unitId];
-  if (!u) return { passes: 0, depthPasses: 0, priorPrompts: [], lastExposureAt: null, daysSinceLastExposure: 0 };
+  if (!u) return { passes: 0, depthPasses: 0, depthExposures: 0, priorPrompts: [], lastExposureAt: null, daysSinceLastExposure: 0 };
   const probes = u.evidence
     .map((id) => state.evidence[id])
     .filter((ev) => ev !== undefined && ev.source === "probe" && ev.grade !== null)
@@ -852,6 +854,7 @@ export function unitExposureStats(state: State, unitId: string, depth?: Depth, n
 
   let passes = 0;
   let depthPasses = 0;
+  let depthExposures = 0;
   const seenPrompts = new Set<string>();
   const priorPrompts: string[] = [];
   let lastExposureAt: number | null = null;
@@ -859,6 +862,7 @@ export function unitExposureStats(state: State, unitId: string, depth?: Depth, n
   for (const ev of probes) {
     if (!ev) continue;
     if (ev.at > (lastExposureAt ?? 0)) lastExposureAt = ev.at;
+    if (depth && ev.depth === depth) depthExposures++;
     if (ev.grade !== "again") {
       passes++;
       if (depth && ev.depth === depth) depthPasses++;
@@ -873,32 +877,44 @@ export function unitExposureStats(state: State, unitId: string, depth?: Depth, n
   return {
     passes,
     depthPasses,
+    depthExposures,
     priorPrompts: priorPrompts.slice(-4),
     lastExposureAt,
     daysSinceLastExposure: lastExposureAt !== null ? Math.max(0, (now - lastExposureAt) / DAY_MS) : 0,
   };
 }
 
-const MIN_LAPSE_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4h: next sitting, never a 10m boomerang
+/** Deduplication window for downward rests_on DAG credit within the same sitting. */
+const IMPLICIT_CREDIT_DEDUP_MS = 4 * 60 * 60 * 1000;
+/** Short-term relearning delay after a miss or reveal (cold retrieval after working memory flushes). */
+const FIRST_RELEARN_MS = 20 * 60 * 1000;
+const MAX_LAPSE_RELEARN_MS = 45 * 60 * 1000;
+const SAME_DAY_RELEARN_WINDOW_MS = 12 * 60 * 60 * 1000;
+const REPEAT_LAPSE_GUARD_MS = 2 * 60 * 60 * 1000;
 
 export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis";
 
+export interface UnitDueOverride {
+  due_at: number;
+  created_at: number;
+}
+
 /**
- * Computes calibrated FSRS-6 (requestRetention = 0.85, optimal desirable difficulty for active
- * generative recall) spacing intervals across ALL probe depths (recall/rebuild/explain/use).
- *
- * Key decoupling from Anki lapse traps & DAG multipliers:
- * - Assisted Build-gear completions (`again` with hints > 0) and first-contact `told` acquisitions
- *   are initial encoding, not memory lapses -> fed as `hard` (~12-24h consolidation).
- * - Pure unassisted lapses (`again`, hints === 0) get at least a 4-hour next-sitting floor so
- *   completed cards never boomerang back into the middle of the same sitting.
- * - Downward DAG credit: passing a dependent unit cleanly (`grade !== "again"`, `hints === 0`)
- *   automatically grants implicit `good` consolidation credit to its `rests_on` prerequisites
- *   (up to depth 2) so proving a higher concept refreshes its foundations without redundant cards.
+ * Computes calibrated FSRS-6 (requestRetention = 0.85) spacing intervals across ALL probe depths,
+ * implementing two-stage Successive Relearning:
+ * - Stage 1 (miss / Show answer): short-term cold retry (`20m` first contact, `20–45m` lapse) so
+ *   the learner reconstructs the pivot once working memory flushes instead of forgetting overnight.
+ * - Stage 2 (same-day relearn pass within <12h of an `again`): overnight consolidation (`14h`/`20h`/`48h`),
+ *   bypassing ts-fsrs's integer-day `+72h` jump and re-anchoring first-contact acquisitions without
+ *   permanent FSRS lapse difficulty penalties.
+ * - One-shot learner timing overrides (`dueOverrides`) take effect while newer than the latest probe
+ *   without rewriting historical accuracy evidence.
+ * - Downward DAG credit: clean unassisted passes refresh `rests_on` prerequisites up to depth 2.
  */
 export function computeCalibratedIntervals(
   state: State,
   now: number,
+  dueOverrides?: ReadonlyMap<string, UnitDueOverride>,
 ): Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }> {
   const sched = fsrsScheduler({ requestRetention: 0.85 });
   const out = new Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }>();
@@ -950,7 +966,7 @@ export function computeCalibratedIntervals(
     const merged: { at: number; seq: number; grade: Grade; hints: number; implicit: boolean }[] = [...directProbes];
     for (const imp of implicitRaw) {
       // Avoid double-counting an implicit credit within 4h of an existing direct or implicit event.
-      const nearExisting = merged.some((e) => Math.abs(e.at - imp.at) < MIN_LAPSE_INTERVAL_MS);
+      const nearExisting = merged.some((e) => Math.abs(e.at - imp.at) < IMPLICIT_CREDIT_DEDUP_MS);
       if (!nearExisting) {
         merged.push({ at: imp.at, seq: imp.seq, grade: "good", hints: 0, implicit: true });
       }
@@ -965,24 +981,65 @@ export function computeCalibratedIntervals(
     let mem = sched.init();
     let lastAt = 0;
     let lastGrade: Grade = "good";
+    let priorPasses = 0;
+    let lastAgainAt: number | null = null;
+    let sameDayRelearn = false;
+
     for (let i = 0; i < merged.length; i++) {
       const ev = merged[i]!;
-      mem = sched.update(mem, { grade: ev.grade, at: ev.at });
+      if (ev.grade === "again") {
+        // Avoid double-spiking FSRS lapses/difficulty when a card fails again within 2h.
+        if (lastAt === 0 || ev.at - lastAt >= REPEAT_LAPSE_GUARD_MS) {
+          mem = sched.update(mem, { grade: "again", at: ev.at });
+        }
+        lastAgainAt = ev.at;
+        sameDayRelearn = false;
+      } else if (lastAgainAt !== null && ev.at - lastAgainAt < SAME_DAY_RELEARN_WINDOW_MS) {
+        sameDayRelearn = true;
+        lastAgainAt = null;
+        priorPasses++;
+        if (priorPasses === 1) {
+          // First-contact acquisition passed its short retry: re-anchor cleanly without D_0(again) penalty.
+          mem = sched.update(sched.init(), { grade: ev.grade === "easy" ? "good" : "hard", at: ev.at });
+        } else {
+          // True lapse relearned same-day: keep post-lapse stability/difficulty, advance last_review.
+          mem = { ...mem, last_review: ev.at };
+        }
+      } else {
+        mem = sched.update(mem, { grade: ev.grade, at: ev.at });
+        priorPasses++;
+        lastAgainAt = null;
+        sameDayRelearn = false;
+      }
       lastAt = ev.at;
       lastGrade = ev.grade;
     }
 
-    const rawDue = typeof mem.due === "number" ? mem.due : lastAt + MIN_LAPSE_INTERVAL_MS;
-    const stabilityDays = typeof mem.stability === "number" && Number.isFinite(mem.stability) ? mem.stability : 0.25;
-    // For "again" (missed/revealed or learner-selected "Soon"), use FSRS continuous sub-day
-    // stability (~8h–16h, floored at 4h next-sitting) instead of ts-fsrs's 1-day integer clamp,
-    // so "Soon" is always clearly shorter than "Shorter" (hard) without boomerang loops.
-    const effectiveDue =
-      lastGrade === "again"
-        ? lastAt + Math.max(MIN_LAPSE_INTERVAL_MS, Math.min(16 * 60 * 60 * 1000, Math.round(stabilityDays * 1.63 * DAY_MS)))
-        : Math.max(rawDue, lastAt + MIN_LAPSE_INTERVAL_MS);
+    const rawDue = typeof mem.due === "number" ? mem.due : lastAt + 12 * 3600_000;
+    const stabilityDays = typeof mem.stability === "number" && Number.isFinite(mem.stability) && mem.stability > 0 ? mem.stability : 0.25;
+    const override = dueOverrides?.get(u.id);
+    let effectiveDue: number;
+    if (override && override.created_at >= lastAt) {
+      effectiveDue = override.due_at;
+    } else if (lastGrade === "again") {
+      const relearnDelay =
+        priorPasses === 0
+          ? FIRST_RELEARN_MS
+          : Math.min(MAX_LAPSE_RELEARN_MS, Math.max(FIRST_RELEARN_MS, Math.round(stabilityDays * 0.05 * DAY_MS)));
+      effectiveDue = lastAt + relearnDelay;
+    } else if (sameDayRelearn) {
+      const overnightHours = lastGrade === "hard" ? 14 : lastGrade === "good" ? 20 : 48;
+      effectiveDue = lastAt + overnightHours * 3600_000;
+    } else {
+      effectiveDue = Math.max(rawDue, lastAt + 12 * 3600_000);
+    }
+
     const nextInMs = Math.max(0, effectiveDue - now);
-    const fsrsRecall = sched.recall(mem, now);
+    const elapsedDays = Math.max(0, (now - lastAt) / DAY_MS);
+    const fsrsRecall =
+      elapsedDays < 1
+        ? Math.pow(1 + (19 / 81) * (elapsedDays / stabilityDays), -0.5)
+        : sched.recall(mem, now);
     out.set(u.id, { next_in_ms: nextInMs, fsrs_recall: fsrsRecall, reviews: merged.length });
   }
 
