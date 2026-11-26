@@ -27,11 +27,9 @@ function media(query: string): () => boolean {
   return get;
 }
 
-// Sidebar density: how many rows a list shows before it folds the rest behind a quiet toggle.
+// Sidebar density: how many exploration rows show before folding the rest behind a quiet toggle.
 const EXPLORATION_LIMIT = 8;
 const EXPLORATION_SHOWN = 7;
-const QUEUE_LIMIT = 7;
-const QUEUE_SHOWN = 6;
 
 const ICON_STROKE = {
   fill: "none",
@@ -390,8 +388,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   // ----- Sidebar view state (session-only; the record lives in the practice store) -----
   const stageUnitId = () => (practice.state.stage.kind === "unit" ? practice.state.stage.unitId : null);
   const isUnitActive = (id: string) => stageUnitId() === id;
-  const isPracticeActive = () =>
-    practice.state.stage.kind === "unit" || practice.state.stage.kind === "sitting-done";
 
   const [explorationsExpanded, setExplorationsExpanded] = createSignal(false);
   const visibleExplorations = createMemo(() => {
@@ -404,38 +400,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     return active && !head.includes(active) ? [...head, active] : head;
   });
   const hiddenExplorations = () => practice.state.explorations.length - visibleExplorations().length;
-
-  const [queueOpen, setQueueOpen] = createSignal(false);
-  const [queueShowAll, setQueueShowAll] = createSignal(false);
-  const visibleQueueItems = createMemo(() => {
-    const items = practice.dueQueue();
-    if (queueShowAll() || items.length <= QUEUE_LIMIT) return items;
-    const id = stageUnitId();
-    const activeIdx = id ? items.findIndex((u) => u.unit_id === id) : -1;
-    const shown = Math.max(QUEUE_SHOWN, activeIdx + 1);
-    return items.length - shown <= 1 ? items : items.slice(0, shown);
-  });
-  const hiddenQueueItems = () => practice.dueQueue().length - visibleQueueItems().length;
-
-  const openPractice = () => {
-    if (isPracticeActive()) {
-      if (practice.dueQueue().length > 0) setQueueOpen((v) => !v);
-      return;
-    }
-    const target = practice.dueQueue()[0];
-    if (target) {
-      practice.selectUnit(target.unit_id);
-      closeSidebarOnNarrow();
-    } else if (practice.backlogDueCount() > 0) {
-      practice.startNextSitting();
-      closeSidebarOnNarrow();
-    } else if (practice.state.queue[0]) {
-      practice.selectUnit(practice.state.queue[0].unit_id);
-      closeSidebarOnNarrow();
-    } else {
-      setQueueOpen((v) => !v);
-    }
-  };
 
   const drillRow = (u: QueueUnit, done = false) => {
     const isActive = () => isUnitActive(u.unit_id);
@@ -465,45 +429,35 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
             <NavChrome />
           </div>
           <div class="v2-sidebar-list">
-            <section class="v2-sb-section">
-              <div class={{ "v2-sb-practice-row": true, "is-active": isPracticeActive(), "is-open": queueOpen() }}>
-                <button
-                  type="button"
-                  class="v2-sb-practice-chev"
-                  aria-label={queueOpen() ? "Collapse practice queue" : "Expand practice queue"}
-                  aria-expanded={queueOpen() ? "true" : "false"}
-                  disabled={practice.dueQueue().length === 0}
-                  onClick={() => setQueueOpen((v) => !v)}
-                >
-                  <ChevronIcon />
-                </button>
-                <button
-                  type="button"
-                  class="v2-sb-practice-main"
-                  disabled={practice.state.queue.length === 0}
-                  onClick={openPractice}
-                >
-                  <span class="v2-sb-nav-label">Practice</span>
-                  <Show when={practice.remainingCount() > 0}>
-                    <span class="v2-sidebar-count">{practice.remainingCount()}</span>
-                  </Show>
-                </button>
-              </div>
-              <Show when={queueOpen() && practice.dueQueue().length > 0}>
-                <div class="v2-sb-fold-list">
-                  <For each={visibleQueueItems()}>{(u) => drillRow(u)}</For>
-                  <Show when={hiddenQueueItems() > 0 || (queueShowAll() && practice.dueQueue().length > QUEUE_LIMIT)}>
-                    <button
-                      type="button"
-                      class="v2-sb-more"
-                      onClick={() => setQueueShowAll((v) => !v)}
-                    >
-                      {hiddenQueueItems() > 0 ? `Show ${hiddenQueueItems()} more` : "Show less"}
-                    </button>
+            <Show when={practice.dueQueue().length > 0 || practice.backlogDueCount() > 0}>
+              <section class="v2-sb-section">
+                <div class="v2-sb-block">
+                  <div class="v2-sb-section-head">
+                    <span class="v2-sidebar-title">Practice</span>
+                    <Show when={practice.remainingCount() > 0}>
+                      <span class="v2-sidebar-count">{practice.remainingCount()}</span>
+                    </Show>
+                  </div>
+                  <Show
+                    when={practice.dueQueue().length > 0}
+                    fallback={
+                      <button
+                        type="button"
+                        class="v2-sb-item"
+                        onClick={() => {
+                          practice.startNextSitting();
+                          closeSidebarOnNarrow();
+                        }}
+                      >
+                        <span class="v2-sb-text">Start next sitting ({Math.min(8, practice.backlogDueCount())})</span>
+                      </button>
+                    }
+                  >
+                    <For each={practice.dueQueue()}>{(u) => drillRow(u)}</For>
                   </Show>
                 </div>
-              </Show>
-            </section>
+              </section>
+            </Show>
 
             <section class="v2-sb-section">
               <div class="v2-sb-block">
