@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { INLINE } from "../src/text.js";
+import { INLINE, inlineCodeClass } from "../src/text.js";
 
 describe("inline math regex", () => {
   const splitPieces = (s: string) => s.split(INLINE).filter(Boolean);
@@ -23,5 +23,15 @@ describe("inline math regex", () => {
 
   it("does not swallow plain currency pairs like $10 and $20", () => {
     expect(splitPieces("Costs $10 and $20 today.")).toEqual(["Costs $10 and $20 today."]);
+  });
+});
+
+describe("inlineCodeClass", () => {
+  it("renders short symbols bare, medium identifiers nowrap, and long expressions wrappable", () => {
+    expect(inlineCodeClass("Q")).toBe("app-code is-bare");
+    expect(inlineCodeClass("T=1")).toBe("app-code is-bare");
+    expect(inlineCodeClass("(B, H, T, D)")).toBe("app-code is-nowrap");
+    expect(inlineCodeClass("torch.einsum")).toBe("app-code is-nowrap");
+    expect(inlineCodeClass("dx = (dx_hat - dx_hat.mean(-1, keepdim=True)) / std")).toBe("app-code");
   });
 });

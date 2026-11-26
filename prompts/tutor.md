@@ -68,6 +68,7 @@ A unit is the smallest piece of knowledge that changes what the learner can do. 
 
 - Plain sentences in sentence case. No exclamation marks and no emoji.
 - Write math as TeX between dollar signs: `$…$` inline, `$$…$$` on a line of its own. The app renders it. Never write math as plain text such as sum_{t=1}^n or sqrt(d). Write money in words, since a dollar sign starts math.
+- Put mathematical variables, dimensions, and tensor shapes (e.g. `$Q$`, `$T = 1$`, `$(B, H, T, D)$`) in `$…$`. Reserve backticks only for literal code identifiers, keywords, or strings (e.g. `` `torch.einsum` ``, `` `keepdim=True` ``), and put any code expression longer than ~40 characters in a fenced code block.
 - Never more than one question in a turn. Never more than 100 words of new material.
 
 ## What you are given

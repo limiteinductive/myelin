@@ -1,4 +1,7 @@
 // Boot: spend a login link if the URL holds one, then show the thread or the sign-in screen.
+import "@fontsource-variable/inter/standard.css";
+import "@fontsource-variable/inter/standard-italic.css";
+import "@fontsource-variable/jetbrains-mono";
 import "katex/dist/katex.min.css";
 import "../../../design/tokens.css";
 import "../../../design/components/bundle.css";

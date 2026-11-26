@@ -90,6 +90,12 @@ export function mathOnly(text: string): JSX.Element[] {
   return out;
 }
 
+export function inlineCodeClass(code: string): string {
+  if (code.length <= 3) return "app-code is-bare";
+  if (code.length <= 24) return "app-code is-nowrap";
+  return "app-code";
+}
+
 export function inline(text: string): JSX.Element[] {
   const out: JSX.Element[] = [];
   text.split("\n").forEach((line, li) => {
@@ -98,8 +104,10 @@ export function inline(text: string): JSX.Element[] {
       if (!piece) continue;
       if (i % 2 === 0) out.push(piece);
       else if (piece === "\\$") out.push("$");
-      else if (piece.startsWith("`")) out.push(<code class="app-code">{piece.slice(1, -1)}</code>);
-      else if (piece.startsWith("$$")) {
+      else if (piece.startsWith("`")) {
+        const code = piece.slice(1, -1);
+        out.push(<code class={inlineCodeClass(code)}>{code}</code>);
+      } else if (piece.startsWith("$$")) {
         const tex = piece.slice(2, -2).trim();
         out.push(<span class="myl-math app-math-display" data-tex={tex} innerHTML={mathHtml(tex, true)} />);
       } else if (piece.startsWith("$")) {
