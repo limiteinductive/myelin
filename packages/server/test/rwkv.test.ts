@@ -98,8 +98,30 @@ print(json.dumps(out))
     const state = replay(events, fsrsScheduler(), emptyState(fsrsScheduler()));
     const cal = computeCalibratedIntervals(state, t0 + 10_000);
     expect(cal.get(uLapse)!.next_in_ms).toBeGreaterThanOrEqual(3.9 * 3600_000);
+    expect(cal.get(uLapse)!.next_in_ms).toBeLessThan(24 * 3600_000);
     expect(cal.get(uGood)!.next_in_ms).toBeGreaterThanOrEqual(24 * 3600_000);
     expect(pickDrillDepth(state.units[uTold]!, state)).toBe("explain");
+
+    // Grade overrides (Soon / Shorter / Normal / Much later) must produce strictly distinct intervals even on assisted/told probes
+    const uOverride = uuidv7(t0 + 20);
+    const probeId = uuidv7(t0 + 21_000);
+    const intervalFor = (grade: "again" | "hard" | "good" | "easy") => {
+      const evs = [
+        makeEvent("unit.found", { unit_id: uOverride, text: "RMSNorm omits mean subtraction.", kind: "mechanism", topic: "Norms", rests_on: [], origin: "need", told: true, observe_only: false, message_id: null }, { id: uuidv7(t0 + 20), device_id: "server:drill", ts: t0 + 20, seq: 1 }),
+        makeEvent("unit.probed", { unit_id: uOverride, depth: "recall", slot: "seam", prompt: "RMSNorm dx?", answer_message_id: null, grade: "hard", corrected_grade: null, hints: 2, latency_ms: 40_000, scheduler: "rwkv", predicted_recall: 0 }, { id: probeId, device_id: "server:drill", ts: t0 + 21_000, seq: 2 }),
+        makeEvent("unit.probed", { unit_id: uOverride, corrects: probeId, grade, note: "Learner override" }, { id: uuidv7(t0 + 22_000), device_id: "server:drill", ts: t0 + 22_000, seq: 3 }),
+      ];
+      const st = replay(evs, fsrsScheduler(), emptyState(fsrsScheduler()));
+      return computeCalibratedIntervals(st, t0 + 23_000).get(uOverride)!.next_in_ms;
+    };
+    const tAgain = intervalFor("again");
+    const tHard = intervalFor("hard");
+    const tGood = intervalFor("good");
+    const tEasy = intervalFor("easy");
+    expect(tAgain).toBeGreaterThanOrEqual(3.9 * 3600_000);
+    expect(tAgain).toBeLessThan(tHard);
+    expect(tHard).toBeLessThan(tGood);
+    expect(tGood).toBeLessThan(tEasy);
   });
 
   it("propagates downward rests_on credit, bundles synthesis clusters, and selects adaptive rep modalities", () => {

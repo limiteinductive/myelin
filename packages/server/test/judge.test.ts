@@ -635,7 +635,7 @@ for await (const line of rl) {
     expect(calls[0]?.url).toContain("/decisions");
     expect(tentative.ok).toBe(true);
 
-    // 3. showPivot closes immediately with ok=true, grading "hard" on firstContact and "again" on review
+    // 3. showPivot closes immediately with ok=true and grade="again" (never fakes a pass)
     const pivotFirst = await judge.check({
       prompt: entry.prompt,
       expectedCrux: entry.crux,
@@ -650,7 +650,7 @@ for await (const line of rl) {
       hintsUsed: 0,
     });
     expect(pivotFirst.ok).toBe(true);
-    expect(pivotFirst.grade).toBe("hard");
+    expect(pivotFirst.grade).toBe("again");
 
     const pivotReview = await judge.check({
       prompt: entry.prompt,
@@ -668,7 +668,7 @@ for await (const line of rl) {
     expect(pivotReview.ok).toBe(true);
     expect(pivotReview.grade).toBe("again");
 
-    // 4. Hard 2-turn ceiling in continueRep forces ok=true even if model emits ok=false
+    // 4. Hard 2-turn ceiling in continueRep forces ok=true with grade="again" when model emits ok=false
     const capped = await judge.continueRep({
       prompt: entry.prompt,
       expectedCrux: entry.crux,
@@ -688,6 +688,7 @@ for await (const line of rl) {
       hintsUsed: 0,
     });
     expect(capped.ok).toBe(true);
+    expect(capped.grade).toBe("again");
     expect(calls[calls.length - 1]?.body).toContain("DIRECT_PIVOT");
   });
 

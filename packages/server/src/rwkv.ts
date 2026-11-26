@@ -964,16 +964,23 @@ export function computeCalibratedIntervals(
 
     let mem = sched.init();
     let lastAt = 0;
+    let lastGrade: Grade = "good";
     for (let i = 0; i < merged.length; i++) {
       const ev = merged[i]!;
-      const isAssistedOrFirstContact = !ev.implicit && ev.grade === "again" && (ev.hints > 0 || (i === 0 && u.told));
-      const effectiveGrade: Grade = isAssistedOrFirstContact ? "hard" : ev.grade;
-      mem = sched.update(mem, { grade: effectiveGrade, at: ev.at });
+      mem = sched.update(mem, { grade: ev.grade, at: ev.at });
       lastAt = ev.at;
+      lastGrade = ev.grade;
     }
 
     const rawDue = typeof mem.due === "number" ? mem.due : lastAt + MIN_LAPSE_INTERVAL_MS;
-    const effectiveDue = Math.max(rawDue, lastAt + MIN_LAPSE_INTERVAL_MS);
+    const stabilityDays = typeof mem.stability === "number" && Number.isFinite(mem.stability) ? mem.stability : 0.25;
+    // For "again" (missed/revealed or learner-selected "Soon"), use FSRS continuous sub-day
+    // stability (~8h–16h, floored at 4h next-sitting) instead of ts-fsrs's 1-day integer clamp,
+    // so "Soon" is always clearly shorter than "Shorter" (hard) without boomerang loops.
+    const effectiveDue =
+      lastGrade === "again"
+        ? lastAt + Math.max(MIN_LAPSE_INTERVAL_MS, Math.min(16 * 60 * 60 * 1000, Math.round(stabilityDays * 1.63 * DAY_MS)))
+        : Math.max(rawDue, lastAt + MIN_LAPSE_INTERVAL_MS);
     const nextInMs = Math.max(0, effectiveDue - now);
     const fsrsRecall = sched.recall(mem, now);
     out.set(u.id, { next_in_ms: nextInMs, fsrs_recall: fsrsRecall, reviews: merged.length });

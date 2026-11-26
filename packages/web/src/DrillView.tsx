@@ -2147,6 +2147,8 @@ export function DrillView() {
             <For each={beats()}>
               {(beat, idx) => {
                 const isFinalPass = () => Boolean(passedVerdict()?.ok) && idx() === beats().length - 1;
+                const isCleanPass = () => isFinalPass() && passedVerdict()?.grade !== "again";
+                const isMissedClose = () => isFinalPass() && passedVerdict()?.grade === "again";
                 const failed = () => isFailedBeat(beat);
                 const isEditing = () => editingBeatIdx() === idx();
                 const canEdit = () =>
@@ -2239,19 +2241,21 @@ export function DrillView() {
                                   const resolved = () => isAnnotationEdited(editDraft(), pin.quote);
                                   return (
                                     <div class={{ "v2-edit-pin": true, "is-resolved": resolved() }}>
-                                      <button
-                                        type="button"
-                                        class={{ "v2-edit-pin-quote": true, [`is-${pin.kind}`]: true }}
-                                        disabled={resolved()}
-                                        data-tip={resolved() ? "Edited" : "Jump to this span"}
-                                        onClick={() => focusEditAnnotation(pin.quote)}
-                                      >
-                                        {pin.quote}
-                                      </button>
+                                      <div class="v2-edit-pin-head">
+                                        <button
+                                          type="button"
+                                          class={{ "v2-edit-pin-quote": true, [`is-${pin.kind}`]: true }}
+                                          disabled={resolved()}
+                                          data-tip={resolved() ? "Edited" : "Jump to this span"}
+                                          onClick={() => focusEditAnnotation(pin.quote)}
+                                        >
+                                          {pin.quote}
+                                        </button>
+                                        <Show when={resolved()}>
+                                          <span class="v2-edit-pin-state">Edited</span>
+                                        </Show>
+                                      </div>
                                       <span class="v2-edit-pin-note">{inline(pin.note)}</span>
-                                      <Show when={resolved()}>
-                                        <span class="v2-edit-pin-state">Edited</span>
-                                      </Show>
                                     </div>
                                   );
                                 }}
@@ -2259,38 +2263,40 @@ export function DrillView() {
                             </div>
                           </Show>
                           <div class="v2-inline-edit-foot">
-                            <button type="button" class="v2-ghost-btn" onClick={cancelEditingBeat}>
+                            <button type="button" class="v2-inline-edit-cancel" onClick={cancelEditingBeat}>
                               Cancel
                             </button>
-                            <Show when={editDraft().trim().length >= 12}>
+                            <div class="v2-pad-actions">
+                              <Show when={editDraft().trim().length >= 12}>
+                                <button
+                                  type="button"
+                                  class="v2-btn-secondary"
+                                  disabled={tidying() || busy()}
+                                  data-tip="Format & typo tidy (⌘⇧F) · ⌘Z undoes"
+                                  onClick={() => void tidyPadText("edit")}
+                                >
+                                  <Show
+                                    when={tidying()}
+                                    fallback={
+                                      <>
+                                        Tidy <span class="v2-kbd">⌘⇧F</span>
+                                      </>
+                                    }
+                                  >
+                                    <span class="v2-spinner" aria-hidden="true" />
+                                    <span>Tidying</span>
+                                  </Show>
+                                </button>
+                              </Show>
                               <button
                                 type="button"
-                                class="v2-btn-secondary"
-                                disabled={tidying() || busy()}
-                                data-tip="Format & typo tidy (⌘⇧F) · ⌘Z undoes"
-                                onClick={() => void tidyPadText("edit")}
+                                class="v2-btn-primary"
+                                disabled={!editDraft().trim() || busy()}
+                                onClick={() => void submitEditedBeat(idx())}
                               >
-                                <Show
-                                  when={tidying()}
-                                  fallback={
-                                    <>
-                                      Tidy <span class="v2-kbd">⌘⇧F</span>
-                                    </>
-                                  }
-                                >
-                                  <span class="v2-spinner" aria-hidden="true" />
-                                  <span>Tidying</span>
-                                </Show>
+                                Re-check <span class="v2-kbd">⌘↵</span>
                               </button>
-                            </Show>
-                            <button
-                              type="button"
-                              class="v2-btn-primary"
-                              disabled={!editDraft().trim() || busy()}
-                              onClick={() => void submitEditedBeat(idx())}
-                            >
-                              Re-check <span class="v2-kbd">⌘↵</span>
-                            </button>
+                            </div>
                           </div>
                         </div>
                       }
@@ -2341,7 +2347,8 @@ export function DrillView() {
                       <div
                         class={{
                           "v2-beat-coach": true,
-                          "is-pass": isFinalPass(),
+                          "is-pass": isCleanPass(),
+                          "is-missed": isMissedClose(),
                           "is-pending": Boolean(beat.pending),
                           "is-failed": failed(),
                         }}
@@ -2433,10 +2440,16 @@ export function DrillView() {
                               </Show>
                             </span>
                             <div class="v2-pass-actions">
-                              <button type="button" class="v2-btn-primary is-passed" onClick={transitionToNext}>
-                                <svg class="v2-check-svg" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                  <path d="M3.2 8.4l3.2 3.2 6.4-7" />
-                                </svg>
+                              <button
+                                type="button"
+                                class={{ "v2-btn-primary": true, "is-passed": isCleanPass() }}
+                                onClick={transitionToNext}
+                              >
+                                <Show when={isCleanPass()}>
+                                  <svg class="v2-check-svg" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                                    <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                                  </svg>
+                                </Show>
                                 Next <span class="v2-kbd">⌘↵</span>
                               </button>
                             </div>

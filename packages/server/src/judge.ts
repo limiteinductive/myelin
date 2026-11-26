@@ -858,12 +858,12 @@ Your goal is maximum genuine human understanding per minute—NOT exam proctorin
   - If they demonstrated what the prompt asked: set ok=true, grade="good"|"easy"|"hard", crisp confirmation (<=10 words).
   - If there is ONE concrete crack/slip or they are stuck: set ok=false, grade="again", and give ONE surgical nudge (max 35 words) pointing directly at the single missing pivot (never telegraph the exact symbol/answer inside the question).
 - Turn 2+ (Follow-up) OR when "Resolution mode: DIRECT_PIVOT" is set:
-  - If they landed it: set ok=true right away (<=10 words).
-  - If they STILL miss on Turn 2, OR clicked "Show pivot" (DIRECT_PIVOT): STOP quizzing! State the missing pivot cleanly in 1-2 crisp whiteboard sentences and CLOSE THE REP (ok=true) so they absorb it and move on without a 5-turn slog!
-- Decouple ok (rep complete) from grade (spaced-repetition consolidation rating):
-  - First-contact ("First contact: yes") or scaffolded build/pivot completion: grade="hard" (consolidates tomorrow — initial encoding is NOT a memory lapse!).
-  - Core mechanism right on Turn 1, minor slip fixed on 1 nudge: grade="hard" (or "good" if Turn 1 was purely a clarifying question).
-  - Previously learned unit ("First contact: no") missed cold on core mechanism or revealed via Show pivot: grade="again" (schedules for next sitting, >=4h).
+  - If they landed the crux themselves: set ok=true, grade="hard" (or "good" if Turn 1 was purely a clarifying question), crisp confirmation (<=10 words).
+  - If they STILL missed on Turn 2, OR clicked "Show pivot" (DIRECT_PIVOT): STOP quizzing! State the missing pivot cleanly in 1-2 crisp whiteboard sentences and CLOSE THE REP with ok=true AND grade="again" (never mark a revealed/missed rep as "hard" or "good").
+- Decouple ok (rep closed) from grade (spaced-repetition consolidation rating):
+  - Clean unassisted production on Turn 1: grade="good" or "easy" (or "hard" if tentative/slow).
+  - Learner landed the crux themselves on Turn 2 after 1 surgical nudge: grade="hard" (or "good" if Turn 1 was purely a clarifying question).
+  - Learner still missed on Turn 2 (coach gave the answer) OR clicked "Show pivot": ok=true, grade="again" (schedules back soon for the next sitting, ~8h).
   - When ok=false: grade="again".
 
 General rules:
@@ -1446,7 +1446,7 @@ export class FastJudge {
       input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
       `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
-      input.showPivot ? "Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the key pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true)." : "",
+      input.showPivot ? 'Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the key pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true, grade="again").' : "",
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
       jev ? `System-1 quick check: P(demonstrated)=${jev.demonstrated.toFixed(2)}, P(cot_gap)=${jev.cot_gap.toFixed(2)}` : "",
       historyBlock,
@@ -1531,10 +1531,8 @@ export class FastJudge {
       const finalOk = input.showPivot ? true : parsed.ok;
       const grade: Grade = finalOk
         ? input.showPivot
-          ? input.firstContact
-            ? "hard"
-            : "again"
-          : parsed.grade && ["hard", "good", "easy"].includes(parsed.grade)
+          ? "again"
+          : parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
             ? parsed.grade
             : inferGrade(input.latencyMs, input.hintsUsed, jev?.clarity)
         : "again";
@@ -1652,9 +1650,9 @@ export class FastJudge {
     const mem = trimLearnerMemory(input.learnerMemory);
     const forceDirectPivot = Boolean(input.showPivot) || input.turns.length >= 2;
     const resolutionNote = input.showPivot
-      ? "Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the missing pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true)."
+      ? 'Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the missing pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true, grade="again").'
       : forceDirectPivot
-        ? "Resolution mode: DIRECT_PIVOT (2-turn drill cap reached — if they got it, confirm crisply; if they still missed, state the missing pivot cleanly in 1-2 sentences and close the rep with ok=true instead of quizzing further)."
+        ? 'Resolution mode: DIRECT_PIVOT (2-turn drill cap reached — if they got it themselves, confirm crisply with ok=true, grade="hard"; if they still missed, state the missing pivot cleanly in 1-2 sentences and close the rep with ok=true, grade="again" instead of quizzing further).'
         : "";
     const fullUser = [
       mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
@@ -1750,20 +1748,14 @@ export class FastJudge {
       }>(raw);
       if (parsed && typeof parsed.ok === "boolean" && typeof parsed.message === "string" && parsed.message.trim()) {
         const finalOk = forceDirectPivot ? true : parsed.ok;
-        let grade: Grade = finalOk
-          ? input.showPivot
-            ? input.firstContact
-              ? "hard"
-              : "again"
+        const missedAtCap = forceDirectPivot && !parsed.ok;
+        const grade: Grade = finalOk
+          ? input.showPivot || missedAtCap
+            ? "again"
             : parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
               ? parsed.grade
-              : input.firstContact
-                ? "hard"
-                : "hard"
+              : "hard"
           : "again";
-        if (finalOk && input.firstContact && grade === "again") {
-          grade = "hard";
-        }
         const missingPrereqs = this.parsePrereqs(parsed.missing_prereqs);
         const annotations = this.parseAnnotations(parsed.annotations, input.reply);
         if (finalOk && input.sessionKey) this.closeSession(input.sessionKey);

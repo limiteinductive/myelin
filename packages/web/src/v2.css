@@ -1119,13 +1119,13 @@ body,
 /* Level 2: In-place living derivation editor */
 .v2-inline-edit {
   border-radius: 16px;
-  background: var(--v2-surface);
-  border: 1px solid color-mix(in srgb, var(--v2-accent) 46%, var(--v2-border));
-  box-shadow: 0 0 0 3px var(--v2-accent-soft), var(--elevation-card);
-  padding: 13px 16px 10px;
+  background: var(--v2-raised);
+  border: 0.5px solid var(--v2-unit-line-focus);
+  box-shadow: var(--v2-edge-light), var(--v2-pad-shadow);
+  padding: 14px 16px 10px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
   animation: v2-in 160ms ease;
 }
 .v2-edit-area {
@@ -1199,31 +1199,40 @@ body,
 .v2-edit-pins {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding-top: 8px;
-  border-top: 1px solid var(--v2-border);
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 0.5px solid var(--v2-hairline-soft);
 }
 .v2-edit-pin {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 6px 10px;
-  font: 400 12.5px/1.45 var(--v2-font-sans);
+  flex-direction: column;
+  gap: 5px;
+  font: 400 13px/1.55 var(--v2-font-sans);
   color: var(--v2-muted);
   transition: opacity 160ms ease;
 }
 .v2-edit-pin.is-resolved {
-  opacity: 0.48;
+  opacity: 0.58;
+}
+.v2-edit-pin-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
 }
 .v2-edit-pin-quote {
   appearance: none;
   border: 0;
+  flex: 0 1 auto;
+  min-width: 0;
   font: 400 12px/1.35 var(--v2-font-mono);
   color: var(--v2-fg);
   background: var(--v2-warn-soft);
-  padding: 2px 6px;
+  padding: 3px 7px;
   border-radius: 5px;
   max-width: 100%;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   cursor: pointer;
@@ -1246,20 +1255,38 @@ body,
   text-decoration: line-through;
 }
 .v2-edit-pin-note {
-  flex: 1;
-  min-width: 180px;
+  min-width: 0;
 }
 .v2-edit-pin-state {
-  font: 500 11px/1 var(--v2-font-sans);
+  flex: none;
+  font: 500 11.5px/1 var(--v2-font-sans);
   color: var(--v2-success);
 }
 .v2-inline-edit-foot {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: space-between;
   gap: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--v2-border);
+  padding-top: 10px;
+  margin-right: -6px;
+  border-top: 0.5px solid var(--v2-hairline-soft);
+}
+.v2-inline-edit-cancel {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: color-mix(in srgb, var(--v2-fg) 66%, var(--v2-muted));
+  height: 28px;
+  padding: 0 10px;
+  margin-left: -10px;
+  border-radius: 999px;
+  font: 500 13px/1 var(--v2-font-sans);
+  cursor: pointer;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+.v2-inline-edit-cancel:hover {
+  background: var(--v2-quiet-fill);
+  color: var(--v2-fg);
 }
 .v2-beat-code {
   margin: 0;
@@ -1299,6 +1326,13 @@ body,
   background: var(--v2-success-soft);
   border-color: color-mix(in srgb, var(--v2-success) 42%, var(--v2-border));
   animation: v2-pass-glow 620ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.v2-beat-coach.is-missed {
+  background: var(--v2-surface);
+  border-color: var(--v2-hairline-strong);
+}
+.v2-beat-coach.is-missed .v2-bump-row {
+  border-top-color: var(--v2-hairline-soft);
 }
 .v2-beat-coach.is-pending {
   padding: 11px 14px;
