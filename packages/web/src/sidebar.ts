@@ -182,3 +182,39 @@ export function groupQueueByTopic(items: readonly QueueUnit[]): TopicGroup[] {
   }
   return order;
 }
+
+export interface SidebarCounts {
+  /** Cards in the current sitting. */
+  due: number;
+  /** Due cards waiting behind the current sitting. */
+  backlog: number;
+  /** Cards finished this session. */
+  done: number;
+  archived: number;
+  briefings: number;
+}
+
+export interface SidebarLayout {
+  /** Practice section: shown for live work, or to keep the Done fold reachable. */
+  practice: boolean;
+  /** Done fold, closing the Practice section. */
+  done: boolean;
+  /** Archived fold, closing the always-present Explorations section. */
+  archived: boolean;
+  /** Briefings, a section of its own after Explorations. */
+  briefings: boolean;
+}
+
+/**
+ * Which optional parts of the sidebar render. Finished things live with their kind:
+ * Done belongs to Practice and Archived to Explorations, never in a shared footer.
+ */
+export function sidebarLayout(c: SidebarCounts): SidebarLayout {
+  const done = c.done > 0;
+  return {
+    practice: c.due > 0 || c.backlog > 0 || done,
+    done,
+    archived: c.archived > 0,
+    briefings: c.briefings > 0,
+  };
+}

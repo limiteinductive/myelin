@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { QueueUnit } from "../src/drillApi.js";
-import { formatSidebarDrillLabel, groupQueueByTopic, plainSidebarText } from "../src/sidebar.js";
+import { formatSidebarDrillLabel, groupQueueByTopic, plainSidebarText, sidebarLayout } from "../src/sidebar.js";
 
 function mkUnit(id: string, topic: string | null): QueueUnit {
   return {
@@ -50,5 +50,18 @@ describe("sidebar helpers", () => {
       { title: "Linear Attention", ids: ["2", "5"] },
       { title: "General", ids: ["4"] },
     ]);
+  });
+
+  it("keeps Done with Practice and Archived with Explorations", () => {
+    const none = { due: 0, backlog: 0, done: 0, archived: 0, briefings: 0 };
+    expect(sidebarLayout(none)).toEqual({ practice: false, done: false, archived: false, briefings: false });
+    // Live work shows Practice without a Done fold.
+    expect(sidebarLayout({ ...none, due: 3 })).toMatchObject({ practice: true, done: false });
+    expect(sidebarLayout({ ...none, backlog: 5 })).toMatchObject({ practice: true, done: false });
+    // Finished cards alone keep Practice visible so Done stays reachable.
+    expect(sidebarLayout({ ...none, done: 51 })).toMatchObject({ practice: true, done: true });
+    // Archived shows on its own count, with or without active explorations.
+    expect(sidebarLayout({ ...none, archived: 7 })).toMatchObject({ practice: false, archived: true });
+    expect(sidebarLayout({ ...none, briefings: 1 }).briefings).toBe(true);
   });
 });

@@ -470,6 +470,25 @@ body,
 .v2-sb-fold.is-topic.has-active .v2-sb-fold-title {
   color: var(--v2-fg);
 }
+/* Sub-fold: closes its parent section (Done under Practice, Archived under Explorations).
+   Label sits on the row text column, chevron trails it, count holds the right edge. */
+.v2-sb-fold.is-sub {
+  margin-top: 2px;
+  gap: 4px;
+}
+.v2-sb-fold.is-sub .v2-sb-fold-title {
+  flex: none;
+  font-weight: 400;
+}
+.v2-sb-fold.is-sub .v2-sidebar-count {
+  margin-left: auto;
+}
+.v2-sb-fold.is-sub:hover .v2-sidebar-count {
+  color: inherit;
+}
+.v2-sb-fold.is-sub + .v2-sb-fold-list .v2-sb-item {
+  padding-left: 8px;
+}
 .v2-sb-chev {
   opacity: 0.75;
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);

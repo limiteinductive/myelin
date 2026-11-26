@@ -6,7 +6,7 @@ import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
 import { createPracticeStore, PracticeContext, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
-import { formatSidebarDrillLabel, plainSidebarText } from "./sidebar.js";
+import { formatSidebarDrillLabel, plainSidebarText, sidebarLayout } from "./sidebar.js";
 import { installStyledTooltips } from "./tooltip.js";
 import type { QueueUnit } from "./drillApi.js";
 
@@ -421,6 +421,32 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     );
   };
 
+  const layout = () =>
+    sidebarLayout({
+      due: practice.dueQueue().length,
+      backlog: practice.backlogDueCount(),
+      done: practice.doneQueue().length,
+      archived: practice.state.archivedExplorations.length,
+      briefings: practice.state.frontiers.length,
+    });
+
+  // A quiet sub-fold that closes its parent section: Done under Practice, Archived under Explorations.
+  const subFold = (title: string, listId: string, count: () => number, open: () => boolean, toggle: () => void) => (
+    <button
+      type="button"
+      class={{ "v2-sb-fold": true, "is-sub": true, "is-open": open() }}
+      aria-expanded={open() ? "true" : "false"}
+      aria-controls={listId}
+      onClick={toggle}
+    >
+      <span class="v2-sb-fold-title">{title}</span>
+      <span class="v2-sb-slot">
+        <ChevronIcon />
+      </span>
+      <span class="v2-sidebar-count">{count()}</span>
+    </button>
+  );
+
   return (
     <PracticeContext value={practice}>
       <div class={{ "v2-workspace": true, "has-sidebar": sidebarOpen() }}>
@@ -429,7 +455,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
             <NavChrome />
           </div>
           <div class="v2-sidebar-list">
-            <Show when={practice.dueQueue().length > 0 || practice.backlogDueCount() > 0}>
+            <Show when={layout().practice}>
               <section class="v2-sb-section">
                 <div class="v2-sb-block">
                   <div class="v2-sb-section-head">
@@ -441,19 +467,35 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                   <Show
                     when={practice.dueQueue().length > 0}
                     fallback={
-                      <button
-                        type="button"
-                        class="v2-sb-item"
-                        onClick={() => {
-                          practice.startNextSitting();
-                          closeSidebarOnNarrow();
-                        }}
-                      >
-                        <span class="v2-sb-text">Start next sitting ({Math.min(8, practice.backlogDueCount())})</span>
-                      </button>
+                      <Show when={practice.backlogDueCount() > 0}>
+                        <button
+                          type="button"
+                          class="v2-sb-item"
+                          onClick={() => {
+                            practice.startNextSitting();
+                            closeSidebarOnNarrow();
+                          }}
+                        >
+                          <span class="v2-sb-text">Start next sitting ({Math.min(8, practice.backlogDueCount())})</span>
+                        </button>
+                      </Show>
                     }
                   >
                     <For each={practice.dueQueue()}>{(u) => drillRow(u)}</For>
+                  </Show>
+                  <Show when={layout().done}>
+                    {subFold(
+                      "Done",
+                      "v2-sb-done-list",
+                      () => practice.doneQueue().length,
+                      () => practice.state.doneOpen,
+                      () => practice.setDoneOpen((v) => !v),
+                    )}
+                    <Show when={practice.state.doneOpen}>
+                      <div class="v2-sb-fold-list" id="v2-sb-done-list">
+                        <For each={practice.doneQueue()}>{(u) => drillRow(u, true)}</For>
+                      </div>
+                    </Show>
                   </Show>
                 </div>
               </section>
@@ -522,9 +564,52 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                     </button>
                   </Show>
                 </Show>
+                <Show when={layout().archived}>
+                  {subFold(
+                    "Archived",
+                    "v2-sb-archived-list",
+                    () => practice.state.archivedExplorations.length,
+                    () => practice.state.archivedOpen,
+                    () => practice.setArchivedOpen((v) => !v),
+                  )}
+                  <Show when={practice.state.archivedOpen}>
+                    <div class="v2-sb-fold-list" id="v2-sb-archived-list">
+                      <For each={practice.state.archivedExplorations}>
+                        {(e) => (
+                          <div class="v2-sb-row">
+                            <button
+                              type="button"
+                              class="v2-sb-item is-done"
+                              onClick={() => {
+                                void practice.unarchiveExplorationById(e.id);
+                                closeSidebarOnNarrow();
+                              }}
+                            >
+                              <span class="v2-sb-text">{plainSidebarText(e.title)}</span>
+                            </button>
+                            <button
+                              type="button"
+                              class="v2-sb-act"
+                              aria-label={`Start new exploration from ${plainSidebarText(e.title)}`}
+                              data-tip="Start new exploration with this context"
+                              onClick={() => {
+                                practice.startExplorationFrom(e);
+                                closeSidebarOnNarrow();
+                              }}
+                            >
+                              <BranchIcon />
+                            </button>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </Show>
               </div>
+            </section>
 
-              <Show when={practice.state.frontiers.length > 0}>
+            <Show when={layout().briefings}>
+              <section class="v2-sb-section">
                 <div class="v2-sb-block">
                   <div class="v2-sb-section-head">
                     <span class="v2-sidebar-title">Briefings</span>
@@ -560,77 +645,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                     }}
                   </For>
                 </div>
-              </Show>
-            </section>
-
-            <Show when={practice.doneQueue().length > 0 || practice.state.archivedExplorations.length > 0}>
-              <section class="v2-sb-section">
-                <Show when={practice.doneQueue().length > 0}>
-                  <button
-                    type="button"
-                    class={{ "v2-sb-fold": true, "is-open": practice.state.doneOpen }}
-                    aria-expanded={practice.state.doneOpen ? "true" : "false"}
-                    onClick={() => practice.setDoneOpen((v) => !v)}
-                  >
-                    <span class="v2-sb-slot">
-                      <ChevronIcon />
-                    </span>
-                    <span class="v2-sb-fold-title">Done</span>
-                    <span class="v2-sidebar-count">{practice.doneQueue().length}</span>
-                  </button>
-                  <Show when={practice.state.doneOpen}>
-                    <div class="v2-sb-fold-list">
-                      <For each={practice.doneQueue()}>{(u) => drillRow(u, true)}</For>
-                    </div>
-                  </Show>
-                </Show>
-
-                <Show when={practice.state.archivedExplorations.length > 0}>
-                  <button
-                    type="button"
-                    class={{ "v2-sb-fold": true, "is-open": practice.state.archivedOpen }}
-                    aria-expanded={practice.state.archivedOpen ? "true" : "false"}
-                    onClick={() => practice.setArchivedOpen((v) => !v)}
-                  >
-                    <span class="v2-sb-slot">
-                      <ChevronIcon />
-                    </span>
-                    <span class="v2-sb-fold-title">Archived</span>
-                    <span class="v2-sidebar-count">{practice.state.archivedExplorations.length}</span>
-                  </button>
-                  <Show when={practice.state.archivedOpen}>
-                    <div class="v2-sb-fold-list">
-                      <For each={practice.state.archivedExplorations}>
-                        {(e) => (
-                          <div class="v2-sb-row">
-                            <button
-                              type="button"
-                              class="v2-sb-item is-done"
-                              onClick={() => {
-                                void practice.unarchiveExplorationById(e.id);
-                                closeSidebarOnNarrow();
-                              }}
-                            >
-                              <span class="v2-sb-text">{plainSidebarText(e.title)}</span>
-                            </button>
-                            <button
-                              type="button"
-                              class="v2-sb-act"
-                              aria-label={`Start new exploration from ${plainSidebarText(e.title)}`}
-                              data-tip="Start new exploration with this context"
-                              onClick={() => {
-                                practice.startExplorationFrom(e);
-                                closeSidebarOnNarrow();
-                              }}
-                            >
-                              <BranchIcon />
-                            </button>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </Show>
               </section>
             </Show>
           </div>
