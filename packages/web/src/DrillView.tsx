@@ -1861,8 +1861,8 @@ export function DrillView() {
           }
         });
       }
-      if (res.exploration && !res.failed && res.added_units.length > 0) {
-        // Auto-promote into a full saved Exploration the moment a follow-up adds a unit to the map.
+      if (res.exploration && !res.failed && !(fix && fix.changes.length > 0)) {
+        // Auto-promote every conceptual post-pass follow-up into a saved Exploration anchored to this prompt.
         const promotedBeats: Beat[] = [...cleanPriorPost, resolved];
         if (promotedBeats[0]) {
           const first = promotedBeats[0];

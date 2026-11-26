@@ -1160,7 +1160,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       reply?: string;
       promote_on_unit?: boolean;
       origin_prompt?: string;
-      prior_post_turns?: { user: string; coach: string; added?: { unit_id: string; text: string; kind: string; observe_only: boolean }[] }[];
+      prior_post_turns?: { user: string; coach: string; question?: string; added?: { unit_id: string; text: string; kind: string; observe_only: boolean }[] }[];
       rep_context?: { unit_id?: string; depth?: Depth; prompt?: string; probe_id?: string | null; grade?: Grade } | null;
     } | null;
     const initial = (body?.initial ?? "").trim();
@@ -1335,7 +1335,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       }
 
       const willPromotePostFollowUp =
-        !isStandaloneExploration && Boolean(body?.promote_on_unit) && !res.failed && res.suggested_units.length > 0;
+        !isStandaloneExploration && Boolean(body?.promote_on_unit) && !res.failed && !rep_fix_applied;
       const now = Date.now();
       const expId = isStandaloneExploration
         ? standaloneExpId
@@ -1346,7 +1346,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const explorationTitle = isStandaloneExploration
         ? existingExp?.title || res.title || fallbackExplorationTitle(initial)
         : willPromotePostFollowUp
-          ? res.title || fallbackExplorationTitle(res.suggested_units[0]?.text || body?.reply || initial)
+          ? res.title ||
+            fallbackExplorationTitle(
+              res.suggested_units[0]?.text || repUnit?.text || body?.origin_prompt || body?.reply || initial,
+            )
           : null;
 
       // Optimistically auto-add crystallized units (exact + near-duplicate guard); learner can undo with Remove.
@@ -1388,11 +1391,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         );
       }
 
-      // Persist standalone explorations, or auto-promote a post-pass drill follow-up once it adds a map unit.
+      // Persist standalone explorations, and auto-promote any non-meta post-pass drill follow-up.
       let exploration: ExplorationRecord | undefined;
       let savedTurnIndex = 0;
       const userText = (body?.reply?.trim() || initial || "(sketch)").trim();
-      if (!res.failed && expId && explorationTitle && (isStandaloneExploration || (willPromotePostFollowUp && added_units.length > 0))) {
+      if (!res.failed && expId && explorationTitle && (isStandaloneExploration || willPromotePostFollowUp)) {
         let nextTurns: ExplorationRecord["turns"];
         if (isStandaloneExploration) {
           const prevTurns = existingExp?.turns ?? [];
@@ -1413,6 +1416,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
                 .map((t) => ({
                   user: t.user,
                   coach: t.coach,
+                  ...(typeof t.question === "string" && t.question ? { question: t.question } : {}),
                   ...(Array.isArray(t.added) && t.added.length > 0 ? { added: t.added } : {}),
                 }))
             : [];
