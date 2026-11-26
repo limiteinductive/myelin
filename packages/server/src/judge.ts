@@ -13,9 +13,10 @@ import { createInterface } from "node:readline";
 import type { Depth, Grade } from "@myelin/core";
 import { AgyAcpClient, type AgyAcpAskOptions, type AgyTurnTrace } from "./agy-acp.js";
 import { PerfLog, type PerfOp, type PerfRecord, type PerfWorker } from "./perf.js";
+import type { RepModality } from "./rwkv.js";
 import { resolveAgyBinary } from "./tutor/agy.js";
 
-export type { AgyTurnTrace };
+export type { AgyTurnTrace, RepModality };
 export { AgyAcpClient };
 
 export interface JudgeHistoryItem {
@@ -26,6 +27,8 @@ export interface JudgeHistoryItem {
 export interface PromptCacheEntry {
   prompt: string;
   crux?: string | undefined;
+  modality?: RepModality | undefined;
+  starter?: string | undefined;
 }
 
 export interface JudgeInput {
@@ -38,6 +41,8 @@ export interface JudgeInput {
   firstContact?: boolean | undefined;
   /** True when the learner clicked "Show pivot" to reveal the key move directly and close the rep. */
   showPivot?: boolean | undefined;
+  /** Optional companion unit texts covered jointly in a multi-unit synthesis rep. */
+  bundledUnits?: string[] | undefined;
   unitText: string;
   unitKind: string;
   depth: Depth;
@@ -134,11 +139,32 @@ export interface AuditRepResult {
   missing_prereqs: ExploreUnitSuggestion[];
 }
 
+export interface DreamMergeProposal {
+  keep_id: string;
+  merge_ids: string[];
+  text?: string | undefined;
+}
+
+export interface DreamLinkProposal {
+  unit_id: string;
+  rests_on: string[];
+}
+
 export interface DreamInput {
   currentMemory: string;
   updatedBy: "dream" | "learner";
   masteredUnits: { text: string; topic?: string | null; p_imm: number; reviews: number }[];
   shakyUnits: { text: string; topic?: string | null; p_imm: number; reviews: number }[];
+  /** Full active unit catalog (compact) so Dream can compact duplicates, link prereqs, and retire baseline trivia. */
+  allUnits?: {
+    id: string;
+    text: string;
+    kind: string;
+    topic?: string | null;
+    rests_on: string[];
+    p_imm: number;
+    reviews: number;
+  }[];
   recentAttempts: {
     prompt: string;
     unitText: string;
@@ -158,6 +184,9 @@ export interface DreamResult {
   summary: string;
   promoted: string[];
   graduated: string[];
+  merges?: DreamMergeProposal[] | undefined;
+  retire_ids?: string[] | undefined;
+  links?: DreamLinkProposal[] | undefined;
 }
 
 export interface PlannedBriefingCrux {
@@ -172,6 +201,8 @@ export interface PromptContextOptions {
   priorPrompts?: string[] | undefined;
   delayedTransfer?: boolean | undefined;
   learnerMemory?: string | null | undefined;
+  modality?: RepModality | undefined;
+  bundledUnits?: { id: string; text: string; kind: string }[] | undefined;
 }
 
 export interface PlannedFrontier {
@@ -959,13 +990,30 @@ export class FastJudge {
   private loadPromptCache(): void {
     if (!this.cachePath || !existsSync(this.cachePath)) return;
     try {
-      const data = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<string, string | { prompt?: string; crux?: string }>;
+      const data = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<
+        string,
+        string | { prompt?: string; crux?: string; modality?: RepModality; starter?: string }
+      >;
       for (const [k, v] of Object.entries(data)) {
         if (typeof v === "string" && v.trim()) {
           this.promptCache.set(k, { prompt: v.trim() });
         } else if (v && typeof v === "object" && typeof v.prompt === "string" && v.prompt.trim()) {
           const crux = typeof v.crux === "string" && v.crux.trim() ? v.crux.trim() : undefined;
-          this.promptCache.set(k, { prompt: v.prompt.trim(), ...(crux ? { crux } : {}) });
+          const starter = typeof v.starter === "string" && v.starter.trim() ? v.starter.trim() : undefined;
+          const modality =
+            v.modality === "direct" ||
+            v.modality === "fix_bug" ||
+            v.modality === "faded_skeleton" ||
+            v.modality === "contrast" ||
+            v.modality === "synthesis"
+              ? v.modality
+              : undefined;
+          this.promptCache.set(k, {
+            prompt: v.prompt.trim(),
+            ...(crux ? { crux } : {}),
+            ...(modality ? { modality } : {}),
+            ...(starter ? { starter } : {}),
+          });
         }
       }
     } catch {
@@ -979,7 +1027,7 @@ export class FastJudge {
       mkdirSync(dirname(this.cachePath), { recursive: true });
       const obj: Record<string, string | PromptCacheEntry> = {};
       for (const [k, v] of this.promptCache) {
-        obj[k] = v.crux ? v : v.prompt;
+        obj[k] = v.crux || v.starter || (v.modality && v.modality !== "direct") ? v : v.prompt;
       }
       writeFileSync(this.cachePath, JSON.stringify(obj, null, 2), "utf8");
     } catch {
@@ -1389,6 +1437,7 @@ export class FastJudge {
       `Prompt asked: ${input.prompt}`,
       input.expectedCrux?.trim() ? `Expected crux for this prompt (grade STRICTLY against this; do NOT require unasked unit clauses): ${input.expectedCrux.trim()}` : "",
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
+      input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
       `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
       input.showPivot ? "Resolution mode: DIRECT_PIVOT (learner clicked Show pivot — state the key pivot cleanly in 1-2 whiteboard sentences and close the rep with ok=true)." : "",
@@ -1558,6 +1607,7 @@ export class FastJudge {
       expectedCrux?: string | undefined;
       firstContact?: boolean | undefined;
       showPivot?: boolean | undefined;
+      bundledUnits?: string[] | undefined;
       unitText: string;
       unitKind: string;
       depth: Depth;
@@ -1605,6 +1655,7 @@ export class FastJudge {
       `Prompt asked: ${input.prompt}`,
       input.expectedCrux?.trim() ? `Expected crux for this prompt (grade STRICTLY against this; do NOT require unasked unit clauses): ${input.expectedCrux.trim()}` : "",
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
+      input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "",
       `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
       resolutionNote,
@@ -2461,9 +2512,14 @@ CORE PRINCIPLES (Salience & Pruning beat Hoarding):
 2. GRADUATE RESOLVED BLIND SPOTS: Check Mastered units (high P_imm across reviews). If an old blind spot in Current memory has clearly been mastered, REMOVE it from Active Blind Spots and record it in "graduated".
 3. RESPECT HUMAN EDITS: If Current memory was edited by the learner (updated_by="learner"), preserve their explicit preferences/notes unless directly superseded.
 4. STAY STRICTLY UNDER 320 WORDS. Prune stale/low-salience lines aggressively; less is more.
+5. CONSERVATIVE MAP COMPACTION (optional — only when Active unit catalog is provided):
+   - "merges" (max 3): ONLY merge genuine duplicates or near-identical restatements (e.g. two formulas differing only by variable name). Set "keep_id" to the unit with more reviews/stronger wording, "merge_ids" to redundant duplicate IDs, and optional cleaner "text". Never merge distinct concepts.
+   - "retire_ids" (max 3): ONLY retire trivially mastered baseline facts/vocabulary that already have reviews >= 3 and P >= 90% and are clearly automatic.
+   - "links" (max 5): ONLY add missing direct prerequisite edges ("unit_id" directly builds on "rests_on" IDs) where both IDs exist in the catalog (no cycles).
+   - If nothing clearly warrants compaction, return empty arrays [].
 
 Return ONLY valid JSON:
-{"memory": string, "summary": string, "promoted": string[], "graduated": string[]}`;
+{"memory": string, "summary": string, "promoted": string[], "graduated": string[], "merges": [{"keep_id": string, "merge_ids": string[], "text": string|null}], "retire_ids": string[], "links": [{"unit_id": string, "rests_on": string[]}]}`;
 
     const masteredBlock =
       input.masteredUnits.length > 0
@@ -2517,14 +2573,28 @@ Return ONLY valid JSON:
             .join("\n")
         : "(none)";
 
+    const catalogBlock =
+      input.allUnits && input.allUnits.length > 0
+        ? input.allUnits
+            .slice(0, 80)
+            .map(
+              (u) =>
+                `- [${u.id}] (${u.kind}, P=${Math.round(u.p_imm * 100)}%, ${u.reviews} rev${u.topic ? `, topic="${u.topic}"` : ""}${u.rests_on.length ? `, rests_on=[${u.rests_on.join(",")}]` : ""}) ${u.text.slice(0, 180)}`,
+            )
+            .join("\n")
+        : "";
+
     const user = [
       `Current memory (updated_by=${input.updatedBy}):\n${input.currentMemory.trim() || "(empty — first dream pass)"}`,
       `Mastered units (graduate any matching old blind spots!):\n${masteredBlock}`,
       `Shaky / active friction units:\n${shakyBlock}`,
+      catalogBlock ? `Active unit catalog (use IDs verbatim for merges / retire_ids / links):\n${catalogBlock}` : "",
       `Manual schedule overrides & audit adjustments:\n${overridesBlock}`,
       `Recent drill transcripts:\n${attemptsBlock}`,
       `Recent explorations:\n${expBlock}`,
-    ].join("\n\n---\n\n");
+    ]
+      .filter(Boolean)
+      .join("\n\n---\n\n");
 
     const t0 = Date.now();
     let agyTrace: AgyTurnTrace | undefined;
@@ -2574,6 +2644,9 @@ Return ONLY valid JSON:
       summary?: string;
       promoted?: unknown;
       graduated?: unknown;
+      merges?: unknown;
+      retire_ids?: unknown;
+      links?: unknown;
     }>(raw);
     if (!parsed || typeof parsed.memory !== "string" || !parsed.memory.trim()) {
       throw new Error("Dream pass did not return a valid memory update.");
@@ -2582,6 +2655,34 @@ Return ONLY valid JSON:
       Array.isArray(v)
         ? v.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim()).slice(0, 6)
         : [];
+    const merges: DreamMergeProposal[] = Array.isArray(parsed.merges)
+      ? parsed.merges
+          .filter(
+            (m): m is { keep_id: string; merge_ids: unknown[]; text?: string | null } =>
+              Boolean(m && typeof m === "object" && typeof (m as { keep_id?: unknown }).keep_id === "string" && Array.isArray((m as { merge_ids?: unknown }).merge_ids)),
+          )
+          .map((m) => ({
+            keep_id: m.keep_id.trim(),
+            merge_ids: m.merge_ids.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()),
+            ...(typeof m.text === "string" && m.text.trim().length > 4 ? { text: m.text.trim() } : {}),
+          }))
+          .filter((m) => m.keep_id && m.merge_ids.length > 0)
+          .slice(0, 3)
+      : [];
+    const retire_ids = toList(parsed.retire_ids).slice(0, 3);
+    const links: DreamLinkProposal[] = Array.isArray(parsed.links)
+      ? parsed.links
+          .filter(
+            (l): l is { unit_id: string; rests_on: unknown[] } =>
+              Boolean(l && typeof l === "object" && typeof (l as { unit_id?: unknown }).unit_id === "string" && Array.isArray((l as { rests_on?: unknown }).rests_on)),
+          )
+          .map((l) => ({
+            unit_id: l.unit_id.trim(),
+            rests_on: l.rests_on.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()),
+          }))
+          .filter((l) => l.unit_id && l.rests_on.length > 0)
+          .slice(0, 5)
+      : [];
     this.perf?.record(
       this.buildPerf(t0, "dream", this.promptModel, workerKind, true, {
         background: true,
@@ -2595,22 +2696,48 @@ Return ONLY valid JSON:
       summary: typeof parsed.summary === "string" && parsed.summary.trim() ? parsed.summary.trim() : "Consolidated recent learning patterns.",
       promoted: toList(parsed.promoted),
       graduated: toList(parsed.graduated),
+      ...(merges.length > 0 ? { merges } : {}),
+      ...(retire_ids.length > 0 ? { retire_ids } : {}),
+      ...(links.length > 0 ? { links } : {}),
     };
   }
 
-  private promptKey(unit: { id: string; text: string }, depth: Depth, restsOn: string[] = [], variant = 0): string {
+  private promptKey(
+    unit: { id: string; text: string },
+    depth: Depth,
+    restsOn: string[] = [],
+    variant = 0,
+    modality: RepModality = "direct",
+    bundledIds: readonly string[] = [],
+  ): string {
     const depSig = restsOn.length > 0 ? restsOn.map((r) => r.slice(0, 24)).join("|") : "";
-    return `v5:${unit.id}:${depth}:v${variant}:${depSig}:${unit.text}`;
+    const modSig = modality !== "direct" ? `:m=${modality}` : "";
+    const bundleSig = bundledIds.length > 0 ? `:b=${[...bundledIds].sort().join(",")}` : "";
+    return `v5:${unit.id}:${depth}:v${variant}${modSig}${bundleSig}:${depSig}:${unit.text}`;
   }
 
-  /** Returns a cached prompt + expected crux synchronously if already warmed, or null. */
-  peekPromptEntry(unit: { id: string; text: string }, depth: Depth, restsOn: string[] = [], variant = 0): PromptCacheEntry | null {
-    return this.promptCache.get(this.promptKey(unit, depth, restsOn, variant)) ?? null;
+  /** Returns a cached prompt + expected crux (+ optional starter) synchronously if already warmed, or null. */
+  peekPromptEntry(
+    unit: { id: string; text: string },
+    depth: Depth,
+    restsOn: string[] = [],
+    variant = 0,
+    modality: RepModality = "direct",
+    bundledIds: readonly string[] = [],
+  ): PromptCacheEntry | null {
+    return this.promptCache.get(this.promptKey(unit, depth, restsOn, variant, modality, bundledIds)) ?? null;
   }
 
   /** Returns a cached prompt synchronously if already warmed, or null. */
-  peekPrompt(unit: { id: string; text: string }, depth: Depth, restsOn: string[] = [], variant = 0): string | null {
-    return this.peekPromptEntry(unit, depth, restsOn, variant)?.prompt ?? null;
+  peekPrompt(
+    unit: { id: string; text: string },
+    depth: Depth,
+    restsOn: string[] = [],
+    variant = 0,
+    modality: RepModality = "direct",
+    bundledIds: readonly string[] = [],
+  ): string | null {
+    return this.peekPromptEntry(unit, depth, restsOn, variant, modality, bundledIds)?.prompt ?? null;
   }
 
   /** Prefetches uncached prompts in the background (runs up to 2 concurrent ACP sessions; yields to foreground misses). */
@@ -2622,11 +2749,14 @@ Return ONLY valid JSON:
       variant?: number;
       priorPrompts?: string[];
       delayedTransfer?: boolean;
+      modality?: RepModality;
+      bundledUnits?: { id: string; text: string; kind: string }[];
     }[],
   ): void {
     if (!this.apiKey && !this.promptWorker) return;
     const queue = items.filter((item) => {
-      const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0);
+      const bIds = (item.bundledUnits ?? []).map((b) => b.id);
+      const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0, item.modality ?? "direct", bIds);
       return !this.promptCache.has(key) && !this.inflightPrompts.has(key);
     });
     if (queue.length === 0) return;
@@ -2636,7 +2766,8 @@ Return ONLY valid JSON:
       while (cursor < queue.length) {
         if (this.activeForegroundPrompts > 0) break;
         const item = queue[cursor++]!;
-        const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0);
+        const bIds = (item.bundledUnits ?? []).map((b) => b.id);
+        const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0, item.modality ?? "direct", bIds);
         if (this.promptCache.has(key) || this.inflightPrompts.has(key)) continue;
         try {
           await this.promptFor(
@@ -2647,6 +2778,8 @@ Return ONLY valid JSON:
               variant: item.variant,
               priorPrompts: item.priorPrompts,
               delayedTransfer: item.delayedTransfer,
+              modality: item.modality,
+              bundledUnits: item.bundledUnits,
             },
             true,
           );
@@ -2660,9 +2793,7 @@ Return ONLY valid JSON:
 
   /**
    * Generates a crisp, self-contained single-beat prompt + its prompt-scoped `expected_crux`
-   * (cached per variant). Background prefetch (`background=true`) uses high-reasoning `promptModel`
-   * (`gemini-4-neon-high`); synchronous foreground cache misses (`background=false`) use fast
-   * `sidecarModel` (`gemini-4-hydrogen-medium`) with a tight 20s ceiling so card loads never stall.
+   * + optional adaptive `starter` (for `fix_bug` / `faded_skeleton` / `synthesis` modalities).
    */
   async promptEntryFor(
     unit: { id: string; text: string; kind: string; topic?: string | null },
@@ -2672,14 +2803,17 @@ Return ONLY valid JSON:
     background = false,
   ): Promise<PromptCacheEntry> {
     const variant = opts.variant ?? 0;
-    const key = this.promptKey(unit, depth, restsOn, variant);
+    const modality: RepModality = opts.modality ?? "direct";
+    const bundled = opts.bundledUnits ?? [];
+    const bundledIds = bundled.map((b) => b.id);
+    const key = this.promptKey(unit, depth, restsOn, variant, modality, bundledIds);
     const cached = this.promptCache.get(key);
     if (cached) return cached;
     const inflight = this.inflightPrompts.get(key);
     if (inflight && (background || !inflight.background)) return inflight.promise;
 
     if (!this.apiKey && !this.promptWorker) {
-      const fallback: PromptCacheEntry = { prompt: defaultPrompt(unit.text, unit.kind, restsOn, depth) };
+      const fallback: PromptCacheEntry = { prompt: defaultPrompt(unit.text, unit.kind, restsOn, depth), modality };
       this.promptCache.set(key, fallback);
       return fallback;
     }
@@ -2696,15 +2830,30 @@ Return ONLY valid JSON:
         : "Pose ONE concrete mini-scenario where the learner must choose and apply this idea themselves, without naming the concept, trick, or theorem.",
     };
 
-    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words) AND its exact single-claim grading rubric ("expected_crux", max 28 words).
+    const modalityGuide: Record<RepModality, string> = {
+      direct: `Modality: DIRECT. Set "starter" to null.`,
+      contrast: `Modality: SHARP CONTRAST (1-line high-signal boundary check). Ask ONE crisp contrast or edge-case question answerable in 1-2 sentences (e.g. "What breaks if X is swapped for Y?"). Set "starter" to null.`,
+      faded_skeleton: `Modality: FADED WORKED SKELETON (skip boilerplate, test the exact pivot in ~30s).
+- "prompt": 1 crisp sentence naming the goal and telling the learner to fill in the missing pivot step(s) below.
+- "starter": A clean 3-6 line code snippet, shape trace, or step-by-step derivation where routine setup is ALREADY filled in and ONLY the 1-2 core pivot lines/expressions are replaced with \`___\` (plain ASCII/code/TeX, no markdown fences).`,
+      fix_bug: `Modality: FIX THE BUG (spot & repair ONE planted flaw in ~25s).
+- "prompt": 1 crisp sentence saying the snippet/derivation below has one subtle bug and asking them to fix it in place.
+- "starter": A realistic 3-6 line code snippet, tensor/shape update, or short derivation containing ONE subtle, realistic bug right at this unit's core pivot (e.g. missing operator/kernel, wrong axis/sign, missing scaling factor). NEVER add comments hinting where the bug is; no markdown fences.`,
+      synthesis: `Modality: MULTI-UNIT SYNTHESIS (clear the primary unit AND the bundled companion unit(s) in ONE compact ~45s task).
+- "prompt": 1-2 crisp sentences posing ONE unified concrete scenario/task that naturally exercises the primary unit AND every bundled unit together without stacking two unrelated sub-questions.
+- "starter": Optionally provide a compact 3-5 line worked skeleton with \`___\` blanks if it cuts boilerplate typing, otherwise null.`,
+    };
+
+    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words), its exact single-claim grading rubric ("expected_crux", max 32 words), and an optional pre-filled editor "starter" matching the requested Modality.
 Rules:
 - MOTIVATE, DON'T WORKSHEET: Frame a real problem, comparison, or curiosity trigger where the brain actually needs this idea—NEVER a disembodied textbook command ("Decompose X into A and B", "State formula Y", "What identity does trick Z use?").
-- ZERO SPOILERS, ZERO RIDDLES: Name the starting setup/object clearly (e.g. standard attention $\\text{softmax}(QK^T)V$, a database write path, a sample mean $\\bar{x}$)—hide ONLY the solution, trick, or intermediate pivot, NEVER obfuscate the premise into a vague riddle ("interactions between all pairs of elements").
+- ZERO SPOILERS, ZERO RIDDLES: Name the starting setup/object clearly (e.g. standard attention $\\text{softmax}(QK^T)V$, a database write path, a sample mean $\\bar{x}$)—hide ONLY the solution, trick, or intermediate pivot, NEVER obfuscate the premise into a vague riddle.
 - NO SURFACE-CUE REPETITION: If Previously asked prompts are listed below, DO NOT reuse the same cover story, numbers, or phrasing—change what the learner must recognize or decide.
 - 100% SELF-CONTAINED COLD: Explicitly define every symbol or variable used.
-- ONE SINGLE TASK: Never stack two separate demands ("...and also explain...").
-- "expected_crux": State the exact single claim/expression needed to answer THIS prompt cleanly (so the judge never nitpicks unasked unit clauses).
-- Return ONLY valid JSON: {"prompt": string, "expected_crux": string}`;
+- ONE SINGLE TASK: Never stack two separate unrelated demands.
+- "expected_crux": State the exact claim/fix/expression needed to pass THIS prompt cleanly (so the judge never nitpicks unasked unit clauses).
+- ${modalityGuide[modality]}
+- Return ONLY valid JSON: {"prompt": string, "expected_crux": string, "starter": string|null}`;
     const prior = (opts.priorPrompts ?? []).filter(Boolean).slice(-3);
     const mem = trimLearnerMemory(opts.learnerMemory);
     const promptUser = [
@@ -2713,7 +2862,10 @@ Rules:
         ? `Learner memory (use ONLY to match background level, preferred style, and target active blind spots—NEVER spoil the answer):\n${mem}`
         : "",
       unit.topic ? `Topic: ${unit.topic}` : "",
-      `Unit (${unit.kind}): ${unit.text}`,
+      `Primary unit (${unit.kind}): ${unit.text}`,
+      bundled.length > 0
+        ? `Bundled companion unit(s) to weave into the same compact task:\n${bundled.map((b) => `- (${b.kind}) ${b.text}`).join("\n")}`
+        : "",
       `Rests on: ${restsOn.join("; ") || "nothing"}`,
       prior.length > 0 ? `Previously asked (MUST invent a fresh scenario/numbers/decision point, never repeat these):\n- ${prior.join("\n- ")}` : "",
     ]
@@ -2772,7 +2924,7 @@ Rules:
           }
         }
         if (raw) {
-          const parsed = parseJudgeJson<{ prompt?: string; expected_crux?: string }>(raw);
+          const parsed = parseJudgeJson<{ prompt?: string; expected_crux?: string; starter?: string | null }>(raw);
           const promptText =
             typeof parsed?.prompt === "string" && parsed.prompt.trim().length > 6
               ? parsed.prompt.trim()
@@ -2781,8 +2933,18 @@ Rules:
             typeof parsed?.expected_crux === "string" && parsed.expected_crux.trim().length > 4
               ? parsed.expected_crux.trim()
               : undefined;
+          const rawStarter = typeof parsed?.starter === "string" ? parsed.starter.trim() : "";
+          const starterText =
+            rawStarter.length >= 6 && (modality === "fix_bug" || modality === "faded_skeleton" || modality === "synthesis")
+              ? rawStarter.replace(/^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```$/, "$1").trim()
+              : undefined;
           if (promptText) {
-            const entry: PromptCacheEntry = { prompt: promptText, ...(cruxText ? { crux: cruxText } : {}) };
+            const entry: PromptCacheEntry = {
+              prompt: promptText,
+              ...(cruxText ? { crux: cruxText } : {}),
+              modality,
+              ...(starterText ? { starter: starterText } : {}),
+            };
             this.promptCache.set(key, entry);
             this.savePromptCache();
             this.perf?.record(

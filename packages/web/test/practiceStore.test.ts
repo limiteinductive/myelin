@@ -402,6 +402,15 @@ describe("PracticeStore (Solid 2.0)", () => {
       flush();
       expect(store.dueQueue().map((u) => u.unit_id)).toEqual(["u9", "u10", "u11"]);
       expect(store.state.stage).toEqual({ kind: "unit", unitId: "u9" });
+
+      // Synthesis rep crediting u9 + companion u10 + u11 clears all 3 cards in one pass!
+      store.markUnitCompleted("u9", ["u10", "u11"]);
+      flush();
+      store.advanceFromUnit("u9");
+      flush();
+      expect(store.dueQueue()).toHaveLength(0);
+      expect(store.sittingDoneCount()).toBe(3);
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
     } finally {
       dispose();
     }

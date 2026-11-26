@@ -289,7 +289,6 @@ export function DrillView() {
   const citations = () => (isExplore() ? practice.state.explore.citations : (unitSession()?.citations ?? []));
   const passedVerdict = () => (isNonUnit() ? null : (unitSession()?.passedVerdict ?? null));
   const overridden = () => (isNonUnit() ? false : Boolean(unitSession()?.overridden));
-  const railItems = createMemo(() => practice.dueQueue().slice(0, 6));
   const exploreAddedIds = createMemo(() => {
     const ids = new Set<string>();
     if (!isExploreMode() && !activeFrontier()) return ids;
@@ -551,6 +550,9 @@ export function DrillView() {
         practice.updateUnitSession(unitId, (d) => {
           d.scheduler = res.scheduler;
           d.rep = res.rep;
+          if (res.rep?.starter && !d.draft.trim() && d.beats.length === 0 && !d.passedVerdict) {
+            d.draft = res.rep.starter;
+          }
         });
       }
       activeMs = practice.state.sessions[unitId]?.activeMs ?? 0;
@@ -588,11 +590,11 @@ export function DrillView() {
     },
   );
 
-  // Re-sync canvas DPR whenever Sketch opens or Map closes back to DrillView.
+  // Re-sync canvas DPR whenever Sketch opens.
   createEffect(
-    () => [sketchOpen(), practice.state.mapOpen, loading(), Boolean(passedVerdict()?.ok)] as const,
-    ([open, mapOpen]) => {
-      if (open && !mapOpen) requestAnimationFrame(resizeCanvas);
+    () => [sketchOpen(), loading(), Boolean(passedVerdict()?.ok)] as const,
+    ([open]) => {
+      if (open) requestAnimationFrame(resizeCanvas);
     },
   );
 
@@ -614,7 +616,7 @@ export function DrillView() {
   };
 
   const syncSelectedMath = () => {
-    if (!stageEl || practice.state.mapOpen) return;
+    if (!stageEl) return;
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
       clearSelectedMath();
@@ -641,7 +643,6 @@ export function DrillView() {
   };
 
   const updateSelectionPill = () => {
-    if (practice.state.mapOpen) return;
     syncSelectedMath();
     if (citeEditor() || !stageEl) return;
     const sel = window.getSelection();
@@ -800,7 +801,6 @@ export function DrillView() {
       }
     };
     const onSelectionChange = () => {
-      if (practice.state.mapOpen) return;
       syncSelectedMath();
       const sel = window.getSelection();
       if (!sel || sel.isCollapsed) setCitePill(null);
@@ -812,7 +812,6 @@ export function DrillView() {
       if (citeEditor()) setCiteEditor(null);
     };
     const onKey = (e: KeyboardEvent) => {
-      if (practice.state.mapOpen) return;
       if (citeEditor()) {
         if (e.key === "Escape") {
           e.preventDefault();
@@ -899,7 +898,7 @@ export function DrillView() {
       d.overridden = false;
     });
     clearSketch();
-    practice.markUnitCompleted(ownerKey);
+    practice.markUnitCompleted(ownerKey, res.credited_unit_ids);
   };
 
   const updateBeatsFor = (key: string, fn: (list: Beat[]) => void) => {
@@ -1010,6 +1009,8 @@ export function DrillView() {
           prompt: r.prompt,
           attempt: opts.payloadText,
           ...(opts.showPivot ? { show_pivot: true } : {}),
+          ...(r.modality ? { modality: r.modality } : {}),
+          ...(r.bundled_unit_ids && r.bundled_unit_ids.length > 0 ? { bundled_unit_ids: r.bundled_unit_ids } : {}),
           sketch_data_url: opts.sketch,
           latency_ms: opts.latencyMs,
           hints_used: opts.showPivot ? 1 : 0,
@@ -1037,6 +1038,8 @@ export function DrillView() {
         feedback: first.coach,
         turns: middleTurns,
         question: opts.payloadText,
+        ...(r.modality ? { modality: r.modality } : {}),
+        ...(r.bundled_unit_ids && r.bundled_unit_ids.length > 0 ? { bundled_unit_ids: r.bundled_unit_ids } : {}),
         ...(opts.showPivot ? { show_pivot: true } : {}),
         sketch_data_url: opts.sketch,
         latency_ms: opts.latencyMs,
@@ -2056,86 +2059,6 @@ export function DrillView() {
 
   return (
     <div ref={stageEl} class={{ "v2-drill-stage": true, "is-exiting": exiting() }}>
-      <div class="v2-drill-head">
-        <div class="v2-pips" aria-label="Up next">
-          <For each={railItems()}>
-            {(item) => {
-              const isCurrent = () => activeUnitId() === item.unit_id;
-              const isDone = () => practice.state.justCompletedId === item.unit_id;
-              const isPop = () => practice.state.celebratingId === item.unit_id;
-              return (
-                <button
-                  type="button"
-                  class={{
-                    "v2-pip": true,
-                    "is-lit": isDone(),
-                    "is-current": isCurrent() && !isPop(),
-                    "is-pop": isPop(),
-                  }}
-                  data-tip={item.text}
-                  data-tip-side="bottom"
-                  aria-label={item.text}
-                  onClick={() => practice.selectUnit(item.unit_id)}
-                />
-              );
-            }}
-          </For>
-          <button
-            type="button"
-            class={{ "v2-pip-plus": true, "is-active": isExplore() }}
-            data-tip="New exploration"
-            data-tip-side="bottom"
-            aria-label="New exploration"
-            aria-pressed={isExplore() ? "true" : "false"}
-            onClick={() => {
-              if (isExplore()) {
-                resetTransient();
-                practice.resetExplore();
-                requestAnimationFrame(() => {
-                  autoGrow();
-                  textarea?.focus();
-                });
-              } else {
-                practice.selectExplore();
-              }
-            }}
-          >
-            <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
-              <path d="M6 2v8M2 6h8" />
-            </svg>
-          </button>
-        </div>
-
-        <Switch>
-          <Match when={activeFrontier()}>
-            <span class="v2-meta-whisper">
-              briefing
-              <Show when={exploreAddedCount() > 0}>
-                {" · "}
-                {exploreAddedCount()} on map
-              </Show>
-            </span>
-          </Match>
-          <Match when={activeExploration() || (isExplore() && exploreAddedCount() > 0)}>
-            <span class="v2-meta-whisper">
-              exploration
-              <Show when={exploreAddedCount() > 0}>
-                {" · "}
-                {exploreAddedCount()} on map
-              </Show>
-            </span>
-          </Match>
-          <Match when={rep()}>
-            {(r) => (
-              <span class="v2-meta-whisper">
-                {r().kind} · {r().depth}
-                <Show when={r().reviews > 0}> · P {Math.round(r().p_imm * 100)}%</Show>
-              </span>
-            )}
-          </Match>
-        </Switch>
-      </div>
-
       <Show when={!loading()} fallback={<div class="v2-loading-dots"><span /><span /><span /></div>}>
         <Show
           when={!isSittingDone()}
@@ -2691,7 +2614,7 @@ export function DrillView() {
               <div class="v2-wrap-nudge" role="status">
                 <div class="v2-wrap-nudge-copy">
                   <span class="v2-wrap-nudge-title">
-                    {exploreAddedCount()} new units on your map — drill this batch before adding more.
+                    {exploreAddedCount()} new cards queued — drill this batch before adding more.
                   </span>
                   <span class="v2-wrap-nudge-sub">
                     This thread stays saved in the sidebar so you can always come right back to it.
@@ -2911,7 +2834,7 @@ export function DrillView() {
             <div class="v2-pad-foot">
               <div class="v2-pad-tools">
                 <Show when={(isExploreMode() || activeFrontier()) && exploreAddedCount() > 0}>
-                  <span class="v2-pad-map-count">{exploreAddedCount()} on map</span>
+                  <span class="v2-pad-map-count">{exploreAddedCount()} queued</span>
                 </Show>
               </div>
 
@@ -3019,12 +2942,12 @@ export function DrillView() {
             <button
               type="button"
               class={{ "v2-cite-pill-btn": true, "is-done": pinnedMap() }}
-              data-tip="Add to map"
+              data-tip="Add to practice"
               data-tip-side="bottom"
               disabled={pinningMap()}
               onClick={() => void pinSelectionToMap()}
             >
-              <span>{pinnedMap() ? "Added" : pinningMap() ? "…" : "+ Map"}</span>
+              <span>{pinnedMap() ? "Added" : pinningMap() ? "…" : "+ Practice"}</span>
             </button>
           </div>
         )}

@@ -69,6 +69,8 @@ export interface ExploreResponse {
   failed?: boolean;
 }
 
+export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis";
+
 export interface DrillRep {
   unit_id: string;
   text: string;
@@ -76,6 +78,9 @@ export interface DrillRep {
   topic: string | null;
   depth: Depth;
   prompt: string;
+  modality?: RepModality;
+  starter?: string | null;
+  bundled_unit_ids?: string[];
   rests_on: string[];
   p_imm: number;
   reviews: number;
@@ -101,6 +106,7 @@ export interface CheckDrillResponse {
   annotations?: InlineAnnotation[];
   habit_observed?: string | null;
   added_units?: AddedUnit[];
+  credited_unit_ids?: string[];
   probe_id: string | null;
   latency_ms: number | null;
   prev_latency_ms: number | null;
@@ -382,6 +388,8 @@ export function checkDrill(
     prompt: string;
     attempt: string;
     show_pivot?: boolean;
+    modality?: RepModality;
+    bundled_unit_ids?: string[];
     sketch_data_url?: string | null;
     history?: { attempt: string; feedback: string }[];
     latency_ms: number | null;
@@ -428,6 +436,8 @@ export function askDrillFollowUp(
     question: string;
     revised_attempt?: boolean;
     show_pivot?: boolean;
+    modality?: RepModality;
+    bundled_unit_ids?: string[];
     sketch_data_url?: string | null;
     latency_ms: number | null;
     hints_used: number;

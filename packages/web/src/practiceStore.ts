@@ -380,7 +380,7 @@ export interface PracticeStore {
   unarchiveExplorationById(id: string): Promise<void>;
   removeExplorationById(id: string): Promise<void>;
 
-  markUnitCompleted(unitId: string): void;
+  markUnitCompleted(unitId: string, extraCreditedIds?: string[]): void;
   practiceUnitAgain(unitId: string): void;
   advanceFromUnit(fromUnitId: string | null): void;
   startNextSitting(): void;
@@ -879,7 +879,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     }
   };
 
-  const markUnitCompleted = (unitId: string) => {
+  const markUnitCompleted = (unitId: string, extraCreditedIds?: string[]) => {
     if (celebrateTimer) clearTimeout(celebrateTimer);
     setState((s) => {
       s.justCompletedId = unitId;
@@ -890,6 +890,14 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       if (item && (nextIn === null || nextIn > 0)) {
         item.due = false;
         if (nextIn !== null) item.next_in_ms = nextIn;
+      }
+      if (extraCreditedIds && extraCreditedIds.length > 0) {
+        for (const cid of extraCreditedIds) {
+          if (!cid || cid === unitId) continue;
+          s.sittingCompletedIds[cid] = true;
+          const extra = s.queue.find((u) => u.unit_id === cid);
+          if (extra) extra.due = false;
+        }
       }
     });
     celebrateTimer = setTimeout(() => {

@@ -4,7 +4,6 @@ import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, Sw
 import { watchActivity } from "./activity.js";
 import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
-import { MapView } from "./MapView.js";
 import { createPracticeStore, PracticeContext, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
 import { formatSidebarDrillLabel, plainSidebarText } from "./sidebar.js";
@@ -229,10 +228,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     const unwatch = watchActivity(s);
 
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && practice.state.mapOpen) {
-        practice.setMapOpen(false);
-        return;
-      }
       if (e.altKey && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
         if (e.key === "ArrowLeft") {
           e.preventDefault();
@@ -249,9 +244,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
       if (e.key === "\\") {
         e.preventDefault();
         setSidebarOpen((v) => !v);
-      } else if (e.key.toLowerCase() === "m") {
-        e.preventDefault();
-        practice.setMapOpen((v) => !v);
       } else if (e.key === "[" || e.key === "]") {
         const active = document.activeElement;
         if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) return;
@@ -289,8 +281,8 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   };
 
   // ----- In-app Back / Forward navigation history -----
-  type NavEntry = { stage: Stage; mapOpen: boolean };
-  const navKey = (e: NavEntry) => `${e.mapOpen ? "map:" : ""}${sessionKeyForStage(e.stage)}`;
+  type NavEntry = { stage: Stage };
+  const navKey = (e: NavEntry) => sessionKeyForStage(e.stage);
   const [navStack, setNavStack] = createSignal<NavEntry[]>([]);
   const [navIdx, setNavIdx] = createSignal(-1);
   let replayingNav = false;
@@ -305,7 +297,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
           : s.kind === "exploration"
             ? { kind: "exploration", explorationId: s.explorationId }
             : { kind: "explore" };
-    return { stage, mapOpen: practice.state.mapOpen };
+    return { stage };
   });
 
   createEffect(
@@ -336,7 +328,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     else if (s.kind === "exploration") practice.selectExploration(s.explorationId);
     else if (s.kind === "frontier") practice.selectFrontier(s.frontierId);
     else practice.selectExplore();
-    if (entry.mapOpen) practice.setMapOpen(true);
   };
 
   const goBack = () => {
@@ -398,9 +389,9 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
 
   // ----- Sidebar view state (session-only; the record lives in the practice store) -----
   const stageUnitId = () => (practice.state.stage.kind === "unit" ? practice.state.stage.unitId : null);
-  const isUnitActive = (id: string) => !practice.state.mapOpen && stageUnitId() === id;
+  const isUnitActive = (id: string) => stageUnitId() === id;
   const isPracticeActive = () =>
-    !practice.state.mapOpen && (practice.state.stage.kind === "unit" || practice.state.stage.kind === "sitting-done");
+    practice.state.stage.kind === "unit" || practice.state.stage.kind === "sitting-done";
 
   const [explorationsExpanded, setExplorationsExpanded] = createSignal(false);
   const visibleExplorations = createMemo(() => {
@@ -429,11 +420,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   const openPractice = () => {
     if (isPracticeActive()) {
       if (practice.dueQueue().length > 0) setQueueOpen((v) => !v);
-      return;
-    }
-    if (practice.state.stage.kind === "unit") {
-      practice.setMapOpen(false);
-      closeSidebarOnNarrow();
       return;
     }
     const target = practice.dueQueue()[0];
@@ -527,7 +513,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                     type="button"
                     class={{
                       "v2-sb-head-add": true,
-                      "is-active": !practice.state.mapOpen && practice.state.stage.kind === "explore",
+                      "is-active": practice.state.stage.kind === "explore",
                     }}
                     aria-label="New exploration"
                     data-tip="New exploration"
@@ -543,7 +529,6 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                   <For each={visibleExplorations()}>
                     {(e) => {
                       const isActive = () =>
-                        !practice.state.mapOpen &&
                         practice.state.stage.kind === "exploration" &&
                         practice.state.stage.explorationId === e.id;
                       return (
@@ -593,7 +578,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                   <For each={practice.state.frontiers}>
                     {(f) => {
                       const isActive = () =>
-                        !practice.state.mapOpen && practice.state.stage.kind === "frontier" && practice.state.stage.frontierId === f.id;
+                        practice.state.stage.kind === "frontier" && practice.state.stage.frontierId === f.id;
                       return (
                         <div class="v2-sb-row">
                           <button
@@ -711,27 +696,11 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
 
             <div class="v2-topbar-right">
               <Show when={run()}>{(r) => <RunClock run={r()} now={clockNow()} />}</Show>
-              <button
-                type="button"
-                class={{ "v2-map-toggle": true, "is-active": practice.state.mapOpen }}
-                aria-pressed={practice.state.mapOpen ? "true" : "false"}
-                data-tip="Toggle Map (⌘M)"
-                data-tip-side="bottom"
-                onClick={() => practice.setMapOpen((v) => !v)}
-              >
-                Map
-              </button>
             </div>
           </header>
 
           <div class="v2-body">
-            {/* Keep DrillView mounted across Map toggles so in-flight checks & canvas strokes survive ⌘M */}
-            <div class={{ "v2-stage-hidden": practice.state.mapOpen }}>
-              <DrillView />
-            </div>
-            <Show when={practice.state.mapOpen}>
-              <MapView />
-            </Show>
+            <DrillView />
           </div>
         </div>
       </div>

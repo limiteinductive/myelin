@@ -13,7 +13,16 @@ import { FrontierStore, type Frontier } from "./frontiers.js";
 import { FastJudge } from "./judge.js";
 import { formatServerTiming, PerfLog, type PerfOp, type PerfRecord } from "./perf.js";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
-import { computeCalibratedIntervals, pickDrillDepth, RwkvInstantEngine, unitExposureStats, type RwkvUnitScore } from "./rwkv.js";
+import {
+  computeCalibratedIntervals,
+  pickDrillDepth,
+  pickRepModality,
+  pickSynthesisCluster,
+  RwkvInstantEngine,
+  unitExposureStats,
+  type RepModality,
+  type RwkvUnitScore,
+} from "./rwkv.js";
 import type { Sandbox } from "./sandbox.js";
 import {
   ConflictError,
@@ -213,11 +222,25 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
       }
 
+      const allUnitsCatalog = activeUnits.slice(0, 80).map((u) => {
+        const s = scores.get(u.id);
+        return {
+          id: u.id,
+          text: u.text,
+          kind: u.kind,
+          topic: u.topic,
+          rests_on: u.rests_on,
+          p_imm: s?.p_imm ?? 0,
+          reviews: s?.reviews ?? 0,
+        };
+      });
+
       const dreamed = await judge.dream({
         currentMemory: existing?.content ?? "",
         updatedBy: existing?.updated_by ?? "dream",
         masteredUnits,
         shakyUnits,
+        allUnits: allUnitsCatalog,
         recentAttempts: attempts,
         recentExplorations: recentExplorations.map((e) => ({
           title: e.title,
@@ -230,10 +253,93 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         recentOverrides,
       });
 
+      // Conservative offline Map Compaction: apply validated merges, baseline retires, and missing DAG links.
+      let mergedCount = 0;
+      let retiredCount = 0;
+      let linkedCount = 0;
+      let evOffset = 1;
+      const compactedIds = new Set<string>();
+
+      for (const m of dreamed.merges ?? []) {
+        const liveState = store.state;
+        const keeper = resolveUnit(liveState, m.keep_id);
+        if (!keeper || keeper.status !== "active" || keeper.observe_only || compactedIds.has(keeper.id)) continue;
+        const validMerged = m.merge_ids
+          .map((id) => resolveUnit(liveState, id))
+          .filter((u): u is Unit => Boolean(u && u.status === "active" && !u.observe_only && u.id !== keeper.id && !compactedIds.has(u.id)))
+          .map((u) => u.id);
+        if (validMerged.length === 0) continue;
+        const ev = makeEvent(
+          "unit.merged",
+          { unit_id: keeper.id, merged: validMerged, text: m.text?.trim() || null },
+          { id: uuidv7(now + evOffset++), device_id: DRILL_DEVICE, ts: now + evOffset },
+        );
+        store.append([ev]);
+        for (const id of validMerged) compactedIds.add(id);
+        mergedCount += validMerged.length;
+      }
+
+      for (const rid of dreamed.retire_ids ?? []) {
+        const liveState = store.state;
+        const target = resolveUnit(liveState, rid);
+        const s = target ? scores.get(target.id) : undefined;
+        if (!target || target.status !== "active" || target.observe_only || compactedIds.has(target.id)) continue;
+        // Safety rail: only auto-retire genuinely mastered baseline units.
+        if ((s?.reviews ?? 0) < 3 || (s?.p_imm ?? 0) < 0.9) continue;
+        const ev = makeEvent(
+          "unit.retired",
+          { unit_id: target.id, reason: "Retired by Dream compaction (mastered baseline)" },
+          { id: uuidv7(now + evOffset++), device_id: DRILL_DEVICE, ts: now + evOffset },
+        );
+        store.append([ev]);
+        compactedIds.add(target.id);
+        retiredCount++;
+      }
+
+      const reaches = (st: State, fromId: string, targetId: string, seen = new Set<string>()): boolean => {
+        if (fromId === targetId) return true;
+        if (seen.has(fromId)) return false;
+        seen.add(fromId);
+        const cur = st.units[fromId];
+        if (!cur) return false;
+        return cur.rests_on.some((pid) => reaches(st, pid, targetId, seen));
+      };
+
+      for (const l of dreamed.links ?? []) {
+        const liveState = store.state;
+        const target = resolveUnit(liveState, l.unit_id);
+        if (!target || target.status !== "active" || target.observe_only) continue;
+        const nextRestsOn = new Set(target.rests_on);
+        let addedAny = false;
+        for (const pid of l.rests_on) {
+          const p = resolveUnit(liveState, pid);
+          if (!p || p.status !== "active" || p.observe_only || p.id === target.id) continue;
+          if (nextRestsOn.has(p.id)) continue;
+          if (reaches(liveState, p.id, target.id)) continue; // prevent DAG cycles
+          nextRestsOn.add(p.id);
+          addedAny = true;
+        }
+        if (!addedAny) continue;
+        const ev = makeEvent(
+          "unit.linked",
+          { unit_id: target.id, rests_on: [...nextRestsOn] },
+          { id: uuidv7(now + evOffset++), device_id: DRILL_DEVICE, ts: now + evOffset },
+        );
+        store.append([ev]);
+        linkedCount++;
+      }
+
+      const compactNotes: string[] = [];
+      if (mergedCount > 0) compactNotes.push(`merged ${mergedCount} duplicate${mergedCount === 1 ? "" : "s"}`);
+      if (retiredCount > 0) compactNotes.push(`retired ${retiredCount} mastered`);
+      if (linkedCount > 0) compactNotes.push(`linked ${linkedCount} prereq${linkedCount === 1 ? "" : "s"}`);
+      const finalSummary =
+        compactNotes.length > 0 ? `${dreamed.summary} (Compaction: ${compactNotes.join(", ")}.)` : dreamed.summary;
+
       const updated: AgentMemoryRecord = {
         key: "learner",
         content: dreamed.memory,
-        last_dream_seq: toSeq,
+        last_dream_seq: store.head,
         last_dream_at: now,
         dream_count: (existing?.dream_count ?? 0) + 1,
         updated_at: now,
@@ -244,8 +350,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const log: DreamLogRecord = {
         id: uuidv7(now),
         from_seq: fromSeq,
-        to_seq: toSeq,
-        summary: dreamed.summary,
+        to_seq: store.head,
+        summary: finalSummary,
         promoted: dreamed.promoted,
         graduated: dreamed.graduated,
         created_at: now,
@@ -1470,16 +1576,32 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     }
 
     const score = scores.get(picked.id);
+    const dueIds = new Set(
+      candidates
+        .filter((u) => {
+          const s = scores.get(u.id);
+          const reviews = s?.reviews ?? 0;
+          const nextIn = s?.next_in_ms ?? null;
+          return reviews === 0 || (nextIn !== null ? nextIn <= 0 : (s?.p_imm ?? 0) < 0.85);
+        })
+        .map((u) => u.id),
+    );
     const depth = pickDrillDepth(picked, state);
     const restsOn = picked.rests_on.map((id) => state.units[id]?.text ?? id);
+    const bundledUnits = pickSynthesisCluster(picked, state, dueIds, 2);
+    const bundledIds = bundledUnits.map((b) => b.id);
+    const modality = pickRepModality(picked, state, depth, bundledUnits);
     const stats = unitExposureStats(state, picked.id, depth, now);
-    const cacheHit = judge.peekPrompt(picked, depth, restsOn, stats.depthPasses) !== null;
-    const prompt = await judge.promptFor(picked, restsOn, depth, {
+    const cacheHit = judge.peekPromptEntry(picked, depth, restsOn, stats.depthPasses, modality, bundledIds) !== null;
+    const promptEntry = await judge.promptEntryFor(picked, restsOn, depth, {
       variant: stats.depthPasses,
       priorPrompts: stats.priorPrompts,
       delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
       learnerMemory: learnerMemoryOf(store),
+      modality,
+      bundledUnits: bundledUnits.map((b) => ({ id: b.id, text: b.text, kind: b.kind })),
     });
+    const prompt = promptEntry.prompt;
     const trend = latencyTrend(state, picked);
     const nextRec: PerfRecord = {
       ts: t0,
@@ -1494,7 +1616,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
     // Eagerly prefetch the next 4 upcoming cards while the learner works on this one.
     const upcoming = rankDrillCandidates(
-      candidates.filter((u) => u.id !== picked.id),
+      candidates.filter((u) => u.id !== picked.id && !bundledIds.includes(u.id)),
       state,
       scores,
     ).slice(0, 4);
@@ -1504,6 +1626,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           const d = pickDrillDepth(u, state);
           const ro = u.rests_on.map((id) => state.units[id]?.text ?? id);
           const st = unitExposureStats(state, u.id, d, now);
+          const b = pickSynthesisCluster(u, state, dueIds, 2);
+          const m = pickRepModality(u, state, d, b);
           return {
             unit: u,
             restsOn: ro,
@@ -1511,6 +1635,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             variant: st.depthPasses,
             priorPrompts: st.priorPrompts,
             delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
+            modality: m,
+            bundledUnits: b.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
           };
         }),
       );
@@ -1528,6 +1654,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         topic: picked.topic,
         depth,
         prompt,
+        modality: promptEntry.modality ?? modality,
+        ...(promptEntry.starter ? { starter: promptEntry.starter } : {}),
+        ...(bundledIds.length > 0 ? { bundled_unit_ids: bundledIds } : {}),
         rests_on: restsOn,
         p_imm: score?.p_imm ?? 0,
         reviews: score?.reviews ?? 0,
@@ -1553,6 +1682,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       hints_used?: number;
       hint_only?: boolean;
       show_pivot?: boolean;
+      modality?: RepModality;
+      bundled_unit_ids?: string[];
       rung?: number;
     } | null;
 
@@ -1563,7 +1694,19 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
     const depth: Depth = body.depth && ["recall", "rebuild", "explain", "use"].includes(body.depth) ? body.depth : pickDrillDepth(u, state);
     const preStats = unitExposureStats(state, u.id, depth, Date.now());
-    const cachedPromptEntry = judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses);
+    const bundledIds = Array.isArray(body.bundled_unit_ids)
+      ? body.bundled_unit_ids.filter((id): id is string => typeof id === "string" && id !== u.id).slice(0, 3)
+      : [];
+    const bundledUnits = bundledIds
+      .map((id) => resolveUnit(state, id))
+      .filter((x): x is Unit => Boolean(x && x.status === "active" && !x.observe_only && x.id !== u.id));
+    const reqModality: RepModality =
+      body.modality && ["direct", "fix_bug", "faded_skeleton", "contrast", "synthesis"].includes(body.modality)
+        ? body.modality
+        : pickRepModality(u, state, depth, bundledUnits);
+    const cachedPromptEntry =
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses, reqModality, bundledIds) ??
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses);
     const prompt = body.prompt?.trim() || cachedPromptEntry?.prompt || (await judge.promptFor(u, restsOn, depth));
     const expectedCrux = cachedPromptEntry?.crux;
     const firstContact = u.told && preStats.passes === 0;
@@ -1626,6 +1769,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           expectedCrux,
           firstContact,
           showPivot,
+          ...(bundledUnits.length > 0 ? { bundledUnits: bundledUnits.map((b) => b.text) } : {}),
           unitText: u.text,
           unitKind: u.kind,
           depth,
@@ -1652,6 +1796,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       let probeId: string | null = null;
       let nextInMs: number | null = null;
+      const creditedUnitIds: string[] = [];
       if (verdict.ok && !verdict.failed) {
         const ev = makeEvent(
           "unit.probed",
@@ -1673,6 +1818,34 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         store.append([ev]);
         probeId = ev.id;
 
+        // Synthesis multiplier: passing a bundled multi-unit rep cleanly credits companion units in context.
+        if (verdict.grade !== "again" && !showPivot && bundledUnits.length > 0) {
+          let offset = 2;
+          for (const companion of bundledUnits) {
+            const cPre = scores.get(companion.id);
+            store.append([
+              makeEvent(
+                "unit.probed",
+                {
+                  unit_id: companion.id,
+                  depth: pickDrillDepth(companion, store.state),
+                  slot: "in_context",
+                  prompt: prompt.slice(0, 1000),
+                  answer_message_id: null,
+                  grade: "good",
+                  corrected_grade: null,
+                  hints: 0,
+                  latency_ms: latencyMs,
+                  scheduler,
+                  predicted_recall: cPre ? cPre.p_imm : null,
+                },
+                { id: uuidv7(now + offset++), device_id: DRILL_DEVICE, ts: now + offset },
+              ),
+            ]);
+            creditedUnitIds.push(companion.id);
+          }
+        }
+
         // If a personal Thinking Move appeared unprompted, log it automatically.
         if (verdict.habit_observed) {
           const matched = habits.find((h) => h.text.toLowerCase() === verdict.habit_observed!.toLowerCase());
@@ -1681,14 +1854,22 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               makeEvent(
                 "unit.observed",
                 { unit_id: matched.id, present: true, note: `Appeared during drill on "${u.text.slice(0, 80)}"`, page_id: null, message_id: null, elapsed_ms: latencyMs },
-                { id: uuidv7(now + 1), device_id: DRILL_DEVICE, ts: now + 1 },
+                { id: uuidv7(now + 10), device_id: DRILL_DEVICE, ts: now + 10 },
               ),
             ]);
           }
         }
 
-        const after = scoreAll(store.state, store.scheduler, now + 2);
+        const after = scoreAll(store.state, store.scheduler, now + 12);
         nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
+        // Include any due rests_on prerequisites that became non-due via downward DAG credit.
+        for (const pid of u.rests_on) {
+          const beforeScore = scores.get(pid);
+          const afterScore = after.scores.get(pid);
+          const wasDue = beforeScore ? beforeScore.reviews === 0 || (beforeScore.next_in_ms ?? 0) <= 0 : false;
+          const nowNotDue = afterScore ? (afterScore.next_in_ms ?? 0) > 0 : false;
+          if (wasDue && nowNotDue && !creditedUnitIds.includes(pid)) creditedUnitIds.push(pid);
+        }
         // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
         const postState = store.state;
         const refreshedU = postState.units[u.id] ?? u;
@@ -1720,6 +1901,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ...verdict,
         attempt_id: attemptId,
         added_units: addedUnits,
+        ...(creditedUnitIds.length > 0 ? { credited_unit_ids: creditedUnitIds } : {}),
         probe_id: probeId,
         latency_ms: latencyMs,
         prev_latency_ms: trend.prev_ms,
@@ -1772,6 +1954,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       question?: string;
       revised_attempt?: boolean;
       show_pivot?: boolean;
+      modality?: RepModality;
+      bundled_unit_ids?: string[];
       sketch_data_url?: string | null;
       latency_ms?: number | null;
       hints_used?: number;
@@ -1785,7 +1969,19 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
     const depth: Depth = body.depth && ["recall", "rebuild", "explain", "use"].includes(body.depth) ? body.depth : pickDrillDepth(u, state);
     const preStats = unitExposureStats(state, u.id, depth, Date.now());
-    const expectedCrux = judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses)?.crux;
+    const bundledIds = Array.isArray(body.bundled_unit_ids)
+      ? body.bundled_unit_ids.filter((id): id is string => typeof id === "string" && id !== u.id).slice(0, 3)
+      : [];
+    const bundledUnits = bundledIds
+      .map((id) => resolveUnit(state, id))
+      .filter((x): x is Unit => Boolean(x && x.status === "active" && !x.observe_only && x.id !== u.id));
+    const reqModality: RepModality =
+      body.modality && ["direct", "fix_bug", "faded_skeleton", "contrast", "synthesis"].includes(body.modality)
+        ? body.modality
+        : pickRepModality(u, state, depth, bundledUnits);
+    const expectedCrux =
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses, reqModality, bundledIds)?.crux ??
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthPasses)?.crux;
     const firstContact = u.told && preStats.passes === 0;
     const turns = Array.isArray(body.turns)
       ? body.turns.filter((t): t is { role: "user" | "assistant"; text: string } => (t?.role === "user" || t?.role === "assistant") && typeof t?.text === "string").slice(-20)
@@ -1818,6 +2014,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           expectedCrux,
           firstContact,
           showPivot,
+          ...(bundledUnits.length > 0 ? { bundledUnits: bundledUnits.map((b) => b.text) } : {}),
           unitText: u.text,
           unitKind: u.kind,
           depth,
@@ -1847,6 +2044,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       let probeId: string | null = null;
       let nextInMs: number | null = null;
+      const creditedUnitIds: string[] = [];
       if (verdict.ok && !verdict.failed) {
         const ev = makeEvent(
           "unit.probed",
@@ -1867,6 +2065,34 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         );
         store.append([ev]);
         probeId = ev.id;
+
+        if (verdict.grade !== "again" && !showPivot && bundledUnits.length > 0) {
+          let offset = 2;
+          for (const companion of bundledUnits) {
+            const cPre = scores.get(companion.id);
+            store.append([
+              makeEvent(
+                "unit.probed",
+                {
+                  unit_id: companion.id,
+                  depth: pickDrillDepth(companion, store.state),
+                  slot: "in_context",
+                  prompt: (body.prompt ?? "").slice(0, 1000),
+                  answer_message_id: null,
+                  grade: "good",
+                  corrected_grade: null,
+                  hints: 0,
+                  latency_ms: latencyMs,
+                  scheduler,
+                  predicted_recall: cPre ? cPre.p_imm : null,
+                },
+                { id: uuidv7(now + offset++), device_id: DRILL_DEVICE, ts: now + offset },
+              ),
+            ]);
+            creditedUnitIds.push(companion.id);
+          }
+        }
+
         if (verdict.habit_observed) {
           const matched = habits.find((h) => h.text.toLowerCase() === verdict.habit_observed!.toLowerCase());
           if (matched) {
@@ -1874,13 +2100,20 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               makeEvent(
                 "unit.observed",
                 { unit_id: matched.id, present: true, note: `Appeared during drill on "${u.text.slice(0, 80)}"`, page_id: null, message_id: null, elapsed_ms: latencyMs },
-                { id: uuidv7(now + 1), device_id: DRILL_DEVICE, ts: now + 1 },
+                { id: uuidv7(now + 10), device_id: DRILL_DEVICE, ts: now + 10 },
               ),
             ]);
           }
         }
-        const after = scoreAll(store.state, store.scheduler, now + 2);
+        const after = scoreAll(store.state, store.scheduler, now + 12);
         nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
+        for (const pid of u.rests_on) {
+          const beforeScore = scores.get(pid);
+          const afterScore = after.scores.get(pid);
+          const wasDue = beforeScore ? beforeScore.reviews === 0 || (beforeScore.next_in_ms ?? 0) <= 0 : false;
+          const nowNotDue = afterScore ? (afterScore.next_in_ms ?? 0) > 0 : false;
+          if (wasDue && nowNotDue && !creditedUnitIds.includes(pid)) creditedUnitIds.push(pid);
+        }
         // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
         const postState = store.state;
         const refreshedU = postState.units[u.id] ?? u;
@@ -1912,6 +2145,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ...verdict,
         attempt_id: attemptId,
         added_units: addedUnits,
+        ...(creditedUnitIds.length > 0 ? { credited_unit_ids: creditedUnitIds } : {}),
         probe_id: probeId,
         latency_ms: latencyMs,
         prev_latency_ms: trend.prev_ms,

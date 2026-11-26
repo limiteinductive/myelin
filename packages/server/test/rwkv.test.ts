@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { emptyState, fsrsScheduler, makeEvent, replay, uuidv7 } from "@myelin/core";
-import { computeCalibratedIntervals, pickDrillDepth, RwkvInstantEngine } from "../src/rwkv.js";
+import { computeCalibratedIntervals, pickDrillDepth, pickRepModality, pickSynthesisCluster, RwkvInstantEngine } from "../src/rwkv.js";
 
 const MODEL_DIR = fileURLToPath(new URL("../../../data/models/sm72e25/sm72e25", import.meta.url));
 
@@ -100,5 +100,39 @@ print(json.dumps(out))
     expect(cal.get(uLapse)!.next_in_ms).toBeGreaterThanOrEqual(3.9 * 3600_000);
     expect(cal.get(uGood)!.next_in_ms).toBeGreaterThanOrEqual(24 * 3600_000);
     expect(pickDrillDepth(state.units[uTold]!, state)).toBe("explain");
+  });
+
+  it("propagates downward rests_on credit, bundles synthesis clusters, and selects adaptive rep modalities", () => {
+    const t0 = 1_790_000_000_000;
+    const uBase = uuidv7(t0);
+    const uDerived = uuidv7(t0 + 1);
+    const uSibling = uuidv7(t0 + 2);
+    const uUnrelated = uuidv7(t0 + 3);
+    const uDef = uuidv7(t0 + 4);
+    const events = [
+      makeEvent("unit.found", { unit_id: uBase, text: "Linear attention replaces softmax with a kernel map phi(q)^T phi(k).", kind: "mechanism", topic: "Linear Attention", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0), device_id: "server:drill", ts: t0, seq: 1 }),
+      makeEvent("unit.found", { unit_id: uDerived, text: "Causal linear attention maintains a d_k x d_v recurrent state matrix S_t = S_{t-1} + phi(k_t) v_t^T.", kind: "mechanism", topic: "Linear Attention", rests_on: [uBase], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0 + 1), device_id: "server:drill", ts: t0 + 1, seq: 2 }),
+      makeEvent("unit.found", { unit_id: uSibling, text: "Additive linear attention hits fixed-capacity memory interference across keys phi(k).", kind: "mechanism", topic: "Linear Attention", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0 + 2), device_id: "server:drill", ts: t0 + 2, seq: 3 }),
+      makeEvent("unit.found", { unit_id: uUnrelated, text: "Borzoi uses dilated convolutions across genomic windows.", kind: "result", topic: "Genomics", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0 + 3), device_id: "server:drill", ts: t0 + 3, seq: 4 }),
+      makeEvent("unit.found", { unit_id: uDef, text: "Homoscedasticity means constant error variance.", kind: "definition", topic: "Stats", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null }, { id: uuidv7(t0 + 4), device_id: "server:drill", ts: t0 + 4, seq: 5 }),
+      // Passing uDerived cleanly should also refresh its rests_on prerequisite uBase via downward DAG credit!
+      makeEvent("unit.probed", { unit_id: uDerived, depth: "rebuild", slot: "seam", prompt: "Derive S_t", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 20_000, scheduler: "rwkv", predicted_recall: 0.5 }, { id: uuidv7(t0 + 5000), device_id: "server:drill", ts: t0 + 5000, seq: 6 }),
+    ];
+    const state = replay(events, fsrsScheduler(), emptyState(fsrsScheduler()));
+    const cal = computeCalibratedIntervals(state, t0 + 10_000);
+    // uBase had 0 direct probes, yet received downward credit from uDerived's clean pass!
+    expect(cal.get(uBase)!.reviews).toBe(1);
+    expect(cal.get(uBase)!.next_in_ms).toBeGreaterThanOrEqual(24 * 3600_000);
+
+    // Synthesis cluster bundles related due units (uBase + uSibling), excludes unrelated Genomics unit
+    const dueIds = new Set([uDerived, uBase, uSibling, uUnrelated]);
+    const bundle = pickSynthesisCluster(state.units[uDerived]!, state, dueIds, 2);
+    expect(bundle.map((u) => u.id)).toEqual([uBase, uSibling]);
+
+    // Adaptive modality selection
+    expect(pickRepModality(state.units[uDerived]!, state, "use", bundle)).toBe("synthesis");
+    expect(pickRepModality(state.units[uDef]!, state, "recall", [])).toBe("contrast");
+    expect(pickRepModality(state.units[uSibling]!, state, "recall", [])).toBe("faded_skeleton");
+    expect(pickRepModality(state.units[uDerived]!, state, "use", [])).toBe("fix_bug");
   });
 });

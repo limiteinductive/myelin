@@ -881,15 +881,20 @@ export function unitExposureStats(state: State, unitId: string, depth?: Depth, n
 
 const MIN_LAPSE_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4h: next sitting, never a 10m boomerang
 
+export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis";
+
 /**
  * Computes calibrated FSRS-6 (requestRetention = 0.85, optimal desirable difficulty for active
  * generative recall) spacing intervals across ALL probe depths (recall/rebuild/explain/use).
  *
- * Key decoupling from Anki lapse traps:
+ * Key decoupling from Anki lapse traps & DAG multipliers:
  * - Assisted Build-gear completions (`again` with hints > 0) and first-contact `told` acquisitions
  *   are initial encoding, not memory lapses -> fed as `hard` (~12-24h consolidation).
  * - Pure unassisted lapses (`again`, hints === 0) get at least a 4-hour next-sitting floor so
  *   completed cards never boomerang back into the middle of the same sitting.
+ * - Downward DAG credit: passing a dependent unit cleanly (`grade !== "again"`, `hints === 0`)
+ *   automatically grants implicit `good` consolidation credit to its `rests_on` prerequisites
+ *   (up to depth 2) so proving a higher concept refreshes its foundations without redundant cards.
  */
 export function computeCalibratedIntervals(
   state: State,
@@ -898,24 +903,71 @@ export function computeCalibratedIntervals(
   const sched = fsrsScheduler({ requestRetention: 0.85 });
   const out = new Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }>();
 
+  // Pre-collect downward DAG credit: ancestorId -> clean pass timestamps from dependents.
+  const downwardCredits = new Map<string, { at: number; seq: number }[]>();
+  const collectAncestors = (unitId: string, depthLeft: number, seen: Set<string>): void => {
+    if (depthLeft <= 0) return;
+    const u = state.units[unitId];
+    if (!u) return;
+    for (const pid of u.rests_on) {
+      if (seen.has(pid)) continue;
+      const p = state.units[pid];
+      if (!p || p.status === "split" || p.status === "merged" || p.observe_only) continue;
+      seen.add(pid);
+      collectAncestors(pid, depthLeft - 1, seen);
+    }
+  };
+
+  for (const child of Object.values(state.units)) {
+    if (child.status !== "active" || child.observe_only || child.rests_on.length === 0) continue;
+    const ancestors = new Set<string>();
+    collectAncestors(child.id, 2, ancestors);
+    if (ancestors.size === 0) continue;
+    for (const evId of child.evidence) {
+      const ev = state.evidence[evId];
+      if (!ev || ev.source !== "probe" || ev.grade === null || ev.grade === "again" || ev.hints > 0) continue;
+      for (const ancId of ancestors) {
+        const anc = state.units[ancId];
+        if (!anc || ev.at < anc.found_at) continue;
+        let list = downwardCredits.get(ancId);
+        if (!list) {
+          list = [];
+          downwardCredits.set(ancId, list);
+        }
+        list.push({ at: ev.at, seq: ev.seq });
+      }
+    }
+  }
+
   for (const u of Object.values(state.units)) {
     if (u.status === "split" || u.status === "merged" || u.observe_only) continue;
-    const probes = u.evidence
+    const directProbes = u.evidence
       .map((id) => state.evidence[id])
       .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null))
-      .sort((a, b) => a.at - b.at || a.seq - b.seq);
+      .map((ev) => ({ at: ev.at, seq: ev.seq, grade: ev.grade!, hints: ev.hints, implicit: false }));
 
-    if (probes.length === 0) {
+    const implicitRaw = (downwardCredits.get(u.id) ?? []).sort((a, b) => a.at - b.at || a.seq - b.seq);
+    const merged: { at: number; seq: number; grade: Grade; hints: number; implicit: boolean }[] = [...directProbes];
+    for (const imp of implicitRaw) {
+      // Avoid double-counting an implicit credit within 4h of an existing direct or implicit event.
+      const nearExisting = merged.some((e) => Math.abs(e.at - imp.at) < MIN_LAPSE_INTERVAL_MS);
+      if (!nearExisting) {
+        merged.push({ at: imp.at, seq: imp.seq, grade: "good", hints: 0, implicit: true });
+      }
+    }
+    merged.sort((a, b) => a.at - b.at || a.seq - b.seq);
+
+    if (merged.length === 0) {
       out.set(u.id, { next_in_ms: 0, fsrs_recall: 0, reviews: 0 });
       continue;
     }
 
     let mem = sched.init();
     let lastAt = 0;
-    for (let i = 0; i < probes.length; i++) {
-      const ev = probes[i]!;
-      const isAssistedOrFirstContact = ev.grade === "again" && (ev.hints > 0 || (i === 0 && u.told));
-      const effectiveGrade: Grade = isAssistedOrFirstContact ? "hard" : ev.grade!;
+    for (let i = 0; i < merged.length; i++) {
+      const ev = merged[i]!;
+      const isAssistedOrFirstContact = !ev.implicit && ev.grade === "again" && (ev.hints > 0 || (i === 0 && u.told));
+      const effectiveGrade: Grade = isAssistedOrFirstContact ? "hard" : ev.grade;
       mem = sched.update(mem, { grade: effectiveGrade, at: ev.at });
       lastAt = ev.at;
     }
@@ -924,10 +976,107 @@ export function computeCalibratedIntervals(
     const effectiveDue = Math.max(rawDue, lastAt + MIN_LAPSE_INTERVAL_MS);
     const nextInMs = Math.max(0, effectiveDue - now);
     const fsrsRecall = sched.recall(mem, now);
-    out.set(u.id, { next_in_ms: nextInMs, fsrs_recall: fsrsRecall, reviews: probes.length });
+    out.set(u.id, { next_in_ms: nextInMs, fsrs_recall: fsrsRecall, reviews: merged.length });
   }
 
   return out;
+}
+
+const STOP_WORDS = new Set([
+  "the", "and", "for", "that", "with", "from", "this", "into", "over", "each", "when", "where",
+  "which", "what", "why", "how", "are", "was", "were", "have", "has", "not", "can", "use", "using",
+  "its", "their", "than", "then", "they", "them", "only", "also", "more", "most", "some", "such",
+  "same", "both", "one", "two", "all", "any", "per", "via",
+]);
+
+function contentTokens(text: string): Set<string> {
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !STOP_WORDS.has(w));
+  return new Set(words);
+}
+
+/**
+ * Picks up to 2 closely related due companion units to bundle with `primary` into a single
+ * high-yield multi-unit synthesis rep (clearing 2-3 cards in one ~45s task).
+ * Prioritizes direct `rests_on` neighbors, then same-topic / high-lexical-overlap due siblings.
+ */
+export function pickSynthesisCluster(
+  primary: Unit,
+  state: State,
+  dueIds: ReadonlySet<string>,
+  maxCompanions = 2,
+): Unit[] {
+  if (maxCompanions <= 0 || !dueIds.has(primary.id)) return [];
+  const primaryTopic = primary.topic?.trim().toLowerCase() || null;
+  const primaryTokens = contentTokens(primary.text);
+  const prereqSet = new Set(primary.rests_on);
+
+  const scored: { unit: Unit; score: number }[] = [];
+  for (const other of Object.values(state.units)) {
+    if (other.id === primary.id || other.status !== "active" || other.observe_only) continue;
+    if (!dueIds.has(other.id)) continue;
+
+    const isDirectNeighbor = prereqSet.has(other.id) || other.rests_on.includes(primary.id);
+    const otherTopic = other.topic?.trim().toLowerCase() || null;
+    const sameTopic = Boolean(primaryTopic && otherTopic && primaryTopic === otherTopic);
+
+    const otherTokens = contentTokens(other.text);
+    let overlap = 0;
+    for (const tok of primaryTokens) {
+      if (otherTokens.has(tok)) overlap++;
+    }
+
+    if (!isDirectNeighbor && !sameTopic && overlap < 3) continue;
+    if (!isDirectNeighbor && sameTopic && overlap < 1) continue;
+
+    const score = (isDirectNeighbor ? 10 : 0) + (sameTopic ? 4 : 0) + overlap * 1.5;
+    scored.push({ unit: other, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score || a.unit.found_at - b.unit.found_at);
+  return scored.slice(0, maxCompanions).map((x) => x.unit);
+}
+
+const STRUCTURAL_CUE_RE =
+  /(\$|\\[a-z]+|=|def\s|torch\.|np\.|shape|matrix|tensor|variance|gradient|softmax|kernel|sum_|log|O\(|complexity|recurrence|algorithm|equation|proof|step)/i;
+
+/**
+ * Selects the highest-leverage rep modality for unit `u`:
+ * - `synthesis`: when 1-2 related due units are bundled into one compact multi-unit task
+ * - `contrast`: sharp 1-line boundary/distinction check for definitions & distinctions
+ * - `faded_skeleton`: worked setup with 1-2 pivot blanks on first contact or after a recent miss
+ * - `fix_bug`: compact 3-6 line snippet/derivation with ONE planted subtle bug on transfer/rebuild reps
+ * - `direct`: standard concise generative prompt
+ */
+export function pickRepModality(
+  u: Unit,
+  state: State | undefined,
+  depth: Depth,
+  bundledUnits: readonly { id: string }[] = [],
+): RepModality {
+  if (bundledUnits.length > 0) return "synthesis";
+  const kind = u.kind.trim().toLowerCase();
+  if (kind === "distinction" || kind === "definition") return "contrast";
+
+  const structural =
+    STRUCTURAL_CUE_RE.test(u.text) || kind === "move" || kind === "mechanism" || kind === "result";
+  if (!structural) return "direct";
+
+  const probes = state
+    ? u.evidence
+        .map((id) => state.evidence[id])
+        .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null))
+        .sort((a, b) => a.at - b.at || a.seq - b.seq)
+    : [];
+  const passes = probes.filter((ev) => ev.grade !== "again").length;
+  const lastGrade = probes.at(-1)?.grade ?? null;
+
+  if (passes === 0 || lastGrade === "again") return "faded_skeleton";
+  if (depth === "use" || depth === "rebuild") return "fix_bug";
+  return "direct";
 }
 
 /**

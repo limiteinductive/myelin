@@ -690,4 +690,74 @@ for await (const line of rl) {
     expect(capped.ok).toBe(true);
     expect(calls[calls.length - 1]?.body).toContain("DIRECT_PIVOT");
   });
+
+  it("generates adaptive fix_bug starters via promptEntryFor and parses Dream map compaction proposals", async () => {
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const b = String(init?.body ?? "");
+      if (b.includes("FIX THE BUG")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    prompt: "This causal linear attention step has one subtle bug — fix it in place.",
+                    expected_crux: "Apply feature map phi() to q_t and k_t before updating/reading S.",
+                    starter: "S = S + torch.outer(k_t, v_t)\ny_t = q_t @ S",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  memory: "## Baseline & Horizons\n- Owns Poisson PMF and linear attention.",
+                  summary: "Merged duplicate Poisson PMF cards.",
+                  promoted: [],
+                  graduated: [],
+                  merges: [{ keep_id: "u_p1", merge_ids: ["u_p2"], text: "Poisson PMF: P(Y=y|lambda) = lambda^y e^-lambda / y!" }],
+                  retire_ids: ["u_old"],
+                  links: [{ unit_id: "u_child", rests_on: ["u_p1"] }],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
+    const unit = { id: "u_la", text: "Causal linear attention uses phi(k_t) and phi(q_t)", kind: "mechanism" };
+    const entry = await judge.promptEntryFor(unit, [], "use", { variant: 1, modality: "fix_bug" });
+    expect(entry.modality).toBe("fix_bug");
+    expect(entry.starter).toContain("torch.outer(k_t, v_t)");
+    expect(judge.peekPromptEntry(unit, "use", [], 1, "fix_bug")?.starter).toContain("q_t @ S");
+
+    const dreamed = await judge.dream({
+      currentMemory: "",
+      updatedBy: "dream",
+      masteredUnits: [],
+      shakyUnits: [],
+      allUnits: [
+        { id: "u_p1", text: "Poisson PMF with lambda", kind: "result", rests_on: [], p_imm: 0.9, reviews: 2 },
+        { id: "u_p2", text: "Poisson PMF with yhat", kind: "result", rests_on: [], p_imm: 0.85, reviews: 1 },
+      ],
+      recentAttempts: [],
+      recentExplorations: [],
+      recentOverrides: [],
+    });
+    expect(dreamed.merges).toEqual([
+      { keep_id: "u_p1", merge_ids: ["u_p2"], text: "Poisson PMF: P(Y=y|lambda) = lambda^y e^-lambda / y!" },
+    ]);
+    expect(dreamed.retire_ids).toEqual(["u_old"]);
+    expect(dreamed.links).toEqual([{ unit_id: "u_child", rests_on: ["u_p1"] }]);
+  });
 });
