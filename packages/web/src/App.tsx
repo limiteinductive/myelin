@@ -7,6 +7,7 @@ import { DrillView } from "./DrillView.js";
 import { createPracticeStore, PracticeContext, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
 import { formatSidebarDrillLabel, plainSidebarText, sidebarLayout } from "./sidebar.js";
+import { installSidebarRoll, trackSidebarOverflow } from "./sidebarRoll.js";
 import { installStyledTooltips } from "./tooltip.js";
 import type { QueueUnit } from "./drillApi.js";
 
@@ -82,6 +83,13 @@ const ForwardIcon = () => (
   <svg width="14" height="14" viewBox="0 0 16 16" {...ICON_STROKE}>
     <path d="M3.5 8h9M8.5 4l4 4-4 4" />
   </svg>
+);
+
+/** A single-line sidebar title: fades only where clipped, and rolls on a sustained hover. */
+const RollingSidebarText = (props: { text: string }) => (
+  <span class="v2-sb-text" ref={trackSidebarOverflow}>
+    <span class="v2-sb-roll">{props.text}</span>
+  </span>
 );
 
 function fmtWait(ms: number): string {
@@ -414,9 +422,12 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
           closeSidebarOnNarrow();
         }}
       >
-        <span class="v2-sb-text">
-          {formatSidebarDrillLabel(practice.sidebarLabel(u), [u.topic || u.kind, u.depth].filter(Boolean).join(" · "))}
-        </span>
+        <RollingSidebarText
+          text={formatSidebarDrillLabel(
+            practice.sidebarLabel(u),
+            [u.topic || u.kind, u.depth].filter(Boolean).join(" · "),
+          )}
+        />
       </button>
     );
   };
@@ -454,7 +465,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
           <div class="v2-sb-chrome">
             <NavChrome />
           </div>
-          <div class="v2-sidebar-list">
+          <div class="v2-sidebar-list" ref={installSidebarRoll}>
             <Show when={layout().practice}>
               <section class="v2-sb-section">
                 <div class="v2-sb-block">
@@ -476,7 +487,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                             closeSidebarOnNarrow();
                           }}
                         >
-                          <span class="v2-sb-text">Start next sitting ({Math.min(8, practice.backlogDueCount())})</span>
+                          <RollingSidebarText text={`Start next sitting (${Math.min(8, practice.backlogDueCount())})`} />
                         </button>
                       </Show>
                     }
@@ -538,7 +549,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                               closeSidebarOnNarrow();
                             }}
                           >
-                            <span class="v2-sb-text">{plainSidebarText(e.title)}</span>
+                            <RollingSidebarText text={plainSidebarText(e.title)} />
                           </button>
                           <button
                             type="button"
@@ -585,7 +596,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                                 closeSidebarOnNarrow();
                               }}
                             >
-                              <span class="v2-sb-text">{plainSidebarText(e.title)}</span>
+                              <RollingSidebarText text={plainSidebarText(e.title)} />
                             </button>
                             <button
                               type="button"
@@ -629,7 +640,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                               closeSidebarOnNarrow();
                             }}
                           >
-                            <span class="v2-sb-text">{plainSidebarText(f.title)}</span>
+                            <RollingSidebarText text={plainSidebarText(f.title)} />
                           </button>
                           <button
                             type="button"

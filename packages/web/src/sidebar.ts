@@ -137,7 +137,10 @@ const LEADIN_PATTERNS: readonly RegExp[] = [
   /^suppose you want to\s+/i,
   /^suppose you have\s+/i,
   /^suppose that\s+/i,
-  /^imagine you(?:'re| are)\s+/i,
+  /^imagine you(?:'re|’re| are)\s+/i,
+  /^you need to\s+/i,
+  // "You're debugging a layer…" reads as "Debugging a layer…"; only before an -ing verb.
+  /^you(?:'re|’re| are)\s+(?=[a-z]+ing\b)/i,
 ];
 
 /**

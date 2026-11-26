@@ -188,11 +188,8 @@ function BeatCitations(props: { items?: readonly Citation[] | undefined }) {
           {(c) => (
             <div class={{ "v2-beat-cite": true, "is-confused": c().kind === "confused" }}>
               <div class="v2-beat-cite-quote">
-                <Show
-                  when={c().kind === "confused"}
-                  fallback={<QuoteIcon />}
-                >
-                  <span class="v2-cite-qmark" data-tip="I don't understand this">???</span>
+                <Show when={c().kind === "confused"}>
+                  <span class="v2-cite-flag">Didn't follow</span>
                 </Show>
                 <span class="v2-beat-cite-text">{inline(c().text)}</span>
               </div>

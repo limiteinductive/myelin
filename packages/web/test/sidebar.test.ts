@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { QueueUnit } from "../src/drillApi.js";
+import { rollOffsetAt, ROLL_HOLD_MS, ROLL_SPEED_PX_S } from "../src/sidebarRoll.js";
 import { formatSidebarDrillLabel, groupQueueByTopic, plainSidebarText, sidebarLayout } from "../src/sidebar.js";
 
 function mkUnit(id: string, topic: string | null): QueueUnit {
@@ -35,6 +36,17 @@ describe("sidebar helpers", () => {
       formatSidebarDrillLabel("You want to train a model to predict raw genomic read-counts.", "Genomics"),
     ).toBe("Train a model to predict raw genomic read-counts.");
     expect(formatSidebarDrillLabel(null, "Borzoi · recall")).toBe("Borzoi · recall");
+    expect(formatSidebarDrillLabel("You're debugging a layer with exploding logits.", "x")).toBe(
+      "Debugging a layer with exploding logits.",
+    );
+    expect(formatSidebarDrillLabel("You need to contract two tensors.", "x")).toBe("Contract two tensors.");
+    // Openers that carry meaning stay.
+    expect(formatSidebarDrillLabel("You need one einsum string to do it.", "x")).toBe(
+      "You need one einsum string to do it.",
+    );
+    expect(formatSidebarDrillLabel("You're right that it diverges here.", "x")).toBe(
+      "You're right that it diverges here.",
+    );
   });
 
   it("groups due items by normalized topic in priority order", () => {
@@ -63,5 +75,18 @@ describe("sidebar helpers", () => {
     // Archived shows on its own count, with or without active explorations.
     expect(sidebarLayout({ ...none, archived: 7 })).toMatchObject({ practice: false, archived: true });
     expect(sidebarLayout({ ...none, briefings: 1 }).briefings).toBe(true);
+  });
+
+  it("rolls clipped titles at a constant reading speed, holds on the tail, then returns", () => {
+    // Titles that fit never move.
+    expect(rollOffsetAt(2, 5000)).toBe(0);
+    for (const overflow of [40, 200]) {
+      const out = (overflow / ROLL_SPEED_PX_S) * 1000;
+      expect(rollOffsetAt(overflow, 0)).toBe(0);
+      expect(rollOffsetAt(overflow, 500)).toBeCloseTo(ROLL_SPEED_PX_S / 2);
+      expect(rollOffsetAt(overflow, out + ROLL_HOLD_MS / 2)).toBe(overflow);
+      // Home again before the next pass.
+      expect(rollOffsetAt(overflow, out + ROLL_HOLD_MS + 950)).toBe(0);
+    }
   });
 });

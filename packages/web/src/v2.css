@@ -252,10 +252,12 @@ body,
   gap: 2px;
 }
 
+/* Three tiers: section titles carry the structure (label, semibold, ink-1), rows are
+   the content (label, regular, ink-2), sub-folds and counts whisper (meta, ink-3). */
 .v2-sidebar-title {
-  font: var(--v2-type-meta);
-  color: var(--v2-ink-3);
-  letter-spacing: var(--v2-track-meta);
+  font: var(--v2-type-label);
+  font-weight: 600;
+  color: var(--v2-ink-1);
 }
 .v2-sidebar-count {
   font: var(--v2-type-meta);
@@ -296,7 +298,7 @@ body,
   gap: 1px;
 }
 .v2-sb-section + .v2-sb-section {
-  margin-top: 18px;
+  margin-top: 28px;
 }
 .v2-sb-block {
   display: flex;
@@ -306,9 +308,11 @@ body,
 .v2-sb-block + .v2-sb-block {
   margin-top: 16px;
 }
+/* Right rail: counts, the + glyph and row actions all end 8px in from the row edge. */
 .v2-sb-section-head {
-  height: 26px;
-  padding: 0 4px 0 8px;
+  height: 28px;
+  margin-bottom: 2px;
+  padding: 0 8px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -322,6 +326,8 @@ body,
   color: var(--v2-muted);
   width: 22px;
   height: 22px;
+  /* Optical: the 12px glyph, not its 22px hit box, sits on the right rail. */
+  margin-right: -6px;
   border-radius: 6px;
   display: grid;
   place-items: center;
@@ -347,35 +353,59 @@ body,
   align-items: center;
   gap: 8px;
   text-align: left;
-  color: color-mix(in srgb, var(--v2-fg) 68%, var(--v2-muted));
+  color: var(--v2-ink-2);
   cursor: pointer;
   transition: background-color 140ms ease, color 140ms ease;
 }
 .v2-sb-item:hover,
 .v2-sb-row:hover > .v2-sb-item {
   background: color-mix(in srgb, var(--v2-fg) 5%, transparent);
-  color: var(--v2-fg);
+  color: var(--v2-ink-1);
 }
 .v2-sb-item.is-active,
 .v2-sb-row:hover > .v2-sb-item.is-active {
   background: color-mix(in srgb, var(--v2-fg) 6.5%, transparent);
-  color: var(--v2-fg);
+  color: var(--v2-ink-1);
 }
 .v2-sb-item.is-active .v2-sb-text {
   font-weight: 500;
 }
 .v2-sb-item.is-done:not(.is-active) {
-  color: var(--v2-muted);
+  color: var(--v2-ink-3);
 }
+.v2-sb-item.is-done:not(.is-active):hover,
+.v2-sb-row:hover > .v2-sb-item.is-done:not(.is-active) {
+  color: var(--v2-ink-2);
+}
+/* Each edge fades only as far as text is hidden behind it; sidebarRoll.ts sets the
+   widths (right at rest when clipped, both while a hovered title rolls). */
 .v2-sb-text {
+  --v2-sb-fade-l: 0px;
+  --v2-sb-fade-r: 0px;
   flex: 1;
   min-width: 0;
   font: var(--v2-type-label);
   font-weight: 400;
   white-space: nowrap;
   overflow: hidden;
-  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
-  mask-image: linear-gradient(to right, #000 calc(100% - 18px), transparent);
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--v2-sb-fade-l),
+    #000 calc(100% - var(--v2-sb-fade-r)),
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent 0,
+    #000 var(--v2-sb-fade-l),
+    #000 calc(100% - var(--v2-sb-fade-r)),
+    transparent 100%
+  );
+}
+.v2-sb-roll {
+  display: inline-block;
+  vertical-align: top;
 }
 .v2-sb-fold-list .v2-sb-item {
   padding-left: 20px;
@@ -473,18 +503,29 @@ body,
 /* Sub-fold: closes its parent section (Done under Practice, Archived under Explorations).
    Label sits on the row text column, chevron trails it, count holds the right edge. */
 .v2-sb-fold.is-sub {
-  margin-top: 2px;
-  gap: 4px;
+  height: calc(var(--v2-sb-row-h) - 4px);
+  margin-top: 6px;
+  gap: 2px;
+  color: var(--v2-ink-3);
+}
+.v2-sb-fold.is-sub:hover,
+.v2-sb-fold.is-sub.is-open {
+  color: var(--v2-ink-2);
 }
 .v2-sb-fold.is-sub .v2-sb-fold-title {
   flex: none;
+  font: var(--v2-type-meta);
   font-weight: 400;
+  letter-spacing: var(--v2-track-meta);
+}
+.v2-sb-fold.is-sub .v2-sb-chev {
+  width: 10px;
+  height: 10px;
+  opacity: 0.6;
 }
 .v2-sb-fold.is-sub .v2-sidebar-count {
   margin-left: auto;
-}
-.v2-sb-fold.is-sub:hover .v2-sidebar-count {
-  color: inherit;
+  font-weight: 400;
 }
 .v2-sb-fold.is-sub + .v2-sb-fold-list .v2-sb-item {
   padding-left: 8px;
@@ -1942,17 +1983,19 @@ body,
 .v2-beat-cite {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   padding: 0;
   border-radius: 0;
   background: none;
   border: 0;
 }
 .v2-beat-cite.is-confused .v2-beat-cite-quote {
-  border-left-color: color-mix(in srgb, var(--v2-warn) 65%, var(--v2-border));
+  border-left-color: color-mix(in srgb, var(--v2-warn) 45%, var(--v2-border-strong));
 }
-.v2-beat-cite.is-confused .v2-cite-qmark {
-  margin-top: 2px;
+.v2-cite-flag {
+  font: var(--v2-type-meta);
+  letter-spacing: var(--v2-track-meta);
+  color: var(--v2-warn-ink);
 }
 
 .v2-beat-question-past {
@@ -2039,16 +2082,36 @@ body,
 }
 .v2-beat-cite-quote {
   display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  padding: 1px 0 1px 12px;
+  flex-direction: column;
+  gap: 2px;
+  padding: 0 0 0 12px;
   margin-left: -14px;
-  border-left: 2px solid color-mix(in srgb, var(--v2-accent) 55%, var(--v2-border));
+  border-left: 2px solid var(--v2-border-strong);
   color: var(--v2-ink-3);
   font: var(--v2-type-body-sm);
 }
-.v2-beat-cite-quote svg {
-  display: none;
+.v2-beat-cite-text {
+  line-height: 26px;
+  text-wrap: pretty;
+  max-width: 68ch;
+}
+/* One uniform muted voice inside quoted citations: math and inline code inherit the quote's ink and weight */
+.v2-beat-cite-text .katex,
+[data-theme="dark"] .v2-beat-cite-text .katex {
+  color: inherit;
+  font-size: 1em;
+  -webkit-font-smoothing: antialiased;
+}
+.v2-beat-cite-text .katex .mfrac {
+  font-size: 0.86em;
+}
+.v2-beat-cite-text code.app-code {
+  color: inherit;
+  font-weight: 400;
+  font-size: 0.93em;
+  background: none;
+  padding: 0;
+  border-radius: 0;
 }
 .v2-beat-cite-comment {
   color: var(--v2-ink-2);
