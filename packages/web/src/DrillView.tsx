@@ -2606,10 +2606,10 @@ export function DrillView() {
               <div class="v2-wrap-nudge" role="status">
                 <div class="v2-wrap-nudge-copy">
                   <span class="v2-wrap-nudge-title">
-                    {batchCount()} unpracticed cards from this thread — drill this batch before adding more.
+                    {batchCount()} cards ready to practice
                   </span>
                   <span class="v2-wrap-nudge-sub">
-                    This thread stays saved in the sidebar so you can always come right back to it.
+                    This thread stays saved in the sidebar.
                   </span>
                 </div>
                 <div class="v2-wrap-nudge-actions">
@@ -2618,7 +2618,7 @@ export function DrillView() {
                     class="v2-wrap-nudge-btn is-primary"
                     onClick={() => practice.selectUnit(target().unit_id)}
                   >
-                    Practice these {batchCount()}
+                    Practice {batchCount()}
                   </button>
                   <button
                     type="button"
