@@ -76,6 +76,26 @@ function starterAnchorLine(starter: string | null | undefined): string {
   return starter.trim();
 }
 
+function isTouchDevice(): boolean {
+  return typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
+}
+
+/** True when a starter contains TeX math or numbered prose blanks that should render with KaTeX rather than raw in a textarea. */
+function isRenderedStarter(starter: string | null | undefined): boolean {
+  if (!starter) return false;
+  if (/\$[^$\n]+\$|\\(?:frac|sqrt|gamma|beta|alpha|sigma|delta|theta|lambda|mu|sum|prod|cdot|times|le|ge|approx|infty|mathbb|mathbf|mathrm|text|hat|bar|tilde|\|)/.test(starter)) {
+    return true;
+  }
+  if (/^\s*1\.\s+[A-Z]/.test(starter) && /___/.test(starter)) return true;
+  return false;
+}
+
+/** On touch devices or for prose/TeX starters, show the starter read-only above the composer instead of pre-filling raw text. */
+function shouldPinStarterAbovePad(starter: string | null | undefined): boolean {
+  if (!starter) return false;
+  return isRenderedStarter(starter) || isTouchDevice();
+}
+
 function beatUserPayload(b: Beat): string {
   return formatCitedMessage(b.citations ?? [], b.user);
 }
@@ -598,11 +618,23 @@ export function DrillView() {
     lastActivityAt = 0;
     if (existing?.rep && sessionHasWork(existing)) {
       practice.rememberPrompt(unitId, existing.rep.prompt);
+      // Clean up any untouched raw-TeX or mobile starter previously pre-filled into the draft.
+      if (
+        existing.rep.starter &&
+        shouldPinStarterAbovePad(existing.rep.starter) &&
+        existing.beats.length === 0 &&
+        !existing.passedVerdict &&
+        existing.draft.trim() === existing.rep.starter.trim()
+      ) {
+        practice.updateUnitSession(unitId, (d) => {
+          d.draft = "";
+        });
+      }
       setLoading(false);
       if (!existing.passedVerdict?.ok) {
         requestAnimationFrame(() => {
           autoGrow();
-          textarea?.focus();
+          if (!isTouchDevice()) textarea?.focus();
         });
       }
       return;
@@ -619,7 +651,13 @@ export function DrillView() {
         practice.updateUnitSession(unitId, (d) => {
           d.scheduler = res.scheduler;
           d.rep = res.rep;
-          if (res.rep?.starter && !d.draft.trim() && d.beats.length === 0 && !d.passedVerdict) {
+          if (
+            res.rep?.starter &&
+            !shouldPinStarterAbovePad(res.rep.starter) &&
+            !d.draft.trim() &&
+            d.beats.length === 0 &&
+            !d.passedVerdict
+          ) {
             d.draft = res.rep.starter;
           }
         });
@@ -628,7 +666,7 @@ export function DrillView() {
       lastActivityAt = 0;
       requestAnimationFrame(() => {
         autoGrow();
-        textarea?.focus();
+        if (!isTouchDevice()) textarea?.focus();
       });
     } catch (e) {
       if (disposed || seq !== loadSeq || ctrl.signal.aborted) return;
@@ -2226,19 +2264,30 @@ export function DrillView() {
             <Match when={rep()}>
               {(r) => {
                 const anchor = () => starterAnchorLine(r().starter);
+                const pinnedAbove = () => shouldPinStarterAbovePad(r().starter);
+                const rendered = () => isRenderedStarter(r().starter);
                 const showStarterRef = () =>
                   Boolean(r().starter) &&
-                  beats().length > 0 &&
-                  !beats().some((b) => anchor() && b.user.includes(anchor()));
+                  (pinnedAbove() ||
+                    (beats().length > 0 && !beats().some((b) => anchor() && b.user.includes(anchor()))));
                 return (
                   <>
                     <h1 class="v2-prompt" data-citable="true">
                       {inline(r().prompt)}
                     </h1>
                     <Show when={showStarterRef()}>
-                      <pre class="v2-prompt-starter" data-citable="true">
-                        {mathOnly(r().starter!)}
-                      </pre>
+                      <Show
+                        when={rendered()}
+                        fallback={
+                          <pre class="v2-prompt-starter" data-citable="true">
+                            {mathOnly(r().starter!)}
+                          </pre>
+                        }
+                      >
+                        <div class="v2-prompt-starter is-prose" data-citable="true">
+                          <Body text={r().starter!} />
+                        </div>
+                      </Show>
                     </Show>
                   </>
                 );
@@ -2766,7 +2815,9 @@ export function DrillView() {
                         ? "Drop a question, derivation, paper, file path, or topic to work through…"
                         : activeFrontier()
                           ? "Cite a line above, ask a question, or explain it back…"
-                          : "Write your attempt or ask anything…"
+                          : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
+                            ? "Write your answer for the points above…"
+                            : "Write your attempt or ask anything…"
                 }
                 spellcheck="false"
                 autocorrect="off"
@@ -2868,7 +2919,7 @@ export function DrillView() {
                     Show answer
                   </button>
                 </Show>
-                <Show when={draft().trim().length >= 12}>
+                <Show when={draft().trim().length >= 12 && draft().trim() !== (rep()?.starter?.trim() ?? "")}>
                   <button
                     type="button"
                     class="v2-btn-secondary"
