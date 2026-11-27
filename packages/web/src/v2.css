@@ -913,6 +913,11 @@ body,
   padding-top: 0;
   padding-bottom: 6%;
 }
+/* The receipt is left-aligned on the drill column, so its optical centre sits above the true one. */
+.v2-drill-stage:has(.v2-sitting-done) {
+  padding-top: 24px;
+  padding-bottom: max(48px, 14vh);
+}
 .v2-drill-stage.is-exiting {
   opacity: 0;
   transform: translateY(-8px) scale(0.992);
@@ -1018,7 +1023,6 @@ body,
   background: color-mix(in srgb, var(--v2-ink-3) 80%, var(--v2-bg));
 }
 .v2-sitting-line.is-receipt {
-  justify-content: center;
   padding: 0;
   margin-bottom: 0;
 }
@@ -2459,18 +2463,20 @@ body,
   opacity: 1;
 }
 
+/* A receipt, not a reward: one heading, plain facts, and no primary action. Stopping is the default.
+   It keeps the drill column's left edge, so the hairline lands where it sat during the sitting, and
+   it is ruled like a ledger: full-width hairlines carry the structure instead of centred prose. */
 .v2-sitting-done {
-  padding: 0;
+  padding: 0 2px;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  text-align: center;
+  align-items: stretch;
+  text-align: left;
   gap: 0;
   animation: v2-in 180ms ease;
 }
-/* A receipt, not a reward: one heading, plain facts, and no primary action. Stopping is the default. */
 .v2-sitting-done .v2-sitting-line {
-  margin-bottom: 22px;
+  margin-bottom: 20px;
 }
 .v2-sitting-done .v2-prompt {
   font: var(--v2-type-display);
@@ -2478,43 +2484,73 @@ body,
   max-width: none;
 }
 .v2-sitting-done-sub {
-  margin: 10px 0 0;
+  margin: 8px 0 0;
   color: var(--v2-ink-2);
   font: var(--v2-type-body);
   font-variant-numeric: tabular-nums;
-  max-width: 46ch;
-  text-wrap: balance;
+  text-wrap: pretty;
 }
+/* The reconstructed units: the fact is stated once as a label, then each unit is a plain row. */
 .v2-sitting-done-notes {
-  list-style: none;
-  margin: 14px 0 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  max-width: 52ch;
+  margin-top: 28px;
+}
+.v2-sitting-done-label {
+  margin: 0 0 9px;
   color: var(--v2-ink-3);
-  font: var(--v2-type-body-sm);
-  text-wrap: balance;
+  font: var(--v2-type-meta);
+  letter-spacing: var(--v2-track-meta);
+}
+.v2-sitting-done-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.v2-sitting-done-unit,
+.v2-sitting-done-more {
+  padding: 11px 0 12px;
+  border-top: 0.5px solid var(--v2-hairline-soft);
 }
 .v2-sitting-done-unit {
   color: var(--v2-ink-2);
+  font: var(--v2-type-body-sm);
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
 }
-.v2-sitting-done-next {
-  margin: 14px 0 0;
+.v2-sitting-done-more {
   color: var(--v2-ink-3);
   font: var(--v2-type-meta);
   font-weight: 400;
   letter-spacing: var(--v2-track-meta);
   font-variant-numeric: tabular-nums;
 }
+/* Footer rule closes the receipt: the two quiet ways on at the left, the next due time at the right. */
+.v2-sitting-done-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 0.5px solid var(--v2-hairline);
+}
+.v2-sitting-done-notes + .v2-sitting-done-foot {
+  margin-top: 0;
+}
 .v2-sitting-done-actions {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 10px;
-  margin-top: 30px;
+  gap: 4px;
   flex-wrap: wrap;
+}
+.v2-sitting-done-next {
+  margin: 0;
+  color: var(--v2-ink-3);
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  letter-spacing: var(--v2-track-meta);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .v2-sketch-pane {

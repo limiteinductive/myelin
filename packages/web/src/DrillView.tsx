@@ -2764,36 +2764,43 @@ export function DrillView() {
                 <p class="v2-sitting-done-sub">{receiptSummary()}</p>
               </Show>
               <Show when={practice.sittingReconstructed().length > 0}>
-                <ul class="v2-sitting-done-notes">
-                  <For each={practice.sittingReconstructed().slice(0, 2)} keyed={(item) => item.unitId}>
-                    {(item) => (
-                      <li>
-                        Reconstructed <span class="v2-sitting-done-unit">{inline(item().label)}</span> on the
-                        second try.
+                <section class="v2-sitting-done-notes" aria-labelledby="v2-sitting-done-label">
+                  <p id="v2-sitting-done-label" class="v2-sitting-done-label">
+                    Reconstructed on the second try
+                  </p>
+                  <ul class="v2-sitting-done-list">
+                    <For each={practice.sittingReconstructed().slice(0, 2)} keyed={(item) => item.unitId}>
+                      {(item) => <li class="v2-sitting-done-unit">{inline(item().label)}</li>}
+                    </For>
+                    <Show when={practice.sittingReconstructed().length > 2}>
+                      <li class="v2-sitting-done-more">
+                        and {practice.sittingReconstructed().length - 2} more
                       </li>
-                    )}
-                  </For>
-                </ul>
+                    </Show>
+                  </ul>
+                </section>
               </Show>
-              <Show when={practice.soonestNextMs()}>
-                {(ms) => <p class="v2-sitting-done-next">Next review in {fmtDur(ms())}.</p>}
-              </Show>
-              <div class="v2-sitting-done-actions">
-                <button
-                  type="button"
-                  class="v2-btn-secondary"
-                  onClick={() => practice.selectExplore()}
-                >
-                  Explore something new
-                </button>
-                <Show when={practice.backlogDueCount() > 0}>
+              <div class="v2-sitting-done-foot">
+                <div class="v2-sitting-done-actions">
                   <button
                     type="button"
                     class="v2-btn-secondary"
-                    onClick={() => practice.startNextSitting()}
+                    onClick={() => practice.selectExplore()}
                   >
-                    Start another sitting ({Math.min(8, practice.backlogDueCount())})
+                    Explore something new
                   </button>
+                  <Show when={practice.backlogDueCount() > 0}>
+                    <button
+                      type="button"
+                      class="v2-ghost-btn"
+                      onClick={() => practice.startNextSitting()}
+                    >
+                      Start another sitting ({Math.min(8, practice.backlogDueCount())})
+                    </button>
+                  </Show>
+                </div>
+                <Show when={practice.soonestNextMs()}>
+                  {(ms) => <p class="v2-sitting-done-next">Next review in {fmtDur(ms() ?? 0)}</p>}
                 </Show>
               </div>
             </div>
