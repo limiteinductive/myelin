@@ -40,7 +40,7 @@ export interface ActiveAttempt {
   prompt: string;
   modality?: RepModality;
   mcq?: { choices: McqChoice[] };
-  turns: { user: string; coach: string; failed?: boolean; annotations?: InlineAnnotation[]; added?: AddedUnit[] }[];
+  turns: { user: string; coach: string; kind?: "clarify" | "starter"; failed?: boolean; annotations?: InlineAnnotation[]; added?: AddedUnit[] }[];
   assistance_count: number;
   active_ms: number | null;
   updated_at: number;
@@ -69,6 +69,9 @@ export interface SavedExploration {
   id: string;
   title: string;
   turns: { user: string; coach: string; question?: string; added?: AddedUnit[] }[];
+  total_turns?: number;
+  crystallized_turn_count?: number;
+  crystallized_units?: AddedUnit[];
   created_at: number;
   updated_at: number;
 }
@@ -325,6 +328,7 @@ export function tidyDraft(text: string, signal?: AbortSignal): Promise<{ text: s
 export function exploreDrill(
   payload: {
     exploration_id?: string | null;
+    mode?: "explore" | "post_rep";
     initial: string;
     sketch_data_url?: string | null;
     turns: { role: "user" | "assistant"; text: string }[];
@@ -388,6 +392,26 @@ export function saveExploration(payload: {
 
 export function archiveExploration(id: string): Promise<{ ok: boolean; id: string }> {
   return req<{ ok: boolean; id: string }>(`/api/explorations/${encodeURIComponent(id)}/archive`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+}
+
+export function crystallizeExploration(
+  id: string,
+): Promise<{
+  exploration_id: string;
+  added_units: AddedUnit[];
+  already_up_to_date?: boolean;
+  exploration?: SavedExploration | null;
+}> {
+  return req<{
+    exploration_id: string;
+    added_units: AddedUnit[];
+    already_up_to_date?: boolean;
+    exploration?: SavedExploration | null;
+  }>(`/api/explorations/${encodeURIComponent(id)}/crystallize`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: "{}",
@@ -462,6 +486,8 @@ export function checkDrill(
     prompt: string;
     attempt: string;
     show_pivot?: boolean;
+    clarify?: boolean;
+    submitted_starter?: boolean;
     modality?: RepModality;
     bundled_unit_ids?: string[];
     sketch_data_url?: string | null;
@@ -510,6 +536,8 @@ export function askDrillFollowUp(
     question: string;
     revised_attempt?: boolean;
     show_pivot?: boolean;
+    clarify?: boolean;
+    submitted_starter?: boolean;
     modality?: RepModality;
     bundled_unit_ids?: string[];
     sketch_data_url?: string | null;

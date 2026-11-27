@@ -18,6 +18,7 @@ import type { Citation } from "./cite.js";
 import {
   abandonDrillAttempt,
   archiveExploration,
+  crystallizeExploration,
   deleteExploration,
   deleteFrontier,
   fetchDrillQueue,
@@ -36,6 +37,7 @@ import {
 
 export interface Beat {
   user: string;
+  kind?: "clarify" | "starter";
   citations?: Citation[];
   sketch?: string | null;
   coach: string;
@@ -500,6 +502,7 @@ export interface PracticeStore {
   archiveExplorationById(id: string): Promise<void>;
   unarchiveExplorationById(id: string): Promise<void>;
   removeExplorationById(id: string): Promise<void>;
+  crystallizeExplorationById(id: string, opts?: { throwOnError?: boolean }): Promise<AddedUnit[]>;
 
   markUnitCompleted(unitId: string, extraCreditedIds?: string[]): void;
   syncDueOverride(unitId: string, delayMs: number): void;
@@ -793,9 +796,54 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     });
   };
 
+  const crystallizingIds = new Set<string>();
+
+  const crystallizeExplorationById = async (id: string, opts?: { throwOnError?: boolean }): Promise<AddedUnit[]> => {
+    if (!id || crystallizingIds.has(id)) return [];
+    crystallizingIds.add(id);
+    try {
+      const res = await crystallizeExploration(id);
+      if (disposed) return [];
+      if (res.exploration) {
+        const updated = res.exploration;
+        setState((s) => {
+          const idx = s.explorations.findIndex((e) => e.id === updated.id);
+          if (idx >= 0) s.explorations[idx] = updated;
+          const aIdx = s.archivedExplorations.findIndex((e) => e.id === updated.id);
+          if (aIdx >= 0) s.archivedExplorations[aIdx] = updated;
+        });
+      }
+      if (res.added_units.length > 0) {
+        void refreshQueue({ preserveOrder: true });
+      }
+      return res.added_units;
+    } catch (err) {
+      if (opts?.throwOnError) throw err;
+      return [];
+    } finally {
+      crystallizingIds.delete(id);
+    }
+  };
+
+  /** Automatically settles uncrystallized exploration turns in the background when leaving a thread. */
+  const settleActiveExploration = (nextExplorationId?: string | null) => {
+    const st = state.stage;
+    if (st.kind !== "exploration") return;
+    if (nextExplorationId && st.explorationId === nextExplorationId) return;
+    const exp = state.explorations.find((e) => e.id === st.explorationId);
+    if (!exp) return;
+    const sessBeats = state.sessions[`explore:${exp.id}`]?.beats?.filter((b) => !b.pending && !b.failed).length ?? 0;
+    const turnCount = Math.max(exp.total_turns ?? exp.turns.length, sessBeats);
+    if (turnCount > (exp.crystallized_turn_count ?? 0)) {
+      void crystallizeExplorationById(exp.id);
+    }
+  };
+
   const setMapOpen = (open: boolean | ((prev: boolean) => boolean)) => {
+    const next = typeof open === "function" ? open(state.mapOpen) : open;
+    if (next) settleActiveExploration();
     setState((s) => {
-      s.mapOpen = typeof open === "function" ? open(s.mapOpen) : open;
+      s.mapOpen = next;
     });
   };
 
@@ -819,6 +867,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   };
 
   const selectUnit = (unitId: string) => {
+    settleActiveExploration();
     setState((s) => {
       if (s.justCompletedId && s.justCompletedId !== unitId) {
         s.justCompletedId = null;
@@ -833,6 +882,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   };
 
   const selectFrontier = (frontierId: string) => {
+    settleActiveExploration();
     setState((s) => {
       s.justCompletedId = null;
       s.manualPracticeUnitId = null;
@@ -843,6 +893,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   };
 
   const selectExploration = (explorationId: string) => {
+    settleActiveExploration(explorationId);
     setState((s) => {
       s.justCompletedId = null;
       s.manualPracticeUnitId = null;
@@ -853,6 +904,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   };
 
   const selectExplore = () => {
+    settleActiveExploration();
     setState((s) => {
       s.justCompletedId = null;
       s.manualPracticeUnitId = null;
@@ -863,6 +915,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   };
 
   const showSittingDone = () => {
+    settleActiveExploration();
     setState((s) => {
       s.justCompletedId = null;
       s.manualPracticeUnitId = null;
@@ -874,10 +927,10 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
 
   /** Opens a fresh exploration seeded with a context citation from a prior/archived exploration. */
   const startExplorationFrom = (exp: SavedExploration) => {
-    const coveredUnits = exp.turns
-      .flatMap((t) => t.added ?? [])
-      .map((u) => u.text)
-      .slice(-6);
+    const coveredUnits = [
+      ...(exp.crystallized_units ?? []).map((u) => u.text),
+      ...exp.turns.flatMap((t) => t.added ?? []).map((u) => u.text),
+    ].slice(-6);
     const lastTurn = exp.turns.at(-1);
     const summaryParts = [
       `Continuing from prior exploration "${exp.title}" (${exp.turns.length} turns).`,
@@ -1547,6 +1600,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
             if (typeof a.active_ms === "number" && a.active_ms > 0) restored.activeMs = a.active_ms;
             restored.beats = a.turns.map((t) => ({
               user: t.user,
+              ...(t.kind ? { kind: t.kind } : {}),
               coach: t.coach,
               ...(t.failed ? { failed: true } : {}),
               ...(t.annotations && t.annotations.length > 0 ? { annotations: t.annotations } : {}),
@@ -1869,6 +1923,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     archiveExplorationById,
     unarchiveExplorationById,
     removeExplorationById,
+    crystallizeExplorationById,
     markUnitCompleted,
     syncDueOverride,
     practiceUnitAgain,

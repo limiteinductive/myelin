@@ -34,6 +34,7 @@ export interface StoredInlineAnnotation {
 export interface StoredAttemptTurn {
   user: string;
   coach: string;
+  kind?: "clarify" | "starter";
   sketch?: string | null;
   failed?: boolean;
   annotations?: StoredInlineAnnotation[];
@@ -96,6 +97,9 @@ export interface ExplorationRecord {
   title: string;
   turns: StoredBriefingTurn[];
   archived?: boolean;
+  total_turns?: number;
+  crystallized_turn_count?: number;
+  crystallized_units?: { unit_id: string; text: string; kind: string; observe_only: boolean }[];
   created_at: number;
   updated_at: number;
 }
@@ -245,6 +249,15 @@ export class EventStore {
     const expCols = this.db.prepare("PRAGMA table_info(explorations)").all() as unknown as { name?: string }[];
     if (!expCols.some((c) => c.name === "archived")) {
       this.db.exec("ALTER TABLE explorations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!expCols.some((c) => c.name === "crystallized_turn_count")) {
+      this.db.exec("ALTER TABLE explorations ADD COLUMN crystallized_turn_count INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!expCols.some((c) => c.name === "crystallized_units_json")) {
+      this.db.exec("ALTER TABLE explorations ADD COLUMN crystallized_units_json TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!expCols.some((c) => c.name === "total_turns")) {
+      this.db.exec("ALTER TABLE explorations ADD COLUMN total_turns INTEGER NOT NULL DEFAULT 0");
     }
     const attemptCols = this.db.prepare("PRAGMA table_info(drill_attempts)").all() as unknown as { name?: string }[];
     if (!attemptCols.some((c) => c.name === "mcq_json")) {
@@ -540,11 +553,22 @@ export class EventStore {
   // --- Durable per-user Explorations (atomic SQLite storage + sidebar + cross-device sync) ---
 
   private parseExplorationRow(r: Record<string, unknown>): ExplorationRecord {
+    const turns = JSON.parse(String(r.turns_json || "[]")) as StoredBriefingTurn[];
+    const crystallizedUnits = JSON.parse(String(r.crystallized_units_json || "[]")) as {
+      unit_id: string;
+      text: string;
+      kind: string;
+      observe_only: boolean;
+    }[];
+    const totalTurns = Math.max(Number(r.total_turns ?? 0), turns.length);
     return {
       id: String(r.id),
       title: String(r.title),
-      turns: JSON.parse(String(r.turns_json || "[]")) as StoredBriefingTurn[],
+      turns,
       archived: Number(r.archived ?? 0) !== 0,
+      total_turns: totalTurns,
+      crystallized_turn_count: Number(r.crystallized_turn_count ?? 0),
+      ...(crystallizedUnits.length > 0 ? { crystallized_units: crystallizedUnits } : {}),
       created_at: Number(r.created_at ?? 0),
       updated_at: Number(r.updated_at ?? 0),
     };
@@ -564,17 +588,58 @@ export class EventStore {
   }
 
   saveExploration(e: ExplorationRecord): void {
+    const existing = this.getExploration(e.id);
+    const archivedFlag = e.archived !== undefined ? (e.archived ? 1 : 0) : existing?.archived ? 1 : 0;
+    const totalTurns = Math.max(e.total_turns ?? 0, existing?.total_turns ?? 0, e.turns.length);
+    const turnCount = e.crystallized_turn_count ?? existing?.crystallized_turn_count ?? 0;
+    const crystallizedUnits = e.crystallized_units ?? existing?.crystallized_units ?? [];
     this.db
       .prepare(
-        `INSERT INTO explorations (id, title, turns_json, archived, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO explorations (id, title, turns_json, archived, total_turns, crystallized_turn_count, crystallized_units_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
           title = excluded.title,
           turns_json = excluded.turns_json,
           archived = excluded.archived,
+          total_turns = excluded.total_turns,
+          crystallized_turn_count = excluded.crystallized_turn_count,
+          crystallized_units_json = excluded.crystallized_units_json,
           updated_at = excluded.updated_at`,
       )
-      .run(e.id, e.title, JSON.stringify(e.turns), e.archived ? 1 : 0, e.created_at, e.updated_at);
+      .run(
+        e.id,
+        e.title,
+        JSON.stringify(e.turns),
+        archivedFlag,
+        totalTurns,
+        turnCount,
+        JSON.stringify(crystallizedUnits),
+        e.created_at,
+        e.updated_at,
+      );
+  }
+
+  updateExplorationCrystallization(
+    id: string,
+    turnCount: number,
+    addedUnits: { unit_id: string; text: string; kind: string; observe_only: boolean }[],
+    title?: string | null,
+    now = Date.now(),
+  ): ExplorationRecord | null {
+    const existing = this.getExploration(id);
+    if (!existing) return null;
+    const prev = existing.crystallized_units ?? [];
+    const seen = new Set(prev.map((u) => u.unit_id));
+    const merged = [...prev, ...addedUnits.filter((u) => !seen.has(u.unit_id))];
+    const next: ExplorationRecord = {
+      ...existing,
+      ...(title && title.trim() ? { title: title.trim() } : {}),
+      crystallized_turn_count: Math.max(existing.crystallized_turn_count ?? 0, turnCount),
+      crystallized_units: merged,
+      updated_at: now,
+    };
+    this.saveExploration(next);
+    return next;
   }
 
   archiveExploration(id: string, archived = true, now = Date.now()): boolean {

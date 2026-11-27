@@ -849,6 +849,202 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
   }
   const pendingExploreSidecars = new Map<string, Promise<PendingExploreSidecar>>();
 
+  interface CrystallizeResult {
+    exploration_id: string;
+    added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[];
+    already_up_to_date?: boolean;
+    failed?: boolean;
+    exploration?: ExplorationRecord | null;
+  }
+  const inFlightCrystallizations = new Map<string, Promise<CrystallizeResult>>();
+  const idleCrystallizeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const scopeExpKey = (userId: string, explorationId: string) => `${userId}:${explorationId}`;
+
+  function decorateExplorationForClient(store: ReturnType<Stores["get"]>, exp: ExplorationRecord): ExplorationRecord {
+    if (!exp.crystallized_units || exp.crystallized_units.length === 0) return exp;
+    const activeUnits = store.state.units;
+    const liveUnits = exp.crystallized_units.filter((u) => activeUnits[u.unit_id]?.status === "active");
+    if (liveUnits.length === exp.crystallized_units.length) return exp;
+    return {
+      ...exp,
+      crystallized_units: liveUnits,
+    };
+  }
+
+  async function runExplorationCrystallize(
+    userId: string,
+    store: ReturnType<Stores["get"]>,
+    explorationId: string,
+  ): Promise<CrystallizeResult> {
+    const cacheKey = scopeExpKey(userId, explorationId);
+    const existingTimer = idleCrystallizeTimers.get(cacheKey);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+      idleCrystallizeTimers.delete(cacheKey);
+    }
+
+    store.catchUp();
+    const initialExp = store.getExploration(explorationId);
+    if (!initialExp || initialExp.turns.length === 0) {
+      return { exploration_id: explorationId, added_units: [], already_up_to_date: true, exploration: initialExp };
+    }
+    const initialTotal = initialExp.total_turns ?? initialExp.turns.length;
+    if (initialTotal <= (initialExp.crystallized_turn_count ?? 0)) {
+      return {
+        exploration_id: explorationId,
+        added_units: [],
+        already_up_to_date: true,
+        exploration: decorateExplorationForClient(store, initialExp),
+      };
+    }
+
+    const inflight = inFlightCrystallizations.get(cacheKey);
+    if (inflight) return inflight;
+
+    let work!: Promise<CrystallizeResult>;
+    work = (async (): Promise<CrystallizeResult> => {
+      try {
+        store.catchUp();
+        const exp = store.getExploration(explorationId);
+        if (!exp || exp.turns.length === 0) {
+          return { exploration_id: explorationId, added_units: [], already_up_to_date: true, exploration: exp };
+        }
+        const totalTurnsSnapshot = exp.total_turns ?? exp.turns.length;
+        const crystallizedCount = exp.crystallized_turn_count ?? 0;
+        if (totalTurnsSnapshot <= crystallizedCount) {
+          return {
+            exploration_id: explorationId,
+            added_units: [],
+            already_up_to_date: true,
+            exploration: decorateExplorationForClient(store, exp),
+          };
+        }
+        const state = store.state;
+        const existingUnits = Object.values(state.units)
+          .filter((u) => u.status === "active" && !u.observe_only)
+          .map((u) => u.text);
+        const alreadyCrystallized = [
+          ...(exp.crystallized_units ?? [])
+            .filter((u) => state.units[u.unit_id]?.status === "active")
+            .map((u) => u.text),
+          ...exp.turns.flatMap((t) => (t.added ?? []).map((u) => u.text)),
+        ];
+        const habits = activeHabits(state).map((h) => h.text);
+        const meta = await judge.crystallizeExploration({
+          title: exp.title,
+          turns: exp.turns.map((t) => ({ user: t.user, coach: t.coach })),
+          existingUnits,
+          alreadyCrystallized,
+          activeHabits: habits,
+          learnerMemory: learnerMemoryOf(store),
+        });
+        if (meta.failed) {
+          const liveOnFail = store.getExploration(explorationId);
+          return {
+            exploration_id: explorationId,
+            added_units: [],
+            failed: true,
+            exploration: liveOnFail ? decorateExplorationForClient(store, liveOnFail) : null,
+          };
+        }
+
+        // Recheck that the exploration still exists before writing any units or advancing the checkpoint.
+        store.catchUp();
+        const liveBeforeCommit = store.getExploration(explorationId);
+        if (!liveBeforeCommit) {
+          return { exploration_id: explorationId, added_units: [], exploration: null };
+        }
+
+        const now = Date.now();
+        const currentActiveTexts = Object.values(store.state.units)
+          .filter((u) => u.status === "active")
+          .map((u) => u.text);
+        const added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
+        for (const [idx, u] of meta.suggested_units.entries()) {
+          if (isNearDuplicate(u.text, currentActiveTexts)) continue;
+          currentActiveTexts.push(u.text);
+          const unit_id = uuidv7(now + idx);
+          store.append([
+            makeEvent(
+              "unit.found",
+              {
+                unit_id,
+                text: u.text,
+                kind: u.kind || (u.observe_only ? "thinking move" : "move"),
+                topic: meta.title || liveBeforeCommit.title,
+                rests_on: [],
+                origin: u.observe_only ? "observed" : "need",
+                told: Boolean(u.told),
+                observe_only: u.observe_only,
+                message_id: null,
+              },
+              { id: uuidv7(now + idx), device_id: DRILL_DEVICE, ts: now + idx },
+            ),
+          ]);
+          added_units.push({ unit_id, text: u.text, kind: u.kind, observe_only: u.observe_only });
+        }
+        if (added_units.length > 0) {
+          judge.warmPrompts(
+            added_units
+              .filter((u) => !u.observe_only)
+              .map((u) => ({
+                unit: { id: u.unit_id, text: u.text, kind: u.kind, topic: meta.title || liveBeforeCommit.title },
+                restsOn: [],
+                depth: "recall" as Depth,
+              })),
+          );
+        }
+        const updated = store.updateExplorationCrystallization(
+          explorationId,
+          totalTurnsSnapshot,
+          added_units,
+          null,
+          now,
+        );
+        // If newer turns arrived while crystallizing, re-arm idle settle so they are never skipped.
+        const latestTotal = updated ? (updated.total_turns ?? updated.turns.length) : 0;
+        if (updated && latestTotal > totalTurnsSnapshot) {
+          scheduleIdleCrystallize(userId, store, explorationId);
+        }
+        return {
+          exploration_id: explorationId,
+          added_units,
+          exploration: updated ? decorateExplorationForClient(store, updated) : null,
+        };
+      } catch (err) {
+        console.error("[explore] crystallize failed:", err instanceof Error ? err.message : err);
+        const liveOnErr = store.getExploration(explorationId);
+        return {
+          exploration_id: explorationId,
+          added_units: [],
+          failed: true,
+          exploration: liveOnErr ? decorateExplorationForClient(store, liveOnErr) : null,
+        };
+      }
+    })();
+
+    inFlightCrystallizations.set(cacheKey, work);
+    void work.finally(() => {
+      if (inFlightCrystallizations.get(cacheKey) === work) {
+        inFlightCrystallizations.delete(cacheKey);
+      }
+    });
+    return work;
+  }
+
+  function scheduleIdleCrystallize(userId: string, store: ReturnType<Stores["get"]>, explorationId: string): void {
+    const cacheKey = scopeExpKey(userId, explorationId);
+    const prev = idleCrystallizeTimers.get(cacheKey);
+    if (prev) clearTimeout(prev);
+    const timer = setTimeout(() => {
+      idleCrystallizeTimers.delete(cacheKey);
+      void runExplorationCrystallize(userId, store, explorationId);
+    }, 90_000);
+    if (typeof timer.unref === "function") timer.unref();
+    idleCrystallizeTimers.set(cacheKey, timer);
+  }
+
   /**
    * Streams live coach prose over SSE when `?stream=1` is passed (emitting `delta` text updates
    * followed by one final `done` JSON payload), or returns regular JSON for non-streaming callers.
@@ -994,7 +1190,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const depth = pickDrillDepth(u, state);
       const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
       const stats = unitExposureStats(state, u.id, depth, now);
-      const bundled = pickSynthesisCluster(u, state, dueIds, 1);
+      const bundled: Unit[] = [];
       const modality = pickRepModality(u, state, depth, bundled);
       return {
         unit: u,
@@ -1004,7 +1200,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         priorPrompts: stats.priorPrompts,
         delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
         modality,
-        bundledUnits: bundled.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
+        bundledUnits: [],
       };
     };
 
@@ -1016,9 +1212,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const depth = pickDrillDepth(u, state);
       const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
       const stats = unitExposureStats(state, u.id, depth, now);
-      const bundled = dueIds.has(u.id) ? pickSynthesisCluster(u, state, dueIds, 1) : [];
+      const bundled: Unit[] = [];
       const modality = pickRepModality(u, state, depth, bundled);
-      const bundledIds = bundled.map((x) => x.id);
+      const bundledIds: string[] = [];
       return {
         unit_id: u.id,
         text: u.text,
@@ -1129,7 +1325,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
   app.get("/api/explorations", (c) => {
     const { user } = c.get("session");
     const store = stores.get(user.id);
-    const all = store.listExplorations(true);
+    store.catchUp();
+    const all = store.listExplorations(true).map((e) => decorateExplorationForClient(store, e));
     return c.json({
       explorations: all.filter((e) => !e.archived),
       archived: all.filter((e) => e.archived),
@@ -1163,11 +1360,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       id,
       title,
       turns,
+      total_turns: Math.max(existing?.total_turns ?? 0, turns.length),
       created_at: existing?.created_at ?? now,
       updated_at: now,
     };
     store.saveExploration(rec);
-    return c.json({ exploration: rec });
+    scheduleIdleCrystallize(user.id, store, id);
+    return c.json({ exploration: decorateExplorationForClient(store, rec) });
   });
 
   app.post("/api/explorations/:id/archive", (c) => {
@@ -1175,8 +1374,20 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const store = stores.get(user.id);
     const id = c.req.param("id");
     store.archiveExploration(id, true);
-    judge.closeSession(`explore:${id}`);
+    judge.closeSession(`explore:${scopeExpKey(user.id, id)}`);
+    void runExplorationCrystallize(user.id, store, id);
     return c.json({ ok: true, id });
+  });
+
+  app.post("/api/explorations/:id/crystallize", async (c) => {
+    const { user } = c.get("session");
+    const store = stores.get(user.id);
+    const id = c.req.param("id");
+    const result = await runExplorationCrystallize(user.id, store, id);
+    if (result.failed) {
+      return c.json({ ...result, error: "Could not save practice units just now." }, 502);
+    }
+    return c.json(result);
   });
 
   app.post("/api/explorations/:id/unarchive", (c) => {
@@ -1191,15 +1402,24 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const { user } = c.get("session");
     const store = stores.get(user.id);
     const id = c.req.param("id");
+    const cacheKey = scopeExpKey(user.id, id);
+    const timer = idleCrystallizeTimers.get(cacheKey);
+    if (timer) {
+      clearTimeout(timer);
+      idleCrystallizeTimers.delete(cacheKey);
+    }
     store.deleteExploration(id);
-    judge.closeSession(`explore:${id}`);
-    pendingExploreSidecars.delete(id);
+    judge.closeSession(`explore:${cacheKey}`);
+    pendingExploreSidecars.delete(cacheKey);
     return c.json({ ok: true, id });
   });
 
   app.get("/api/explorations/:id/sidecar", async (c) => {
+    const { user } = c.get("session");
+    const store = stores.get(user.id);
     const id = c.req.param("id");
-    const pending = pendingExploreSidecars.get(id);
+    if (!store.getExploration(id)) return c.json({ exploration_id: id, added_units: [] });
+    const pending = pendingExploreSidecars.get(scopeExpKey(user.id, id));
     if (!pending) return c.json({ exploration_id: id, added_units: [] });
     try {
       const res = await pending;
@@ -1237,6 +1457,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     store.catchUp();
     const body = (await c.req.json().catch(() => null)) as {
       exploration_id?: string | null;
+      mode?: "explore" | "post_rep";
       initial?: string;
       sketch_data_url?: string | null;
       turns?: { role: "user" | "assistant"; text: string }[];
@@ -1313,7 +1534,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           ? body.rep_context.grade
           : "good";
 
-      const isStandaloneExploration = !initial.startsWith("Completed practice on:");
+      const isStandaloneExploration =
+        body?.mode === "explore"
+          ? true
+          : body?.mode === "post_rep"
+            ? false
+            : !initial.startsWith("Completed practice on:");
       const preNow = Date.now();
       const standaloneExpId = isStandaloneExploration
         ? typeof body?.exploration_id === "string" && body.exploration_id.trim()
@@ -1324,7 +1550,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       const res = await judge.explore(
         {
-          sessionKey: standaloneExpId ? `explore:${standaloneExpId}` : undefined,
+          sessionKey: standaloneExpId ? `explore:${scopeExpKey(user.id, standaloneExpId)}` : undefined,
           decoupleMeta,
           initial,
           sketchDataUrl: sketch,
@@ -1435,46 +1661,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             )
           : null;
 
-      // Optimistically auto-add crystallized units (exact + near-duplicate guard); learner can undo with Remove.
-      const activeUnitTexts = Object.values(store.state.units)
-        .filter((u) => u.status === "active")
-        .map((u) => u.text);
+      // Knowledge crystallization is deferred to thread settle / archive / manual trigger
+      // rather than eagerly writing micro-units on every conversational turn.
       const added_units: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
-      for (const [idx, u] of res.suggested_units.entries()) {
-        if (isNearDuplicate(u.text, activeUnitTexts)) continue;
-        activeUnitTexts.push(u.text);
-        const unit_id = uuidv7(now + idx);
-        const ev = makeEvent(
-          "unit.found",
-          {
-            unit_id,
-            text: u.text,
-            kind: u.kind || (u.observe_only ? "thinking move" : "move"),
-            topic: explorationTitle,
-            rests_on: [],
-            origin: u.observe_only ? "observed" : "need",
-            told: Boolean(u.told),
-            observe_only: u.observe_only,
-            message_id: null,
-          },
-          { id: uuidv7(now + idx), device_id: DRILL_DEVICE, ts: now + idx },
-        );
-        store.append([ev]);
-        added_units.push({ unit_id, text: u.text, kind: u.kind, observe_only: u.observe_only });
-      }
-      if (added_units.length > 0) {
-        judge.warmPrompts(
-          added_units
-            .filter((u) => !u.observe_only)
-            .map((u) => ({
-              unit: { id: u.unit_id, text: u.text, kind: u.kind, topic: explorationTitle },
-              restsOn: [],
-              depth: "recall" as Depth,
-            })),
-        );
-      }
 
-      // Persist standalone explorations, and auto-promote any non-meta post-pass drill follow-up.
+      // Persist standalone explorations, or explicitly branched post-rep explorations.
       let exploration: ExplorationRecord | undefined;
       let savedTurnIndex = 0;
       const userText = (body?.reply?.trim() || initial || "(sketch)").trim();
@@ -1487,8 +1678,6 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             {
               user: userText,
               coach: res.message,
-              ...(res.question ? { question: res.question } : {}),
-              ...(added_units.length > 0 ? { added: added_units } : {}),
             },
           ].slice(-60);
           savedTurnIndex = nextTurns.length - 1;
@@ -1514,8 +1703,6 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             {
               user: userText,
               coach: res.message,
-              ...(res.question ? { question: res.question } : {}),
-              ...(added_units.length > 0 ? { added: added_units } : {}),
             },
           ];
           if (priorPost.length === 0 && origin && rawTurns[0] && !rawTurns[0].user.startsWith("> ")) {
@@ -1524,87 +1711,46 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           nextTurns = rawTurns.slice(-60);
           savedTurnIndex = nextTurns.length - 1;
         }
+        const nextTotalTurns = isStandaloneExploration
+          ? (existingExp?.total_turns ?? existingExp?.turns.length ?? 0) + 1
+          : nextTurns.length;
         exploration = {
           id: expId,
           title: explorationTitle,
           turns: nextTurns,
+          total_turns: nextTotalTurns,
           created_at: existingExp?.created_at ?? now,
           updated_at: now,
         };
         store.saveExploration(exploration);
+        scheduleIdleCrystallize(user.id, store, expId);
       }
 
-      // Fire non-blocking post-turn sidecar for standalone explorations so unit crystallization & title
-      // refinement add 0ms to foreground TTFT and stream smoothly onto the saved beat once ready.
+      // Fire lightweight Turn-1 title sidecar only (never writes units per turn).
       let sidecarPending = false;
-      if (decoupleMeta && !res.failed && expId && exploration) {
+      if (decoupleMeta && !existingExp && !res.failed && expId && exploration) {
         sidecarPending = true;
-        const needsTitle = !existingExp;
+        const sidecarKey = scopeExpKey(user.id, expId);
         const fallbackTitleUsed = exploration.title;
-        const sidecarPromise: Promise<PendingExploreSidecar> = (async () => {
+        let sidecarPromise!: Promise<PendingExploreSidecar>;
+        sidecarPromise = (async () => {
           try {
             const meta = await judge.extractExploreMeta({
               userText,
               coachMessage: res.message,
-              coachQuestion: res.question,
               priorTurns: turns,
               existingUnits,
               activeHabits: habits,
-              needsTitle,
+              needsTitle: true,
             });
             const sNow = Date.now();
             const liveExp = store.getExploration(expId);
             const finalTitle =
-              needsTitle && meta.title && liveExp && liveExp.title === fallbackTitleUsed ? meta.title : liveExp?.title ?? fallbackTitleUsed;
-
-            const currentActiveTexts = Object.values(store.state.units)
-              .filter((u) => u.status === "active")
-              .map((u) => u.text);
-            const sidecarAdded: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
-            for (const [idx, u] of meta.suggested_units.entries()) {
-              if (isNearDuplicate(u.text, currentActiveTexts)) continue;
-              currentActiveTexts.push(u.text);
-              const unit_id = uuidv7(sNow + idx);
-              store.append([
-                makeEvent(
-                  "unit.found",
-                  {
-                    unit_id,
-                    text: u.text,
-                    kind: u.kind || (u.observe_only ? "thinking move" : "move"),
-                    topic: finalTitle,
-                    rests_on: [],
-                    origin: u.observe_only ? "observed" : "need",
-                    told: Boolean(u.told),
-                    observe_only: u.observe_only,
-                    message_id: null,
-                  },
-                  { id: uuidv7(sNow + idx), device_id: DRILL_DEVICE, ts: sNow + idx },
-                ),
-              ]);
-              sidecarAdded.push({ unit_id, text: u.text, kind: u.kind, observe_only: u.observe_only });
-            }
-            if (sidecarAdded.length > 0) {
-              judge.warmPrompts(
-                sidecarAdded
-                  .filter((u) => !u.observe_only)
-                  .map((u) => ({
-                    unit: { id: u.unit_id, text: u.text, kind: u.kind, topic: finalTitle },
-                    restsOn: [],
-                    depth: "recall" as Depth,
-                  })),
-              );
-            }
-            if (liveExp && (sidecarAdded.length > 0 || finalTitle !== liveExp.title)) {
-              const updatedTurns = liveExp.turns.map((t, i) =>
-                i === savedTurnIndex && sidecarAdded.length > 0
-                  ? { ...t, added: [...(t.added ?? []), ...sidecarAdded] }
-                  : t,
-              );
+              meta.title && liveExp && liveExp.title === fallbackTitleUsed ? meta.title : liveExp?.title ?? fallbackTitleUsed;
+            if (liveExp && finalTitle !== liveExp.title) {
               store.saveExploration({
                 ...liveExp,
                 title: finalTitle,
-                turns: updatedTurns,
                 updated_at: sNow,
               });
             }
@@ -1612,17 +1758,19 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               exploration_id: expId,
               turn_index: savedTurnIndex,
               ...(finalTitle !== fallbackTitleUsed ? { title: finalTitle } : {}),
-              added_units: sidecarAdded,
+              added_units: [],
             };
           } catch {
             return { exploration_id: expId, turn_index: savedTurnIndex, added_units: [] };
-          } finally {
-            setTimeout(() => {
-              if (pendingExploreSidecars.get(expId) === sidecarPromise) pendingExploreSidecars.delete(expId);
-            }, 30_000);
           }
         })();
-        pendingExploreSidecars.set(expId, sidecarPromise);
+        pendingExploreSidecars.set(sidecarKey, sidecarPromise);
+        void sidecarPromise.finally(() => {
+          const t = setTimeout(() => {
+            if (pendingExploreSidecars.get(sidecarKey) === sidecarPromise) pendingExploreSidecars.delete(sidecarKey);
+          }, 30_000);
+          if (typeof t.unref === "function") t.unref();
+        });
       }
 
       if (!res.failed) scheduleIdleDream(user.id, store);
@@ -1690,8 +1838,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     );
     const depth = pickDrillDepth(picked, state);
     const restsOn = picked.rests_on.map((id) => state.units[id]?.text ?? id);
-    const bundledUnits = isRetry ? [] : pickSynthesisCluster(picked, state, dueIds, 1);
-    const bundledIds = bundledUnits.map((b) => b.id);
+    // Default to single-target drills so each rep measures one clear retrieval target.
+    const bundledUnits: Unit[] = [];
+    const bundledIds: string[] = [];
     const rawModality = pickRepModality(picked, state, depth, bundledUnits);
     // On cold tail retries, always test unaided retrieval instead of re-serving a faded skeleton.
     const modality: RepModality = isRetry && rawModality === "faded_skeleton" ? "direct" : rawModality;
@@ -1888,7 +2037,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           const d = pickDrillDepth(u, state);
           const ro = u.rests_on.map((id) => state.units[id]?.text ?? id);
           const st = unitExposureStats(state, u.id, d, now);
-          const b = pickSynthesisCluster(u, state, dueIds, 1);
+          const b: Unit[] = [];
           const m = pickRepModality(u, state, d, b);
           return {
             unit: u,
@@ -1898,7 +2047,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             priorPrompts: st.priorPrompts,
             delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
             modality: m,
-            bundledUnits: b.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
+            bundledUnits: [],
           };
         }),
       );
@@ -1946,6 +2095,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       hints_used?: number;
       hint_only?: boolean;
       show_pivot?: boolean;
+      clarify?: boolean;
+      submitted_starter?: boolean;
       modality?: RepModality;
       bundled_unit_ids?: string[];
       rung?: number;
@@ -2135,6 +2286,94 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       return c.json(existingAttempt.result);
     }
 
+    // Explicit clarifying question on an open drill: never invoke the grader, close the rep, or leak the answer.
+    if (Boolean(body.clarify) && !showPivot) {
+      const nowClarify = Date.now();
+      const trendClarify = latencyTrend(state, u);
+      const priorClarifyTurns: { role: "user" | "assistant"; text: string }[] = [];
+      for (const t of existingAttempt?.turns ?? []) {
+        if (t.failed) continue;
+        if (t.user.trim()) priorClarifyTurns.push({ role: "user", text: t.user });
+        if (t.coach.trim()) priorClarifyTurns.push({ role: "assistant", text: t.coach });
+      }
+      judge.closeSession(`drill:${attemptId}`);
+      return respondMaybeStream(c, async (onText, onPerf, signal) => {
+        const clarified = await judge.clarifyDrill(
+          {
+            prompt,
+            starter: cachedPromptEntry?.starter,
+            unitText: u.text,
+            question: attempt,
+            turns: priorClarifyTurns,
+            learnerMemory: learnerMemoryOf(store),
+          },
+          onText,
+          onPerf,
+          signal,
+        );
+        if (signal?.aborted) {
+          return {
+            ok: false,
+            grade: "again" as Grade,
+            message: clarified.message,
+            tier: "system2" as const,
+            attempt_id: attemptId,
+            added_units: [],
+            probe_id: null,
+            latency_ms: null,
+            prev_latency_ms: trendClarify.prev_ms,
+            next_in_ms: null,
+            scheduler: store.scheduler.name,
+          };
+        }
+        // Terminal-status guard: never let a late Ask reopen or overwrite an already-passed rep.
+        const latestAttempt = store.getAttempt(attemptId);
+        if (latestAttempt?.status !== "passed") {
+          const nextAssistance = (latestAttempt?.assistance_count ?? 0) + (clarified.substantive_help ? 1 : 0);
+          const prevTurns = latestAttempt?.turns?.filter((t) => !t.failed) ?? [];
+          store.abandonActiveAttempts(u.id, attemptId, nowClarify);
+          store.upsertAttempt({
+            attempt_id: attemptId,
+            unit_id: u.id,
+            depth,
+            prompt,
+            first_attempt: latestAttempt?.first_attempt || attempt,
+            turns: [
+              ...prevTurns,
+              {
+                user: attempt,
+                coach: clarified.message,
+                kind: "clarify",
+                ...(clarified.failed ? { failed: true } : {}),
+              },
+            ],
+            status: "active",
+            assistance_count: nextAssistance,
+            active_ms: latestAttempt?.active_ms ?? null,
+            probe_id: null,
+            grade: null,
+            result: null,
+            created_at: latestAttempt?.created_at ?? nowClarify,
+            updated_at: nowClarify,
+          });
+        }
+        return {
+          ok: false,
+          grade: "again" as Grade,
+          message: clarified.message,
+          tier: "system2" as const,
+          ...(clarified.failed ? { failed: true } : {}),
+          attempt_id: attemptId,
+          added_units: [],
+          probe_id: null,
+          latency_ms: null,
+          prev_latency_ms: trendClarify.prev_ms,
+          next_in_ms: null,
+          scheduler: store.scheduler.name,
+        };
+      }, "follow-up");
+    }
+
     const now = Date.now();
     const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const preScore = scores.get(u.id);
@@ -2184,7 +2423,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         return { ...verdict, attempt_id: attemptId, added_units: [], probe_id: null, latency_ms: latencyMs, prev_latency_ms: trend.prev_ms, next_in_ms: null, scheduler };
       }
 
-      const addedUnits = autoAddPrereqs(store, u, verdict.missing_prereqs, now);
+      const addedUnits: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
 
       let probeId: string | null = null;
       let nextInMs: number | null = null;
@@ -2296,7 +2535,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             const d = pickDrillDepth(item, postState);
             const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
             const st = unitExposureStats(postState, item.id, d, now + 2);
-            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 1) : [];
+            const b: Unit[] = [];
             const m = pickRepModality(item, postState, d, b);
             return {
               unit: item,
@@ -2306,7 +2545,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               priorPrompts: st.priorPrompts,
               delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
               modality: m,
-              bundledUnits: b.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
+              bundledUnits: [],
             };
           }),
         );
@@ -2341,6 +2580,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           {
             user: attempt,
             coach: verdict.message,
+            ...(body.submitted_starter ? { kind: "starter" as const } : {}),
             ...(verdict.failed ? { failed: true } : {}),
             ...(verdict.annotations && verdict.annotations.length > 0 ? { annotations: verdict.annotations } : {}),
             ...(addedUnits.length > 0 ? { added: addedUnits } : {}),
@@ -2375,6 +2615,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       question?: string;
       revised_attempt?: boolean;
       show_pivot?: boolean;
+      clarify?: boolean;
+      submitted_starter?: boolean;
       modality?: RepModality;
       bundled_unit_ids?: string[];
       sketch_data_url?: string | null;
@@ -2526,13 +2768,107 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const trend = latencyTrend(state, u);
     const habits = activeHabits(state);
     const latencyMs = typeof body.latency_ms === "number" && body.latency_ms >= 0 ? Math.round(body.latency_ms) : null;
-    const assistanceCount = Math.max(1, Math.round(body.hints_used ?? 0), 1 + Math.floor(turns.length / 2));
+    const questionText = (body.question ?? "").trim();
+
+    // Explicit clarifying question on an open drill: answer directly without invoking the grader or closing the rep.
+    if (Boolean(body.clarify) && !showPivot) {
+      const priorClarifyTurns: { role: "user" | "assistant"; text: string }[] = [];
+      if (body.attempt?.trim()) priorClarifyTurns.push({ role: "user", text: body.attempt.trim() });
+      if (body.feedback?.trim()) priorClarifyTurns.push({ role: "assistant", text: body.feedback.trim() });
+      priorClarifyTurns.push(...turns);
+      const cachedStarter =
+        judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds)?.starter ??
+        judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures)?.starter;
+      judge.closeSession(`drill:${attemptId}`);
+      return respondMaybeStream(c, async (onText, onPerf, signal) => {
+        const clarified = await judge.clarifyDrill(
+          {
+            prompt: body.prompt ?? "",
+            starter: cachedStarter,
+            unitText: u.text,
+            question: questionText,
+            turns: priorClarifyTurns,
+            learnerMemory: learnerMemoryOf(store),
+          },
+          onText,
+          onPerf,
+          signal,
+        );
+        if (signal?.aborted) {
+          return {
+            ok: false,
+            grade: "again" as Grade,
+            message: clarified.message,
+            tier: "system2" as const,
+            attempt_id: attemptId,
+            added_units: [],
+            probe_id: null,
+            latency_ms: latencyMs,
+            prev_latency_ms: trend.prev_ms,
+            next_in_ms: null,
+            scheduler,
+          };
+        }
+        // Terminal-status guard: never let a late Ask reopen or overwrite an already-passed rep.
+        const latestAttempt = store.getAttempt(attemptId);
+        if (latestAttempt?.status !== "passed") {
+          const nextAssistance = (latestAttempt?.assistance_count ?? 0) + (clarified.substantive_help ? 1 : 0);
+          const prevStoredTurns =
+            latestAttempt?.turns && latestAttempt.turns.length > 0
+              ? latestAttempt.turns.filter((t) => !t.failed)
+              : body.attempt || body.feedback
+                ? [{ user: body.attempt ?? "", coach: body.feedback ?? "" }]
+                : [];
+          store.upsertAttempt({
+            attempt_id: attemptId,
+            unit_id: u.id,
+            depth,
+            prompt: body.prompt ?? "",
+            first_attempt: latestAttempt?.first_attempt || (body.attempt ?? ""),
+            turns: [
+              ...prevStoredTurns,
+              {
+                user: questionText,
+                coach: clarified.message,
+                kind: "clarify",
+                ...(clarified.failed ? { failed: true } : {}),
+              },
+            ],
+            status: "active",
+            assistance_count: nextAssistance,
+            active_ms: latestAttempt?.active_ms ?? latencyMs,
+            probe_id: null,
+            grade: null,
+            result: null,
+            created_at: latestAttempt?.created_at ?? now,
+            updated_at: now,
+          });
+        }
+        return {
+          ok: false,
+          grade: "again" as Grade,
+          message: clarified.message,
+          tier: "system2" as const,
+          ...(clarified.failed ? { failed: true } : {}),
+          attempt_id: attemptId,
+          added_units: [],
+          probe_id: null,
+          latency_ms: latencyMs,
+          prev_latency_ms: trend.prev_ms,
+          next_in_ms: null,
+          scheduler,
+        };
+      }, "follow-up");
+    }
+
+    // Track assistance strictly from recorded substantive help / hints rather than raw clarification turn count.
+    const assistanceCount = existingAttempt
+      ? Math.max(existingAttempt.assistance_count, Math.max(0, Math.round(body.hints_used ?? 0)))
+      : Math.max(0, Math.round(body.hints_used ?? 0));
 
     const existingUnits = Object.values(state.units)
       .filter((u2) => u2.status === "active" && !u2.observe_only)
       .map((u2) => u2.text);
-
-    const questionText = (body.question ?? "").trim();
 
     return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.continueRep(
@@ -2568,7 +2904,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         return { ...verdict, attempt_id: attemptId, added_units: [], probe_id: null, latency_ms: latencyMs, prev_latency_ms: trend.prev_ms, next_in_ms: null, scheduler };
       }
 
-      const addedUnits = autoAddPrereqs(store, u, verdict.missing_prereqs, now);
+      const addedUnits: { unit_id: string; text: string; kind: string; observe_only: boolean }[] = [];
 
       let probeId: string | null = null;
       let nextInMs: number | null = null;
@@ -2579,10 +2915,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const prevScheduleKind = preScore?.schedule_kind ?? "first";
       const creditedUnitIds: string[] = [];
       if (verdict.ok && !verdict.failed) {
-        const storedHints =
-          verdict.grade === "good" || verdict.grade === "easy"
-            ? Math.max(0, Math.round(body.hints_used ?? 0))
-            : assistanceCount;
+        // Re-check latest recorded assistance from the attempt so substantive clarifications are never dropped.
+        const latestAtPass = store.getAttempt(attemptId);
+        if (latestAtPass?.status === "passed" && latestAtPass.result) {
+          return latestAtPass.result;
+        }
+        const storedHints = Math.max(latestAtPass?.assistance_count ?? 0, assistanceCount);
         const ev = makeEvent(
           "unit.probed",
           {
@@ -2680,7 +3018,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             const d = pickDrillDepth(item, postState);
             const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
             const st = unitExposureStats(postState, item.id, d, now + 2);
-            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 1) : [];
+            const b: Unit[] = [];
             const m = pickRepModality(item, postState, d, b);
             return {
               unit: item,
@@ -2690,7 +3028,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               priorPrompts: st.priorPrompts,
               delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
               modality: m,
-              bundledUnits: b.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
+              bundledUnits: [],
             };
           }),
         );
@@ -2730,6 +3068,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           {
             user: questionText,
             coach: verdict.message,
+            ...(body.submitted_starter ? { kind: "starter" as const } : {}),
             ...(verdict.failed ? { failed: true } : {}),
             ...(verdict.annotations && verdict.annotations.length > 0 ? { annotations: verdict.annotations } : {}),
             ...(addedUnits.length > 0 ? { added: addedUnits } : {}),

@@ -668,7 +668,7 @@ for await (const line of rl) {
     expect(pivotReview.ok).toBe(true);
     expect(pivotReview.grade).toBe("again");
 
-    // 4. Clarifying sub-step on Turn 2 stays open (no premature turn cap); Turn 5 hard cap forces ok=true, grade="again"
+    // 4. Long clarifying/sub-step chains stay open (no blind turn-count spoiler cap); only explicit showPivot forces closure.
     const openSubstep = await judge.continueRep({
       prompt: entry.prompt,
       expectedCrux: entry.crux,
@@ -689,7 +689,7 @@ for await (const line of rl) {
     });
     expect(openSubstep.ok).toBe(false);
 
-    const capped = await judge.continueRep({
+    const stillOpen = await judge.continueRep({
       prompt: entry.prompt,
       expectedCrux: entry.crux,
       firstContact: false,
@@ -707,13 +707,35 @@ for await (const line of rl) {
         { role: "user", text: "hmm" },
         { role: "assistant", text: "Try plugging a = 1/n." },
       ],
-      reply: "not sure",
+      reply: "wait what does a denote here?",
       latencyMs: 25000,
       hintsUsed: 0,
     });
-    expect(capped.ok).toBe(true);
-    expect(capped.grade).toBe("again");
-    expect(calls[calls.length - 1]?.body).toContain("HARD_TURN_CAP");
+    expect(stillOpen.ok).toBe(false);
+    expect(calls[calls.length - 1]?.body).not.toContain("HARD_TURN_CAP");
+
+    const explicitReveal = await judge.continueRep({
+      prompt: entry.prompt,
+      expectedCrux: entry.crux,
+      firstContact: false,
+      showPivot: true,
+      unitText: unit.text,
+      unitKind: unit.kind,
+      depth: "recall",
+      restsOn: [],
+      attempt: "sigma^2 / n^2",
+      feedback: "Close — how many terms are in the sum?",
+      turns: [
+        { role: "user", text: "n terms, so sigma^2?" },
+        { role: "assistant", text: "And what happens to the 1/n factor outside Var?" },
+      ],
+      reply: "",
+      latencyMs: 25000,
+      hintsUsed: 0,
+    });
+    expect(explicitReveal.ok).toBe(true);
+    expect(explicitReveal.grade).toBe("again");
+    expect(calls[calls.length - 1]?.body).toContain("SHOW_ANSWER");
   });
 
   it("generates adaptive fix_bug starters via promptEntryFor and parses Dream map compaction proposals", async () => {

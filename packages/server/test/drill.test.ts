@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { uuidv7 } from "@myelin/core";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { FastJudge } from "../src/judge.js";
@@ -196,7 +197,7 @@ describe("v2 drill and map API", () => {
     });
     const { unit_id: compId } = (await compRes.json()) as { unit_id: string };
 
-    // Learner says "i have no ideas" -> Build gear returns ground-floor question + missing prerequisite
+    // Learner says "i have no ideas" -> drill check does NOT silently mutate the review queue
     const checkRes = await app.request("/api/drill/check", {
       method: "POST",
       headers: authed({ "content-type": "application/json" }),
@@ -205,10 +206,26 @@ describe("v2 drill and map API", () => {
     expect(checkRes.status).toBe(200);
     const checkData = (await checkRes.json()) as { ok: boolean; added_units: { unit_id: string; text: string }[] };
     expect(checkData.ok).toBe(false);
-    expect(checkData.added_units).toHaveLength(1);
-    const prereqId = checkData.added_units[0]!.unit_id;
+    expect(checkData.added_units).toEqual([]);
 
-    // Map shows compound unit now rests_on the newly discovered prerequisite
+    // Adding an explicit prerequisite unit and linking rests_on ranks the weak foundation ahead of the compound unit
+    const prereqRes = await app.request("/api/units", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({ text: "The sample mean is the average of the observed sample points.", kind: "definition" }),
+    });
+    const { unit_id: prereqId } = (await prereqRes.json()) as { unit_id: string };
+    stores.get(user.id).append([
+      {
+        id: uuidv7(),
+        device_id: "test",
+        ts: Date.now() + 50,
+        v: 1,
+        type: "unit.linked",
+        payload: { unit_id: compId, rests_on: [prereqId] },
+      },
+    ]);
+
     const mapData = (await (await app.request("/api/map", { headers: authed() })).json()) as {
       units: { id: string; rests_on: string[] }[];
     };
@@ -669,5 +686,303 @@ describe("v2 drill and map API", () => {
     });
     expect(saved.turns[2]?.user).toBe("show me the computation exactly");
     expect(saved.turns[2]?.coach).toContain("(m+n)");
+  });
+
+  it("keeps an open drill ungraded across 5 clarifying questions and defers Explore unit crystallization to settle", async () => {
+    dir = mkdtempSync(join(tmpdir(), "myelin-clarify-crystallize-"));
+    registry = new Registry(dir);
+    stores = new Stores(dir);
+    const user = registry.createUser("ben");
+    const link = registry.issueLink(user.id);
+
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const bodyStr = String(init?.body ?? "");
+      if (bodyStr.includes("answering a clarifying question while a practice prompt is still open")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    message: "Here `grad_gamma` denotes the loss gradient $\\partial L / \\partial \\gamma$.",
+                    substantive_help: false,
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("thread-level knowledge consolidator")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    title: "LayerNorm backward geometry",
+                    suggested_units: [
+                      {
+                        text: "In LayerNorm backward (with $\\epsilon \\to 0$), shift and scale invariances force $\\nabla_x L$ to project out $\\mathbf{1}$ and $\\hat{x}$ before dividing by $\\sigma$.",
+                        kind: "result",
+                        observe_only: false,
+                        told: true,
+                      },
+                    ],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("Generate a crisp 2-5 word title")) {
+        return new Response(
+          JSON.stringify({
+            choices: [{ message: { content: JSON.stringify({ title: "LayerNorm backward geometry" }) } }],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("focused exploration")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    message: "LayerNorm pins $\\hat{x}$ to mean $0$ and fixed radius $\\sqrt{D}$ (for $\\epsilon \\to 0$), so radial pushes hit a wall.",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  message: "Clean reduction over the broadcast axes.",
+                  ok: true,
+                  grade: "good",
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const app = createApp({ registry, stores, judge: new FastJudge({ apiKey: "test-key", fetchFn: mockFetch }), dataDir: dir });
+    const loginRes = await app.request("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link }),
+    });
+    const cookie = loginRes.headers.get("set-cookie")!.split(";")[0]!;
+    const authed = (headers: Record<string, string> = {}) => ({ cookie, ...headers });
+
+    const created = (await (
+      await app.request("/api/units", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({ text: "Broadcasting a tensor in the forward pass sums over broadcast axes in backward", kind: "result" }),
+      })
+    ).json()) as { unit_id: string };
+
+    const attemptId = "att-clarify-5";
+    const questions = [
+      "why PyTorch?",
+      "what does grad_gamma mean?",
+      "is that standard notation?",
+      "isnt d_gamma confusing?",
+      "whats an adjoint?",
+    ];
+
+    const c1 = (await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          unit_id: created.unit_id,
+          depth: "recall",
+          prompt: "Complete grad_gamma for a broadcast scale parameter.",
+          attempt: questions[0],
+          clarify: true,
+          latency_ms: 4000,
+          hints_used: 0,
+        }),
+      })
+    ).json()) as { ok: boolean; probe_id: string | null };
+    expect(c1.ok).toBe(false);
+    expect(c1.probe_id).toBeNull();
+
+    const prior: { role: "user" | "assistant"; text: string }[] = [];
+    for (let i = 1; i < questions.length; i++) {
+      const ci = (await (
+        await app.request("/api/drill/followup", {
+          method: "POST",
+          headers: authed({ "content-type": "application/json" }),
+          body: JSON.stringify({
+            attempt_id: attemptId,
+            unit_id: created.unit_id,
+            depth: "recall",
+            prompt: "Complete grad_gamma for a broadcast scale parameter.",
+            attempt: questions[0],
+            feedback: "Clarified.",
+            turns: prior,
+            question: questions[i],
+            clarify: true,
+            latency_ms: 5000,
+            hints_used: 0,
+          }),
+        })
+      ).json()) as { ok: boolean; probe_id: string | null };
+      expect(ci.ok).toBe(false);
+      expect(ci.probe_id).toBeNull();
+      prior.push({ role: "user", text: questions[i]! }, { role: "assistant", text: "Clarified." });
+    }
+
+    const storedBefore = stores.get(user.id).getAttempt(attemptId);
+    expect(storedBefore?.status).toBe("active");
+    expect(storedBefore?.assistance_count).toBe(0);
+
+    const graded = (await (
+      await app.request("/api/drill/followup", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          unit_id: created.unit_id,
+          depth: "recall",
+          prompt: "Complete grad_gamma for a broadcast scale parameter.",
+          attempt: questions[0],
+          feedback: "Clarified.",
+          turns: prior,
+          question: "grad_gamma = (grad_y * x_hat).sum((0, 1), keepdim=True)",
+          latency_ms: 12000,
+          hints_used: 0,
+        }),
+      })
+    ).json()) as { ok: boolean; grade: string; probe_id: string | null };
+    expect(graded.ok).toBe(true);
+    expect(graded.grade).toBe("good");
+    expect(graded.probe_id).toBeTruthy();
+
+    const expRes = (await (
+      await app.request("/api/drill/explore", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          mode: "explore",
+          initial: "Why do we project out 1 and x_hat in LayerNorm backward?",
+          turns: [],
+        }),
+      })
+    ).json()) as { added_units: unknown[]; exploration?: { id: string } };
+    expect(expRes.added_units).toEqual([]);
+    const expId = expRes.exploration!.id;
+
+    const crys1 = (await (
+      await app.request(`/api/explorations/${encodeURIComponent(expId)}/crystallize`, {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+      })
+    ).json()) as { added_units: { text: string }[]; already_up_to_date?: boolean };
+    expect(crys1.added_units).toHaveLength(1);
+    expect(crys1.added_units[0]?.text).toContain("LayerNorm");
+
+    const crys2 = (await (
+      await app.request(`/api/explorations/${encodeURIComponent(expId)}/crystallize`, {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+      })
+    ).json()) as { added_units: { text: string }[]; already_up_to_date?: boolean };
+    expect(crys2.added_units).toEqual([]);
+    expect(crys2.already_up_to_date).toBe(true);
+
+    // Adding a second turn after already_up_to_date MUST NOT be stuck behind a cached promise!
+    const expRes2 = await app.request("/api/drill/explore", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        exploration_id: expId,
+        mode: "explore",
+        initial: "Why do we project out 1 and x_hat in LayerNorm backward?",
+        turns: [{ role: "assistant", text: "LayerNorm pins x_hat." }],
+        reply: "And why divide by std at the end?",
+      }),
+    });
+    expect(expRes2.status).toBe(200);
+    const crys3 = (await (
+      await app.request(`/api/explorations/${encodeURIComponent(expId)}/crystallize`, {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+      })
+    ).json()) as { already_up_to_date?: boolean; exploration?: { crystallized_turn_count?: number } };
+    expect(crys3.already_up_to_date).toBeUndefined();
+    expect(crys3.exploration?.crystallized_turn_count).toBe(2);
+
+    // Provider failure on crystallize returns 502 and does NOT advance crystallized_turn_count
+    let failCrystallize = true;
+    const failFetch: typeof fetch = async (_url, init) => {
+      const bodyStr = String(init?.body ?? "");
+      if (bodyStr.includes("thread-level knowledge consolidator") && failCrystallize) {
+        return new Response("upstream error", { status: 503 });
+      }
+      return mockFetch(_url, init);
+    };
+    const appFail = createApp({ registry, stores, judge: new FastJudge({ apiKey: "test-key", fetchFn: failFetch }), dataDir: dir });
+    await appFail.request("/api/drill/explore", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        exploration_id: expId,
+        mode: "explore",
+        initial: "Why do we project out 1 and x_hat in LayerNorm backward?",
+        turns: [],
+        reply: "What about eps > 0?",
+      }),
+    });
+    const failedCrys = await appFail.request(`/api/explorations/${encodeURIComponent(expId)}/crystallize`, {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+    });
+    expect(failedCrys.status).toBe(502);
+    expect(stores.get(user.id).getExploration(expId)?.crystallized_turn_count).toBe(2);
+
+    failCrystallize = false;
+    const retriedCrys = await appFail.request(`/api/explorations/${encodeURIComponent(expId)}/crystallize`, {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+    });
+    expect(retriedCrys.status).toBe(200);
+    expect(stores.get(user.id).getExploration(expId)?.crystallized_turn_count).toBe(3);
+
+    // Late Ask arriving on an already-passed attempt must never reopen status="active"
+    const lateClarify = await app.request("/api/drill/check", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        unit_id: created.unit_id,
+        depth: "recall",
+        prompt: "Complete grad_gamma for a broadcast scale parameter.",
+        attempt: "late question?",
+        clarify: true,
+        latency_ms: 1000,
+        hints_used: 0,
+      }),
+    });
+    expect(lateClarify.status).toBe(200);
+    expect(stores.get(user.id).getAttempt(attemptId)?.status).toBe("passed");
   });
 });

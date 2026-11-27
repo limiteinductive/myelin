@@ -21,6 +21,7 @@ import {
   fetchNextDrill,
   rescheduleDrillUnit,
   respondFrontier,
+  saveExploration,
   submitMcqChoice,
   tidyDraft,
   waitExplorationSidecar,
@@ -402,6 +403,12 @@ export function DrillView() {
   const exploreAddedIds = createMemo(() => {
     const ids = new Set<string>();
     if (!isExploreMode() && !activeFrontier()) return ids;
+    const exp = activeExploration();
+    if (exp?.crystallized_units) {
+      for (const u of exp.crystallized_units) {
+        if (!practice.state.removedUnits[u.unit_id]) ids.add(u.unit_id);
+      }
+    }
     for (const b of beats()) {
       if (!b.added) continue;
       for (const u of b.added) {
@@ -437,6 +444,9 @@ export function DrillView() {
 
   // Request & active-effort timer ownership (measures typing/sketching effort, not reading or coach waits).
   const IDLE_CUTOFF_MS = 15_000;
+  const [crystallizing, setCrystallizing] = createSignal(false);
+  const [branchingExplore, setBranchingExplore] = createSignal(false);
+
   let activeMs = 0;
   let lastActivityAt = 0;
   let loadSeq = 0;
@@ -1040,6 +1050,8 @@ export function DrillView() {
     const anchor = starterAnchorLine(starter);
     return beats().some((b) => {
       if (isFailedBeat(b)) return false;
+      if (b.kind === "starter") return true;
+      if (b.kind === "clarify") return false;
       const u = b.user.trim();
       if (!u) return false;
       if (u === "Show answer.") return true;
@@ -1079,16 +1091,16 @@ export function DrillView() {
     const note = blankNote();
     const text = assembleFilledStarter(b.starter, blankValues(), note);
     if (note) setBlankNote("");
-    await submitBeat(text);
+    await submitBeat(text, { submittedStarter: true });
   };
 
-  /** Sends only the clarifying question below the blanks card, keeping the fillable holes open and intact. */
+  /** Sends only the clarifying question below the blanks card, keeping the fillable holes open and ungraded. */
   const submitBlankQuestion = async () => {
     if (busy() || !activeBlanks()) return;
     const q = blankNote().trim();
     if (!q && citations().length === 0) return;
     setBlankNote("");
-    await submitBeat(q || undefined);
+    await submitBeat(q || undefined, { clarify: true });
   };
 
   const triggerComplete = (
@@ -1098,9 +1110,11 @@ export function DrillView() {
     finalCitations: Citation[],
     finalSketch: string | null,
     replaceIdx?: number,
+    beatKind?: Beat["kind"],
   ) => {
     const passedBeat: Beat = {
       user: finalUser,
+      ...(beatKind ? { kind: beatKind } : {}),
       ...(finalCitations.length > 0 ? { citations: finalCitations } : {}),
       sketch: finalSketch,
       coach: res.message,
@@ -1436,6 +1450,8 @@ export function DrillView() {
     sketch: string | null;
     testMe?: boolean;
     showPivot?: boolean;
+    clarify?: boolean;
+    submittedStarter?: boolean;
     signal: AbortSignal;
     onDelta?: (partialText: string) => void;
   }): Promise<
@@ -1472,6 +1488,7 @@ export function DrillView() {
       const res = await exploreDrill(
         {
           exploration_id: opts.explorationId ?? null,
+          mode: "explore",
           initial,
           sketch_data_url: opts.sketch,
           turns: priorAfterFirst,
@@ -1531,6 +1548,8 @@ export function DrillView() {
           prompt: r.prompt,
           attempt: opts.payloadText,
           ...(opts.showPivot ? { show_pivot: true } : {}),
+          ...(opts.clarify ? { clarify: true } : {}),
+          ...(opts.submittedStarter ? { submitted_starter: true } : {}),
           ...(r.modality ? { modality: r.modality } : {}),
           ...(r.bundled_unit_ids && r.bundled_unit_ids.length > 0 ? { bundled_unit_ids: r.bundled_unit_ids } : {}),
           sketch_data_url: opts.sketch,
@@ -1563,9 +1582,11 @@ export function DrillView() {
         ...(r.modality ? { modality: r.modality } : {}),
         ...(r.bundled_unit_ids && r.bundled_unit_ids.length > 0 ? { bundled_unit_ids: r.bundled_unit_ids } : {}),
         ...(opts.showPivot ? { show_pivot: true } : {}),
+        ...(opts.clarify ? { clarify: true } : {}),
+        ...(opts.submittedStarter ? { submitted_starter: true } : {}),
         sketch_data_url: opts.sketch,
         latency_ms: opts.latencyMs,
-        hints_used: cleanPrior.length,
+        hints_used: opts.showPivot ? 1 : 0,
       },
       opts.signal,
       opts.onDelta,
@@ -1573,12 +1594,14 @@ export function DrillView() {
     return { kind: "drill", res };
   };
 
-  const submitBeat = async (overrideText?: string, opts?: { showPivot?: boolean; tellMe?: boolean }) => {
+  const submitBeat = async (overrideText?: string, opts?: { showPivot?: boolean; clarify?: boolean; submittedStarter?: boolean }) => {
     const showPivot = Boolean(opts?.showPivot);
-    const tellMe = Boolean(opts?.tellMe);
+    const clarify = Boolean(opts?.clarify);
+    const submittedStarter = Boolean(opts?.submittedStarter);
+    const beatKind: Beat["kind"] = clarify ? "clarify" : submittedStarter ? "starter" : undefined;
     const hasOverride = typeof overrideText === "string" && overrideText.trim().length > 0;
-    if (!hasOverride && !showPivot && !tellMe && !canSubmit()) return;
-    if ((hasOverride || showPivot || tellMe) && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
+    if (!hasOverride && !showPivot && !canSubmit()) return;
+    if ((hasOverride || showPivot) && (busy() || (!isNonUnit() && passedVerdict()?.ok))) return;
     const ownerKey = sessionKey();
     const isFreshExplore = isExplore();
     const savedExp = activeExploration();
@@ -1586,26 +1609,19 @@ export function DrillView() {
     const frontier = activeFrontier();
     const unitRep = rep();
     const prevDraft = draft().trim();
-    const text = tellMe
-      ? ""
-      : hasOverride
-        ? overrideText.trim()
-        : showPivot
-          ? prevDraft || "Show answer."
-          : prevDraft;
-    const activeQ = activeExploreQuestion();
-    const qAns = tellMe ? "Walk me through this directly." : "";
-    const rawCitations = tellMe ? [] : snapshot(citations());
-    const pendingCitations: Citation[] =
-      activeQ && qAns
-        ? [{ id: uuidv7(), text: activeQ, comment: qAns }, ...rawCitations]
-        : rawCitations;
-    const payloadText = formatCitedMessage(pendingCitations, text || (tellMe ? qAns : ""));
-    const sketch = tellMe ? null : exportSketch();
+    const text = hasOverride
+      ? overrideText.trim()
+      : showPivot
+        ? prevDraft || "Show answer."
+        : prevDraft;
+    const rawCitations = snapshot(citations());
+    const pendingCitations: Citation[] = rawCitations;
+    const payloadText = formatCitedMessage(pendingCitations, text);
+    const sketch = clarify ? null : exportSketch();
     const priorBeats = snapshot(beats());
     const latencyMs = !modeExplore && !frontier ? currentActiveLatencyMs() : null;
     const attemptId = !modeExplore && !frontier && unitRep ? ensureAttemptId(ownerKey) : undefined;
-    pauseActivity();
+    if (!clarify) pauseActivity();
 
     const ctrl = new AbortController();
     activeAbort = ctrl;
@@ -1617,6 +1633,7 @@ export function DrillView() {
     const pendingId = uuidv7();
     const pendingBeat: Beat = {
       user: text,
+      ...(beatKind ? { kind: beatKind } : {}),
       ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
       sketch,
       coach: "",
@@ -1626,22 +1643,18 @@ export function DrillView() {
     if (isFreshExplore) {
       practice.updateExplore((d) => {
         d.beats.push(pendingBeat);
-        if (!tellMe) {
-          d.draft = "";
-          d.citations = [];
-        }
+        d.draft = "";
+        d.citations = [];
       });
     } else {
       practice.updateUnitSession(ownerKey, (d) => {
-        if (latencyMs !== null) d.activeMs = latencyMs;
+        if (!clarify && latencyMs !== null) d.activeMs = latencyMs;
         d.beats.push(pendingBeat);
-        if (!tellMe) {
-          d.draft = "";
-          d.citations = [];
-        }
+        if (!clarify) d.draft = "";
+        d.citations = [];
       });
     }
-    if (!tellMe) clearSketch();
+    if (!clarify) clearSketch();
     requestAnimationFrame(() => {
       autoGrow();
       scrollPadIntoView();
@@ -1667,6 +1680,8 @@ export function DrillView() {
         payloadText,
         sketch,
         showPivot,
+        clarify,
+        submittedStarter,
         signal: ctrl.signal,
         onDelta,
       });
@@ -1675,8 +1690,12 @@ export function DrillView() {
           const idx = list.findIndex((b) => b.pending && b.pendingId === pendingId);
           if (idx >= 0) list.splice(idx, 1);
         });
-        if (!disposed && !tellMe) {
-          setDraftFor(ownerKey, hasOverride ? prevDraft : text);
+        if (!disposed) {
+          if (clarify) {
+            setBlankNote(text);
+          } else {
+            setDraftFor(ownerKey, hasOverride ? prevDraft : text);
+          }
           if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
               if (list.length === 0) list.push(...rawCitations);
@@ -1695,7 +1714,7 @@ export function DrillView() {
       if (out.kind === "drill" && out.res.ok) {
         const curBeats = snapshot(practice.state.sessions[ownerKey]?.beats ?? []);
         const idx = curBeats.findIndex((b) => b.pending && b.pendingId === pendingId);
-        triggerComplete(ownerKey, out.res, text, pendingCitations, sketch, idx >= 0 ? idx : undefined);
+        triggerComplete(ownerKey, out.res, text, pendingCitations, sketch, idx >= 0 ? idx : undefined, beatKind);
         return;
       }
 
@@ -1707,6 +1726,7 @@ export function DrillView() {
 
       const settled: Beat = {
         user: text,
+        ...(beatKind ? { kind: beatKind } : {}),
         ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
         sketch,
         coach: message,
@@ -1753,8 +1773,12 @@ export function DrillView() {
           const idx = list.findIndex((b) => b.pending && b.pendingId === pendingId);
           if (idx >= 0) list.splice(idx, 1);
         });
-        if (!disposed && !tellMe) {
-          setDraftFor(ownerKey, hasOverride ? prevDraft : text);
+        if (!disposed) {
+          if (clarify) {
+            setBlankNote(text);
+          } else {
+            setDraftFor(ownerKey, hasOverride ? prevDraft : text);
+          }
           if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
               if (list.length === 0) list.push(...rawCitations);
@@ -1766,6 +1790,7 @@ export function DrillView() {
       // Park the submission as a retryable failed beat so the learner never loses or re-types their work.
       const failedBeat: Beat = {
         user: text,
+        ...(beatKind ? { kind: beatKind } : {}),
         ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
         sketch,
         coach: e instanceof Error ? e.message : "Could not check that reply just now.",
@@ -1840,6 +1865,8 @@ export function DrillView() {
         payloadText,
         sketch: target.sketch ?? null,
         testMe,
+        clarify: target.kind === "clarify",
+        submittedStarter: target.kind === "starter",
         signal: ctrl.signal,
         onDelta,
       });
@@ -1857,7 +1884,7 @@ export function DrillView() {
       }
 
       if (out.kind === "drill" && out.res.ok) {
-        triggerComplete(ownerKey, out.res, target.user, pendingCitations, target.sketch ?? null, beatIdx);
+        triggerComplete(ownerKey, out.res, target.user, pendingCitations, target.sketch ?? null, beatIdx, target.kind);
         return;
       }
 
@@ -1871,6 +1898,7 @@ export function DrillView() {
         if (list[beatIdx]) {
           list[beatIdx] = {
             user: target.user,
+            ...(target.kind ? { kind: target.kind } : {}),
             ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
             ...(target.sketch ? { sketch: target.sketch } : {}),
             coach: message,
@@ -2089,7 +2117,7 @@ export function DrillView() {
           ...(r.bundled_unit_ids && r.bundled_unit_ids.length > 0 ? { bundled_unit_ids: r.bundled_unit_ids } : {}),
           sketch_data_url: target.sketch ?? null,
           latency_ms: latencyMs,
-          hints_used: Math.max(1, cleanAll.length),
+          hints_used: 0,
         },
         ctrl.signal,
         (partial) => {
@@ -2335,10 +2363,11 @@ export function DrillView() {
     try {
       const res = await exploreDrill(
         {
+          mode: "post_rep",
           initial: `Completed practice on: ${r.prompt} (Unit: ${r.text})${mcqExploreContext()}`,
           turns: priorTurns,
           reply: payloadText,
-          promote_on_unit: true,
+          promote_on_unit: false,
           origin_prompt: r.prompt,
           prior_post_turns: promotedHistoryBeats.map((b) => ({
             user: beatUserPayload(b),
@@ -2447,6 +2476,90 @@ export function DrillView() {
   const submitPostFollowUp = (ev: SubmitEvent) => {
     ev.preventDefault();
     void sendPostFollowUp();
+  };
+
+  /** Explicitly branches a completed rep (plus any post-rep Q&A) into a standalone saved Exploration. */
+  const branchRepToExploration = async () => {
+    const r = rep();
+    if (!r || branchingExplore() || postBusy()) return;
+    const ownerKey = sessionKey();
+    const cleanDrillBeats = snapshot(beats())
+      .filter((b) => !b.pending && !isFailedBeat(b))
+      .map((b): Beat => ({
+        user: b.user,
+        ...(b.citations && b.citations.length > 0 ? { citations: b.citations } : {}),
+        ...(b.sketch ? { sketch: b.sketch } : {}),
+        coach: b.coach,
+        ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
+      }));
+    const vNow = passedVerdict();
+    const mcqVerdictBeat: Beat | null = (() => {
+      const m = vNow?.mcq_result;
+      if (!isMcq() || !m) return null;
+      const choices = mcqChoices();
+      const pickedIdx = m.selected_choice_id ? choices.findIndex((c) => c.id === m.selected_choice_id) : -1;
+      const pickedText = pickedIdx >= 0 ? `${pickedIdx + 1}. ${choices[pickedIdx]!.text}` : "I'm not sure · Show answer";
+      const coachParts = [
+        m.outcome === "wrong" && m.why_wrong_selected ? m.why_wrong_selected : "",
+        m.explanation,
+      ].filter(Boolean);
+      return { user: pickedText, coach: coachParts.join("\n\n") };
+    })();
+    const originCoach = (() => {
+      const choices = mcqChoices();
+      if (choices.length > 0) {
+        return `${r.prompt}\n\n${choices.map((c, i) => `${i + 1}. ${c.text}`).join("\n")}`;
+      }
+      return r.prompt;
+    })();
+    const cleanPost = snapshot(postBeats()).filter((b) => !b.pending && !isFailedBeat(b));
+    const promotedBeats: Beat[] = [
+      { user: "", coach: originCoach },
+      ...cleanDrillBeats,
+      ...(mcqVerdictBeat ? [mcqVerdictBeat] : []),
+      ...cleanPost,
+    ];
+    setBranchingExplore(true);
+    try {
+      const title = (r.topic?.trim() || r.text.slice(0, 52)).trim();
+      const { exploration } = await saveExploration({
+        title,
+        turns: promotedBeats.map((b) => ({
+          user: beatUserPayload(b),
+          coach: b.coach,
+          ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
+        })),
+      });
+      if (disposed) return;
+      if (practice.stageKey() !== ownerKey) {
+        void practice.refreshExplorations();
+        return;
+      }
+      practice.promotePostFollowUpToExploration(ownerKey, exploration, promotedBeats);
+      requestAnimationFrame(() => {
+        autoGrow();
+        scrollPadIntoView();
+        textarea?.focus();
+      });
+    } catch (e) {
+      if (!disposed) setError(e instanceof Error ? e.message : "Could not open exploration.");
+    } finally {
+      if (!disposed) setBranchingExplore(false);
+    }
+  };
+
+  const triggerManualCrystallize = async () => {
+    const exp = activeExploration();
+    if (!exp || crystallizing() || busy()) return;
+    setCrystallizing(true);
+    setError(null);
+    try {
+      await practice.crystallizeExplorationById(exp.id, { throwOnError: true });
+    } catch (e) {
+      if (!disposed) setError(e instanceof Error ? e.message : "Could not save practice units just now.");
+    } finally {
+      if (!disposed) setCrystallizing(false);
+    }
   };
 
   const handleUndoAddedUnit = async (u: AddedUnit) => {
@@ -2590,19 +2703,6 @@ export function DrillView() {
     if (!canvas) return { x: 0, y: 0 };
     const r = canvas.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
-  };
-
-  const activeExploreQuestion = () => {
-    if (!isExploreMode() || busy() || passedVerdict()?.ok || editingBeatIdx() !== null) return null;
-    const list = beats();
-    const last = list[list.length - 1];
-    if (!last || last.pending || isFailedBeat(last) || !last.question?.trim()) return null;
-    return last.question.trim();
-  };
-
-  const tellMeDirectly = () => {
-    if (busy()) return;
-    void submitBeat(undefined, { tellMe: true });
   };
 
   /** Schedule line with the Bring back slider, plus Next. Shared by the written and the MCQ verdict. */
@@ -2882,11 +2982,13 @@ export function DrillView() {
                 const anchor = () => starterAnchorLine(r().starter);
                 const pinnedAbove = () => shouldPinStarterAbovePad(r().starter);
                 const rendered = () => isRenderedStarter(r().starter);
+                const hasStarterBeat = () =>
+                  beats().some((b) => b.kind === "starter" || (Boolean(anchor()) && b.user.includes(anchor())));
                 const showStarterRef = () =>
                   Boolean(r().starter) &&
                   !activeBlanks() &&
-                  (pinnedAbove() ||
-                    (beats().length > 0 && !beats().some((b) => anchor() && b.user.includes(anchor()))));
+                  !hasStarterBeat() &&
+                  (pinnedAbove() || beats().length > 0);
                 return (
                   <>
                     <h1 class="v2-prompt" data-citable="true">
@@ -3067,6 +3169,7 @@ export function DrillView() {
                   !passedVerdict()?.ok &&
                   !beat.pending &&
                   !failed() &&
+                  beat.kind !== "clarify" &&
                   beat.user.trim().length > 0;
                 const annoSummary = createMemo(() => {
                   if (!beat.user || !beat.annotations || beat.annotations.length === 0) {
@@ -3318,12 +3421,7 @@ export function DrillView() {
                         <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
 
                         <Show
-                          when={
-                            beat.question &&
-                            !beat.pending &&
-                            !failed() &&
-                            !(isExploreMode() && idx() === beats().length - 1 && activeExploreQuestion())
-                          }
+                          when={beat.question && !beat.pending && !failed()}
                         >
                           <div class="v2-beat-question-past" data-citable="true">
                             <Body text={beat.question!} />
@@ -3477,33 +3575,57 @@ export function DrillView() {
                   </svg>
                 </button>
               </Show>
+              <Show when={!postBusy() && postInput().trim().length === 0 && citations().length === 0}>
+                <button
+                  type="button"
+                  class="v2-post-branch"
+                  disabled={branchingExplore()}
+                  data-tip="Open this thread in Explore to go deeper"
+                  onClick={() => void branchRepToExploration()}
+                >
+                  {branchingExplore() ? "Opening…" : "Explore this"}
+                </button>
+              </Show>
             </form>
           </div>
         </Show>
 
-        {/* Explicit active question card in Explore mode: quiet header + 1-click Tell me */}
-        <Show when={activeExploreQuestion()}>
-          {(q) => (
-            <div class="v2-explore-q">
-              <div class="v2-explore-q-head">
-                <span class="v2-explore-q-label">Question</span>
-                <div class="v2-explore-q-actions">
-                  <button
-                    type="button"
-                    class="v2-explore-q-tell"
-                    disabled={busy()}
-                    data-tip="Walk me through this directly"
-                    onClick={tellMeDirectly}
-                  >
-                    Tell me
-                  </button>
+        {/* Thread-level crystallization summary & optional immediate settle for saved Explorations */}
+        <Show when={activeExploration()}>
+          {(exp) => {
+            const settledCount = () => beats().filter((b) => !b.pending && !isFailedBeat(b)).length;
+            const effectiveTurns = () => Math.max(settledCount(), exp()?.total_turns ?? 0);
+            const hasUncrystallized = () => effectiveTurns() > (exp()?.crystallized_turn_count ?? 0);
+            const crystallizedList = () => exp()?.crystallized_units ?? [];
+            return (
+              <Show when={crystallizedList().length > 0 || (hasUncrystallized() && !busy())}>
+                <div class="v2-explore-settle">
+                  <Show when={crystallizedList().length > 0}>
+                    <div class="v2-explore-crystallized">
+                      <AddedUnitsList
+                        items={crystallizedList()}
+                        removingId={removingId()}
+                        onUndo={(u) => void handleUndoAddedUnit(u)}
+                      />
+                    </div>
+                  </Show>
+                  <Show when={hasUncrystallized() && !busy()}>
+                    <div class="v2-explore-settle-bar">
+                      <button
+                        type="button"
+                        class="v2-explore-settle-btn"
+                        disabled={crystallizing()}
+                        data-tip="Distill 0–2 practice units now (also runs automatically when you leave or archive)"
+                        onClick={() => void triggerManualCrystallize()}
+                      >
+                        {crystallizing() ? "Saving to practice…" : "Save to practice"}
+                      </button>
+                    </div>
+                  </Show>
                 </div>
-              </div>
-              <div class="v2-explore-q-body" data-citable="true">
-                <Body text={q()} />
-              </div>
-            </div>
-          )}
+              </Show>
+            );
+          }}
         </Show>
 
         {/* The ONE active pad at the bottom (hidden once rep passes or while editing a derivation in place) */}
@@ -3527,17 +3649,15 @@ export function DrillView() {
                     ref={textarea}
                     class="v2-pad-input"
                     placeholder={
-                      activeExploreQuestion()
-                        ? "Answer or ask a follow-up…"
-                        : beats().length > 0
-                          ? "Continue, or ask…"
-                          : isExploreMode()
-                            ? "Drop a question, derivation, paper, file path, or topic to work through…"
-                            : activeFrontier()
-                              ? "Cite a line above, ask a question, or explain it back…"
-                              : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
-                                ? "Write your answer for the points above…"
-                                : "Write your attempt or ask anything…"
+                      beats().length > 0
+                        ? "Continue, or ask…"
+                        : isExploreMode()
+                          ? "Drop a question, derivation, paper, file path, or topic to work through…"
+                          : activeFrontier()
+                            ? "Cite a line above, ask a question, or explain it back…"
+                            : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
+                              ? "Write your answer for the points above…"
+                              : "Write your attempt or ask anything…"
                     }
                     spellcheck="false"
                     autocorrect="off"
@@ -3638,6 +3758,16 @@ export function DrillView() {
                       >
                         Show answer
                       </button>
+                      <Show when={canSubmit()}>
+                        <button
+                          type="button"
+                          class="v2-btn-secondary"
+                          data-tip="Ask a clarifying question without grading or closing this rep"
+                          onClick={() => void submitBeat(undefined, { clarify: true })}
+                        >
+                          Ask
+                        </button>
+                      </Show>
                     </Show>
                     <Show when={draft().trim().length >= 12 && draft().trim() !== (rep()?.starter?.trim() ?? "")}>
                       <button
