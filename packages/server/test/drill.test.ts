@@ -984,5 +984,42 @@ describe("v2 drill and map API", () => {
     });
     expect(lateClarify.status).toBe(200);
     expect(stores.get(user.id).getAttempt(attemptId)?.status).toBe("passed");
+
+    // GET /api/progress returns live session, backlog split, 7-day forecast, mastery, and focus without leaking unit text
+    const progUnitRes = await app.request(
+      `/api/progress?tz=UTC&unit=${encodeURIComponent(created.unit_id)}`,
+      { headers: authed() },
+    );
+    expect(progUnitRes.status).toBe(200);
+    const progUnit = (await progUnitRes.json()) as {
+      session: { practiced: number; first_try: number };
+      backlog: { due: { total: number; new: number; review: number; shaky: number }; cleared_today: number; forecast: number[]; forecast_days: string[] };
+      mastery: { total: number; solid: number; learning: number; new: number; topics: { topic: string; units: number; due: number }[] };
+      focus: { kind: string; unit_id?: string; reviews?: number; text?: string } | null;
+    };
+    expect(progUnit.session.practiced).toBe(1);
+    expect(progUnit.session.first_try).toBe(1);
+    expect(progUnit.backlog.cleared_today).toBe(1);
+    expect(progUnit.backlog.forecast).toHaveLength(7);
+    expect(progUnit.backlog.forecast_days).toHaveLength(7);
+    expect(progUnit.mastery.total).toBeGreaterThanOrEqual(2);
+    expect(progUnit.focus?.kind).toBe("unit");
+    expect(progUnit.focus?.unit_id).toBe(created.unit_id);
+    expect(progUnit.focus?.reviews).toBe(1);
+    expect("text" in (progUnit.focus ?? {})).toBe(false);
+
+    const progExpRes = await app.request(
+      `/api/progress?tz=UTC&exploration=${encodeURIComponent(expId)}`,
+      { headers: authed() },
+    );
+    expect(progExpRes.status).toBe(200);
+    const progExp = (await progExpRes.json()) as {
+      focus: { kind: string; exploration_id?: string; turns?: number; saved_units?: number; unsaved_turns?: number } | null;
+    };
+    expect(progExp.focus?.kind).toBe("exploration");
+    expect(progExp.focus?.exploration_id).toBe(expId);
+    expect(progExp.focus?.turns).toBe(3);
+    expect(progExp.focus?.saved_units).toBe(1);
+    expect(progExp.focus?.unsaved_turns).toBe(0);
   });
 });

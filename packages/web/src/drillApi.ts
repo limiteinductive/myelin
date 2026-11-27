@@ -304,6 +304,68 @@ async function reqStream<T>(
   return donePayload;
 }
 
+export interface ProgressFocusUnit {
+  kind: "unit";
+  unit_id: string;
+  topic: string | null;
+  depth: Depth;
+  p_imm: number | null;
+  reviews: number;
+  first_latency_ms: number | null;
+  last_latency_ms: number | null;
+  interval_ms: number | null;
+  next_in_ms: number | null;
+}
+
+export interface ProgressFocusExploration {
+  kind: "exploration";
+  exploration_id: string;
+  title: string;
+  turns: number;
+  saved_units: number;
+  unsaved_turns: number;
+  saving: boolean;
+}
+
+export interface ProgressResponse {
+  as_of: number;
+  session: {
+    started_at: number;
+    active_ms: number;
+    today_active_ms: number;
+    practiced: number;
+    first_try: number;
+    run: { run_id: string; duration_ms: number; elapsed_ms: number; paused: boolean } | null;
+  };
+  backlog: {
+    due: { total: number; new: number; review: number; shaky: number };
+    cleared_today: number;
+    next_due_in_ms: number | null;
+    forecast: number[];
+    forecast_days: string[];
+  };
+  mastery: {
+    total: number;
+    solid: number;
+    learning: number;
+    new: number;
+    topics: { topic: string; units: number; due: number }[];
+  };
+  focus: ProgressFocusUnit | ProgressFocusExploration | null;
+}
+
+export function fetchProgress(
+  opts: { tz?: string; unit?: string | null; exploration?: string | null } = {},
+  signal?: AbortSignal,
+): Promise<ProgressResponse> {
+  const qs = new URLSearchParams();
+  if (opts.tz) qs.set("tz", opts.tz);
+  if (opts.unit) qs.set("unit", opts.unit);
+  if (opts.exploration) qs.set("exploration", opts.exploration);
+  const q = qs.toString();
+  return req<ProgressResponse>(`/api/progress${q ? `?${q}` : ""}`, signal ? { signal } : undefined);
+}
+
 export function fetchDrillQueue(
   signal?: AbortSignal,
   includeIds?: readonly string[],

@@ -280,6 +280,11 @@ export class EventStore {
     return (this.db.prepare("SELECT * FROM events WHERE seq > ? ORDER BY seq LIMIT ?").all(after, limit) as unknown as Row[]).map(fromRow);
   }
 
+  /** Events with ts >= sinceMs, in chronological seq order (used for daily active time & session stats). */
+  readSinceTs(sinceMs: number): Appended[] {
+    return (this.db.prepare("SELECT * FROM events WHERE ts >= ? ORDER BY seq ASC").all(sinceMs) as unknown as Row[]).map(fromRow);
+  }
+
   /**
    * Appends a batch atomically. Each event is validated first; one bad event rejects the batch.
    * An id already in the log is a retry: it returns the existing seq if the content matches and

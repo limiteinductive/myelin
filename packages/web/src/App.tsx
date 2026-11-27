@@ -4,6 +4,7 @@ import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, Sw
 import { watchActivity } from "./activity.js";
 import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
+import { ProgressRail } from "./ProgressRail.js";
 import { createPracticeStore, PracticeContext, sessionHasWork, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
 import { formatSidebarDrillLabel, plainSidebarText, sidebarLayout } from "./sidebar.js";
@@ -72,6 +73,12 @@ const SidebarToggleIcon = () => (
   <svg width="15" height="15" viewBox="0 0 18 18" {...ICON_STROKE}>
     <rect x="2.5" y="3" width="13" height="12" rx="2.5" />
     <path d="M6.75 3v12" />
+  </svg>
+);
+const RailToggleIcon = () => (
+  <svg width="15" height="15" viewBox="0 0 18 18" {...ICON_STROKE}>
+    <rect x="2.5" y="3" width="13" height="12" rx="2.5" />
+    <path d="M11.25 3v12" />
   </svg>
 );
 const BackIcon = () => (
@@ -188,6 +195,52 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   const narrow = media("(max-width: 900px)");
   const [sidebarOpen, setSidebarOpen] = createSignal(typeof matchMedia === "function" ? !matchMedia("(max-width: 900px)").matches : true);
 
+  // Floating right Progress rail: persists preference in localStorage; overlay below 940px main width.
+  const railPrefKey = `myelin:rail-open:${props.session.user.id}`;
+  const readRailPref = () => {
+    try {
+      const saved = localStorage.getItem(railPrefKey);
+      if (saved === "0") return false;
+      if (saved === "1") return true;
+    } catch {
+      /* ignore */
+    }
+    return typeof matchMedia === "function" ? matchMedia("(min-width: 1160px)").matches : true;
+  };
+  const [railPrefOpen, setRailPrefOpen] = createSignal(readRailPref());
+  const [railOverlayOpen, setRailOverlayOpen] = createSignal(false);
+  const [mainWidth, setMainWidth] = createSignal(typeof window !== "undefined" ? window.innerWidth : 1440);
+  const railOverlay = () => mainWidth() < 940;
+  const railOpen = () => (railOverlay() ? railOverlayOpen() : railPrefOpen());
+  const toggleRail = () => {
+    if (railOverlay()) {
+      setRailOverlayOpen((v) => !v);
+    } else {
+      setRailPrefOpen((v) => {
+        const next = !v;
+        try {
+          localStorage.setItem(railPrefKey, next ? "1" : "0");
+        } catch {
+          /* ignore */
+        }
+        return next;
+      });
+    }
+  };
+  let mainEl: HTMLDivElement | undefined;
+  const [progressRev, setProgressRev] = createSignal(0);
+
+  onSettled(() => {
+    if (!mainEl || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (typeof w === "number" && w > 0) setMainWidth(w);
+    });
+    ro.observe(mainEl);
+    setMainWidth(mainEl.getBoundingClientRect().width || window.innerWidth);
+    return () => ro.disconnect();
+  });
+
   // Single account-scoped reactive store owned by this authenticated session.
   const practice = createPracticeStore(props.session.user.id);
 
@@ -226,6 +279,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
         }
         const cur = currentRun(runMap);
         setRun(cur ? { ...cur } : null);
+        setProgressRev((n) => n + 1);
       }
     };
 
@@ -720,7 +774,14 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
           <div class="v2-sidebar-scrim" onClick={() => setSidebarOpen(false)} />
         </Show>
 
-        <div class="v2-main">
+        <div
+          ref={mainEl}
+          class={{
+            "v2-main": true,
+            "has-rail": railOpen(),
+            "rail-overlay": railOverlay(),
+          }}
+        >
           <header class="v2-topbar">
             <div class="v2-topbar-left">
               <Show when={!sidebarOpen() || narrow()}>
@@ -729,13 +790,33 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
             </div>
 
             <div class="v2-topbar-right">
-              <Show when={run()}>{(r) => <RunClock run={r()} now={clockNow()} />}</Show>
+              <Show when={!railOpen() ? run() : null}>{(r) => <RunClock run={r()} now={clockNow()} />}</Show>
+              <button
+                type="button"
+                class="v2-icon-toggle"
+                data-rail-toggle="true"
+                aria-label={railOpen() ? "Hide progress" : "Show progress"}
+                aria-pressed={railOpen() ? "true" : "false"}
+                data-tip={railOpen() ? "Hide progress" : "Show progress"}
+                data-tip-side="bottom"
+                onClick={toggleRail}
+              >
+                <RailToggleIcon />
+              </button>
             </div>
           </header>
 
           <div class="v2-body">
             <DrillView />
           </div>
+
+          <ProgressRail
+            userId={props.session.user.id}
+            open={railOpen()}
+            overlay={railOverlay()}
+            revision={progressRev()}
+            onCloseOverlay={() => setRailOverlayOpen(false)}
+          />
         </div>
       </div>
     </PracticeContext>

@@ -4,7 +4,24 @@ import { randomInt } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { serveStatic } from "@hono/node-server/serve-static";
-import { codeBlocks, EventError, makeEvent, PhotoCard, resolveUnit, uuidv7, type Depth, type Grade, type State, type Unit } from "@myelin/core";
+import {
+  activeMs,
+  addMark,
+  codeBlocks,
+  currentRun,
+  EventError,
+  makeEvent,
+  marksOf,
+  PhotoCard,
+  resolveUnit,
+  runLeft,
+  uuidv7,
+  type Depth,
+  type Grade,
+  type Mark,
+  type State,
+  type Unit,
+} from "@myelin/core";
 import { Hono, type Context } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -1136,6 +1153,271 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       }
     });
   }
+
+  function safeTimeZone(tz?: string | null): string {
+    if (!tz || !tz.trim()) return "UTC";
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: tz.trim() }).format(0);
+      return tz.trim();
+    } catch {
+      return "UTC";
+    }
+  }
+
+  /** Computes the epoch ms of local midnight (00:00:00) for the calendar day containing `ts` in `tz`. */
+  function localDayStartMs(ts: number, tz: string): number {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    });
+    const partsOf = (t: number) => {
+      const m: Record<string, number> = {};
+      for (const p of fmt.formatToParts(t)) {
+        if (p.type !== "literal") m[p.type] = Number(p.value);
+      }
+      return m;
+    };
+    const p = partsOf(ts);
+    const localElapsedMs = ((p.hour ?? 0) * 3600 + (p.minute ?? 0) * 60 + (p.second ?? 0)) * 1000 + (ts % 1000);
+    let approx = ts - localElapsedMs;
+    // Correct for any DST boundary crossed since midnight
+    const check = partsOf(approx);
+    const driftHours = check.hour === 23 ? 1 : check.hour === 1 ? -1 : 0;
+    if (driftHours !== 0) approx += driftHours * 3_600_000;
+    return approx;
+  }
+
+  function localWeekdayInitial(ts: number, tz: string): string {
+    try {
+      const wd = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(ts);
+      return wd.charAt(0).toUpperCase() || "·";
+    } catch {
+      return "·";
+    }
+  }
+
+  app.get("/api/progress", (c) => {
+    const { user } = c.get("session");
+    const store = stores.get(user.id);
+    store.catchUp();
+    const state = store.state;
+    const now = Date.now();
+    const tz = safeTimeZone(c.req.query("tz"));
+    const focusUnitId = c.req.query("unit")?.trim() || null;
+    const focusExpId = c.req.query("exploration")?.trim() || null;
+
+    const dayStart = localDayStartMs(now, tz);
+    // Build exact local day boundaries [day0, day1, ..., day7] (7 forecast buckets starting today).
+    const dayBounds: number[] = [dayStart];
+    for (let i = 1; i <= 7; i++) {
+      dayBounds.push(localDayStartMs(dayBounds[i - 1]! + 26 * 3_600_000, tz));
+    }
+    const forecastDays: string[] = [];
+    for (let i = 0; i < 7; i++) {
+      forecastDays.push(localWeekdayInitial(dayBounds[i]! + 12 * 3_600_000, tz));
+    }
+
+    // Active time & session boundary (session = activity since last >30m inactivity gap).
+    const SESSION_GAP_MS = 30 * 60_000;
+    const recentEvents = store.readSinceTs(dayStart - 6 * 3_600_000);
+    const marks: Mark[] = [];
+    for (const ev of recentEvents) {
+      for (const m of marksOf(ev)) addMark(marks, m);
+    }
+    const todayActiveMs = activeMs(marks, dayStart, now);
+    let sessionStart = now;
+    if (marks.length > 0 && now - marks[marks.length - 1]!.at <= SESSION_GAP_MS) {
+      let i = marks.length - 1;
+      while (i > 0 && marks[i]!.at - marks[i - 1]!.at <= SESSION_GAP_MS) {
+        i--;
+      }
+      sessionStart = marks[i]!.at;
+    }
+    const sessionActiveMs = sessionStart < now ? activeMs(marks, sessionStart, now) : 0;
+
+    // Daily probe counts & first-try / cleared counts from state.evidence.
+    let practiced = 0;
+    let firstTry = 0;
+    const latestTodayGradeByUnit = new Map<string, { ts: number; grade: Grade | null }>();
+    for (const ev of Object.values(state.evidence)) {
+      if (ev.source !== "probe" || ev.at < dayStart || ev.slot === "in_context") continue;
+      practiced++;
+      if (ev.grade && ev.grade !== "again" && (ev.hints ?? 0) === 0) firstTry++;
+      const prev = latestTodayGradeByUnit.get(ev.unit_id);
+      if (!prev || ev.at >= prev.ts) {
+        latestTodayGradeByUnit.set(ev.unit_id, { ts: ev.at, grade: ev.grade });
+      }
+    }
+    let clearedToday = 0;
+    for (const entry of latestTodayGradeByUnit.values()) {
+      if (entry.grade && entry.grade !== "again") clearedToday++;
+    }
+
+    const activeRun = currentRun(state.runs);
+    const runInfo = activeRun
+      ? {
+          run_id: activeRun.id,
+          duration_ms: activeRun.duration_ms,
+          elapsed_ms: Math.max(0, activeRun.duration_ms - runLeft(activeRun, now)),
+          paused: activeRun.paused_at !== null,
+        }
+      : null;
+
+    // Backlog, 7-day forecast, mastery breakdown, and top topics.
+    const { scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
+    const activeUnits = Object.values(state.units).filter((u) => u.status === "active" && !u.observe_only);
+
+    let dueTotal = 0;
+    let dueNew = 0;
+    let dueReview = 0;
+    let dueShaky = 0;
+    let nextDueInMs: number | null = null;
+    const forecast = [0, 0, 0, 0, 0, 0, 0];
+
+    let solid = 0;
+    let newTotal = 0;
+    const topicMap = new Map<string, { topic: string; units: number; due: number }>();
+
+    for (const u of activeUnits) {
+      const s = scores.get(u.id);
+      const reviews = s?.reviews ?? 0;
+      const pImm = s?.p_imm ?? 0;
+      const nextIn = s?.next_in_ms ?? null;
+      const schedKind = s?.schedule_kind;
+      const isDue = reviews === 0 || (nextIn !== null ? nextIn <= 0 : pImm < 0.85);
+
+      if (reviews === 0) newTotal++;
+      else if (reviews >= 2 && pImm >= 0.88) solid++;
+
+      if (isDue) {
+        dueTotal++;
+        forecast[0]!++;
+        if (reviews === 0) dueNew++;
+        else if (pImm < 0.78 || schedKind === "relearn" || schedKind === "lapse") dueShaky++;
+        else dueReview++;
+      } else if (nextIn !== null && nextIn > 0) {
+        if (nextDueInMs === null || nextIn < nextDueInMs) nextDueInMs = nextIn;
+        const dueAt = now + nextIn;
+        if (dueAt < dayBounds[7]!) {
+          for (let d = 0; d < 7; d++) {
+            if (dueAt < dayBounds[d + 1]!) {
+              forecast[d]!++;
+              break;
+            }
+          }
+        }
+      }
+
+      const rawTopic = (u.topic ?? "").trim();
+      if (rawTopic) {
+        const key = rawTopic.toLowerCase();
+        const cur = topicMap.get(key) ?? { topic: rawTopic, units: 0, due: 0 };
+        cur.units++;
+        if (isDue) cur.due++;
+        topicMap.set(key, cur);
+      }
+    }
+
+    const learning = Math.max(0, activeUnits.length - solid - newTotal);
+    const topics = [...topicMap.values()]
+      .sort((a, b) => b.due - a.due || b.units - a.units || a.topic.localeCompare(b.topic))
+      .slice(0, 5);
+
+    // Contextual focus: never expose unit.text (which is the answer).
+    let focus:
+      | {
+          kind: "unit";
+          unit_id: string;
+          topic: string | null;
+          depth: Depth;
+          p_imm: number | null;
+          reviews: number;
+          first_latency_ms: number | null;
+          last_latency_ms: number | null;
+          interval_ms: number | null;
+          next_in_ms: number | null;
+        }
+      | {
+          kind: "exploration";
+          exploration_id: string;
+          title: string;
+          turns: number;
+          saved_units: number;
+          unsaved_turns: number;
+          saving: boolean;
+        }
+      | null = null;
+
+    if (focusUnitId) {
+      const u = resolveUnit(state, focusUnitId);
+      if (u && u.status === "active") {
+        const s = scores.get(u.id);
+        const trend = latencyTrend(state, u);
+        focus = {
+          kind: "unit",
+          unit_id: u.id,
+          topic: u.topic,
+          depth: pickDrillDepth(u, state),
+          p_imm: s && s.reviews > 0 ? s.p_imm : null,
+          reviews: s?.reviews ?? 0,
+          first_latency_ms: trend.first_ms,
+          last_latency_ms: trend.prev_ms,
+          interval_ms: s?.scheduled_interval_ms ?? null,
+          next_in_ms: s?.next_in_ms ?? null,
+        };
+      }
+    } else if (focusExpId) {
+      const exp = store.getExploration(focusExpId);
+      if (exp) {
+        const decorated = decorateExplorationForClient(store, exp);
+        const turns = decorated.total_turns ?? decorated.turns.length;
+        const savedUnits = decorated.crystallized_units?.length ?? 0;
+        const unsavedTurns = Math.max(0, turns - (decorated.crystallized_turn_count ?? 0));
+        focus = {
+          kind: "exploration",
+          exploration_id: decorated.id,
+          title: decorated.title,
+          turns,
+          saved_units: savedUnits,
+          unsaved_turns: unsavedTurns,
+          saving: inFlightCrystallizations.has(scopeExpKey(user.id, decorated.id)),
+        };
+      }
+    }
+
+    return c.json({
+      as_of: now,
+      session: {
+        started_at: sessionStart,
+        active_ms: sessionActiveMs,
+        today_active_ms: todayActiveMs,
+        practiced,
+        first_try: firstTry,
+        run: runInfo,
+      },
+      backlog: {
+        due: { total: dueTotal, new: dueNew, review: dueReview, shaky: dueShaky },
+        cleared_today: clearedToday,
+        next_due_in_ms: dueTotal === 0 ? nextDueInMs : null,
+        forecast,
+        forecast_days: forecastDays,
+      },
+      mastery: {
+        total: activeUnits.length,
+        solid,
+        learning,
+        new: newTotal,
+        topics,
+      },
+      focus,
+    });
+  });
 
   app.get("/api/drill/queue", (c) => {
     const { user } = c.get("session");

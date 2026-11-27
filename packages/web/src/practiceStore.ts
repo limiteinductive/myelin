@@ -509,6 +509,7 @@ export interface PracticeStore {
   practiceUnitAgain(unitId: string): void;
   advanceFromUnit(fromUnitId: string | null): void;
   startNextSitting(limit?: number): void;
+  startTopicSitting(topic: string, limit?: number): void;
   undoAddedUnit(unitId: string): Promise<void>;
 
   updateUnitSession(key: string, fn: (draft: UnitSession) => void): void;
@@ -1401,6 +1402,43 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     markDirty();
   };
 
+  const startTopicSitting = (topic: string, limit = SITTING_LIMIT) => {
+    const cleanTopic = topic.trim().toLowerCase();
+    if (!cleanTopic) return;
+    settleActiveExploration();
+    const cap = Math.max(1, Math.min(SITTING_LIMIT, Math.round(limit)));
+    const snap = snapshot(state);
+    const matchesTopic = (u: QueueUnit) => (u.topic ?? "").trim().toLowerCase() === cleanTopic;
+    const dueTopic = snap.queue.filter((u) => matchesTopic(u) && u.due).slice(0, cap);
+    if (dueTopic.length > 0) {
+      const batch = dueTopic.map((u) => u.unit_id);
+      setState((s) => {
+        s.justCompletedId = null;
+        s.manualPracticeUnitId = null;
+        s.sittingId = uuidv7();
+        s.sittingCompletedIds = {};
+        s.sittingRetriedIds = {};
+        s.sittingRetryIds = {};
+        s.sittingRetryMinCompletions = {};
+        s.sittingDirectCompletions = 0;
+        s.sittingOutcomes = {};
+        s.sittingPracticedIds = {};
+        s.sittingRescheduledIds = {};
+        s.sittingReconstructed = [];
+        s.sittingIds = batch;
+        s.sittingOrder = [...batch];
+        s.mapOpen = false;
+        s.stage = { kind: "unit", unitId: batch[0]! };
+      });
+      markDirty();
+      return;
+    }
+    const anyTopic = snap.queue.find(matchesTopic);
+    if (anyTopic) {
+      practiceUnitAgain(anyTopic.unit_id);
+    }
+  };
+
   const undoAddedUnit = async (unitId: string) => {
     if (state.removedUnits[unitId]) return;
     setState((s) => {
@@ -1929,6 +1967,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     practiceUnitAgain,
     advanceFromUnit,
     startNextSitting,
+    startTopicSitting,
     undoAddedUnit,
     updateUnitSession,
     updateExplore,
