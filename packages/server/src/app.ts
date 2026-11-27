@@ -954,18 +954,18 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       scores,
     );
     const includeParam = (c.req.query("include") ?? "").trim();
-    const includeIds = includeParam
-      ? new Set(
-          includeParam
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean)
-            .slice(0, 32),
-        )
-      : null;
+    const includeList = includeParam
+      ? includeParam
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 32)
+      : [];
+    const includeIds = includeList.length > 0 ? new Set(includeList) : null;
 
     let totalDue = 0;
     let earliestFutureMs: number | null = null;
+    const dueIds = new Set<string>();
     for (const u of candidates) {
       const s = scores.get(u.id);
       const reviews = s?.reviews ?? 0;
@@ -973,6 +973,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const isDue = reviews === 0 || (nextIn !== null ? nextIn <= 0 : (s?.p_imm ?? 0) < 0.85);
       if (isDue) {
         totalDue++;
+        dueIds.add(u.id);
       } else if (nextIn !== null && nextIn > 0 && (earliestFutureMs === null || nextIn < earliestFutureMs)) {
         earliestFutureMs = nextIn;
       }
@@ -989,6 +990,24 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       }
     }
 
+    const buildWarmItem = (u: Unit) => {
+      const depth = pickDrillDepth(u, state);
+      const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
+      const stats = unitExposureStats(state, u.id, depth, now);
+      const bundled = pickSynthesisCluster(u, state, dueIds, 2);
+      const modality = pickRepModality(u, state, depth, bundled);
+      return {
+        unit: u,
+        restsOn,
+        depth,
+        variant: stats.depthExposures,
+        priorPrompts: stats.priorPrompts,
+        delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
+        modality,
+        bundledUnits: bundled.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
+      };
+    };
+
     const items = page.map((u) => {
       const s = scores.get(u.id);
       const pImm = s?.p_imm ?? 0;
@@ -997,41 +1016,47 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const depth = pickDrillDepth(u, state);
       const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
       const stats = unitExposureStats(state, u.id, depth, now);
+      const bundled = dueIds.has(u.id) ? pickSynthesisCluster(u, state, dueIds, 2) : [];
+      const modality = pickRepModality(u, state, depth, bundled);
+      const bundledIds = bundled.map((x) => x.id);
       return {
         unit_id: u.id,
         text: u.text,
-        prompt: judge.peekPrompt(u, depth, restsOn, stats.depthExposures),
+        prompt:
+          judge.peekPrompt(u, depth, restsOn, stats.depthExposures, modality, bundledIds) ??
+          judge.peekPrompt(u, depth, restsOn, stats.depthExposures),
         kind: u.kind,
         topic: u.topic,
         depth,
         p_imm: pImm,
         reviews,
         next_in_ms: nextIn,
-        due: reviews === 0 || (nextIn !== null ? nextIn <= 0 : pImm < 0.85),
+        due: dueIds.has(u.id),
       };
     });
-    // Warm prompts for the top due items in the background so switching items is instant.
-    const toWarm = candidates.filter((u) => {
-      const s = scores.get(u.id);
-      const reviews = s?.reviews ?? 0;
-      const nextIn = s?.next_in_ms ?? null;
-      return reviews === 0 || (nextIn !== null ? nextIn <= 0 : (s?.p_imm ?? 0) < 0.85);
-    });
-    judge.warmPrompts(
-      (toWarm.length > 0 ? toWarm : candidates).slice(0, 12).map((u) => {
-        const depth = pickDrillDepth(u, state);
-        const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
-        const stats = unitExposureStats(state, u.id, depth, now);
-        return {
-          unit: u,
-          restsOn,
-          depth,
-          variant: stats.depthExposures,
-          priorPrompts: stats.priorPrompts,
-          delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
-        };
-      }),
-    );
+    // Warm the locked sitting cards FIRST in exact sitting order, then remaining due cards,
+    // using the exact modality + synthesis bundle cache key that /api/drill/next will request.
+    const candById = new Map(candidates.map((u) => [u.id, u]));
+    const warmOrdered: Unit[] = [];
+    const warmSeen = new Set<string>();
+    for (const id of includeList) {
+      const u = candById.get(id);
+      if (u && dueIds.has(u.id) && !warmSeen.has(u.id)) {
+        warmOrdered.push(u);
+        warmSeen.add(u.id);
+      }
+    }
+    for (const u of candidates) {
+      if (warmOrdered.length >= 12) break;
+      if (dueIds.has(u.id) && !warmSeen.has(u.id)) {
+        warmOrdered.push(u);
+        warmSeen.add(u.id);
+      }
+    }
+    if (warmOrdered.length === 0) {
+      for (const u of candidates.slice(0, 6)) warmOrdered.push(u);
+    }
+    judge.warmPrompts(warmOrdered.slice(0, 12).map(buildWarmItem));
     return c.json({
       scheduler,
       total_units: candidates.length,
@@ -1824,12 +1849,37 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     perfLog?.record(nextRec);
     c.header("Server-Timing", formatServerTiming(nextRec));
 
-    // Eagerly prefetch the next 4 upcoming cards while the learner works on this one.
-    const upcoming = rankDrillCandidates(
-      candidates.filter((u) => u.id !== picked.id && !bundledIds.includes(u.id)),
-      state,
-      scores,
-    ).slice(0, 4);
+    // Eagerly prefetch the learner's exact next sitting cards first, then fallback ranked cards.
+    const nextIdsParam = (c.req.query("next_ids") ?? "").trim();
+    const requestedNextIds = nextIdsParam
+      ? nextIdsParam
+          .split(",")
+          .map((s) => s.trim())
+          .filter((id) => id && id !== picked.id && !bundledIds.includes(id))
+          .slice(0, 6)
+      : [];
+    const candById = new Map(candidates.map((u) => [u.id, u]));
+    const upcoming: Unit[] = [];
+    const upcomingSeen = new Set<string>([picked.id, ...bundledIds]);
+    for (const id of requestedNextIds) {
+      const u = candById.get(id);
+      if (u && !upcomingSeen.has(u.id)) {
+        upcoming.push(u);
+        upcomingSeen.add(u.id);
+      }
+    }
+    if (upcoming.length < 4) {
+      const rankedFallback = rankDrillCandidates(
+        candidates.filter((u) => !upcomingSeen.has(u.id)),
+        state,
+        scores,
+      );
+      for (const u of rankedFallback) {
+        if (upcoming.length >= 4) break;
+        upcoming.push(u);
+        upcomingSeen.add(u.id);
+      }
+    }
     if (upcoming.length > 0) {
       judge.warmPrompts(
         upcoming.map((u) => {
@@ -2218,21 +2268,34 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           const nowNotDue = afterScore ? (afterScore.next_in_ms ?? 0) > 0 : false;
           if (wasDue && nowNotDue && !creditedUnitIds.includes(pid)) creditedUnitIds.push(pid);
         }
-        // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
+        // Pre-warm top upcoming due cards FIRST (exact modality + bundle key), then this unit's next variant.
         const postState = store.state;
         const refreshedU = postState.units[u.id] ?? u;
         nextDepth = pickDrillDepth(refreshedU, postState);
+        const postActive = Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only);
+        const postDueIds = new Set(
+          postActive
+            .filter((x) => {
+              const sc = after.scores.get(x.id);
+              const rev = sc?.reviews ?? 0;
+              const ni = sc?.next_in_ms ?? null;
+              return rev === 0 || (ni !== null ? ni <= 0 : (sc?.p_imm ?? 0) < 0.85);
+            })
+            .map((x) => x.id),
+        );
         const postCandidates = rankDrillCandidates(
-          Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only && x.id !== u.id),
+          postActive.filter((x) => x.id !== u.id),
           postState,
           after.scores,
-        ).slice(0, 3);
-        const warmTargets = [refreshedU, ...postCandidates];
+        ).slice(0, 4);
+        const warmTargets = [...postCandidates, refreshedU];
         judge.warmPrompts(
           warmTargets.map((item) => {
             const d = pickDrillDepth(item, postState);
             const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
             const st = unitExposureStats(postState, item.id, d, now + 2);
+            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 2) : [];
+            const m = pickRepModality(item, postState, d, b);
             return {
               unit: item,
               restsOn: ro,
@@ -2240,6 +2303,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               variant: st.depthExposures,
               priorPrompts: st.priorPrompts,
               delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
+              modality: m,
+              bundledUnits: b.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
             };
           }),
         );
@@ -2587,21 +2652,34 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           const nowNotDue = afterScore ? (afterScore.next_in_ms ?? 0) > 0 : false;
           if (wasDue && nowNotDue && !creditedUnitIds.includes(pid)) creditedUnitIds.push(pid);
         }
-        // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
+        // Pre-warm top upcoming due cards FIRST (exact modality + bundle key), then this unit's next variant.
         const postState = store.state;
         const refreshedU = postState.units[u.id] ?? u;
         nextDepth = pickDrillDepth(refreshedU, postState);
+        const postActive = Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only);
+        const postDueIds = new Set(
+          postActive
+            .filter((x) => {
+              const sc = after.scores.get(x.id);
+              const rev = sc?.reviews ?? 0;
+              const ni = sc?.next_in_ms ?? null;
+              return rev === 0 || (ni !== null ? ni <= 0 : (sc?.p_imm ?? 0) < 0.85);
+            })
+            .map((x) => x.id),
+        );
         const postCandidates = rankDrillCandidates(
-          Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only && x.id !== u.id),
+          postActive.filter((x) => x.id !== u.id),
           postState,
           after.scores,
-        ).slice(0, 3);
-        const warmTargets = [refreshedU, ...postCandidates];
+        ).slice(0, 4);
+        const warmTargets = [...postCandidates, refreshedU];
         judge.warmPrompts(
           warmTargets.map((item) => {
             const d = pickDrillDepth(item, postState);
             const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
             const st = unitExposureStats(postState, item.id, d, now + 2);
+            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 2) : [];
+            const m = pickRepModality(item, postState, d, b);
             return {
               unit: item,
               restsOn: ro,
@@ -2609,6 +2687,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               variant: st.depthExposures,
               priorPrompts: st.priorPrompts,
               delayedTransfer: st.passes >= 1 && st.daysSinceLastExposure >= 5,
+              modality: m,
+              bundledUnits: b.map((x) => ({ id: x.id, text: x.text, kind: x.kind })),
             };
           }),
         );

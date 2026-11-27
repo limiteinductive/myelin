@@ -47,7 +47,7 @@ for await (const line of rl) {
     const blocks = msg.params?.prompt ?? [];
     const text = blocks.find((b) => b.type === "text")?.text ?? "";
     const hasImage = blocks.some((b) => b.type === "image");
-    const delayMs = text.includes("SLOW_TURN") && s.modelId !== "gemini-4-hydrogen-medium" ? 400 : 10;
+    const delayMs = text.includes("SLOW_TURN") && s.modelId !== "gemini-4-hydrogen-low" ? 400 : 10;
     const timer = setTimeout(() => {
       activeTimers.delete(sid);
       const reply = JSON.stringify({
@@ -270,8 +270,8 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
       expect(fetchCalls).toHaveLength(0);
       expect(tidied.text).toBeTruthy();
 
-      // Foreground promptFor cache miss uses fast gemini-4-hydrogen-medium and does not stall
-      // behind a slow background gemini-4-neon-high prefetch for the same unit!
+      // Foreground promptFor cache miss uses fast gemini-4-hydrogen-low and does not stall
+      // behind a background gemini-4-hydrogen-medium prefetch for the same unit!
       const slowBg = judge.promptFor(
         { id: "u-slow", text: "SLOW_TURN unit text", kind: "result" },
         [],
@@ -296,11 +296,12 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
         {},
         false,
       );
-      expect(fgPrompt).toContain("model=gemini-4-hydrogen-medium");
+      expect(fgPrompt).toContain("model=gemini-4-hydrogen-low");
       expect(Date.now() - tFg).toBeLessThan(250);
-      expect(racedPrompt).toContain("model=gemini-4-hydrogen-medium");
+      expect(racedPrompt).toContain("model=gemini-4-hydrogen-low");
       expect(Date.now() - tRace).toBeLessThan(250);
-      await slowBg;
+      const bgPrompt = await slowBg;
+      expect(bgPrompt).toContain("model=gemini-4-hydrogen-medium");
     } finally {
       judge.close();
       rmSync(dir, { recursive: true, force: true });

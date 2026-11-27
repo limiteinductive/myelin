@@ -2875,7 +2875,7 @@ Return ONLY valid JSON:
       return !this.promptCache.has(key) && !this.inflightPrompts.has(key);
     });
     if (queue.length === 0) return;
-    const concurrency = this.acpClient && !this.acpClient.isUnsupported ? Math.min(2, queue.length) : 1;
+    const concurrency = this.acpClient && !this.acpClient.isUnsupported ? Math.min(3, queue.length) : 1;
     let cursor = 0;
     const runWorker = async () => {
       while (cursor < queue.length) {
@@ -2988,11 +2988,29 @@ Rules:
       .filter(Boolean)
       .join("\n");
 
-    const useFastFg = !background && this.isAgy;
-    const modelForCall = useFastFg ? this.sidecarModel : this.promptModel;
-    const slugForCall = useFastFg ? this.sidecarSlug : this.promptSlug;
-    const fallbackWorkerForCall = useFastFg ? (this.sidecarWorker ?? this.promptWorker) : this.promptWorker;
-    const timeoutMs = background ? 65_000 : 20_000;
+    const explicitPromptEnv = Boolean(process.env.MYELIN_PROMPT_MODEL?.trim());
+    const modelForCall = this.isAgy
+      ? background
+        ? explicitPromptEnv
+          ? this.promptModel
+          : this.sidecarModel
+        : this.drillModel
+      : this.promptModel;
+    const slugForCall = this.isAgy
+      ? background
+        ? explicitPromptEnv
+          ? this.promptSlug
+          : this.sidecarSlug
+        : this.drillSlug
+      : this.promptSlug;
+    const fallbackWorkerForCall = this.isAgy
+      ? background
+        ? explicitPromptEnv
+          ? this.promptWorker
+          : (this.sidecarWorker ?? this.promptWorker)
+        : (this.drillWorker ?? this.sidecarWorker ?? this.promptWorker)
+      : this.promptWorker;
+    const timeoutMs = background ? 45_000 : 18_000;
 
     if (!background) this.activeForegroundPrompts++;
     const t0 = Date.now();

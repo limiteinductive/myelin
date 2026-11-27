@@ -418,6 +418,7 @@ export function fetchNextDrill(
     directDone?: number | null;
     manual?: boolean;
     retry?: boolean;
+    nextIds?: readonly string[];
   } = {},
   signal?: AbortSignal,
 ): Promise<NextDrillResponse> {
@@ -429,6 +430,8 @@ export function fetchNextDrill(
   if (typeof opts.directDone === "number" && opts.directDone >= 0) qs.set("direct_done", String(opts.directDone));
   if (opts.manual) qs.set("manual", "1");
   if (opts.retry) qs.set("retry", "1");
+  const nextClean = opts.nextIds?.filter(Boolean).slice(0, 6) ?? [];
+  if (nextClean.length > 0) qs.set("next_ids", nextClean.join(","));
   const q = qs.toString();
   return req<NextDrillResponse>(`/api/drill/next${q ? `?${q}` : ""}`, signal ? { signal } : undefined);
 }

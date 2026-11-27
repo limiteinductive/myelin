@@ -682,6 +682,11 @@ export function DrillView() {
     loadAbort = ctrl;
     setLoading(true);
     try {
+      const upcomingIds = practice
+        .dueQueue()
+        .filter((u) => u.unit_id !== unitId)
+        .slice(0, 4)
+        .map((u) => u.unit_id);
       const res = await fetchNextDrill(
         {
           unitId,
@@ -690,6 +695,7 @@ export function DrillView() {
           directDone: practice.sittingDirectDoneCount(),
           manual: practice.isManualPractice(unitId),
           retry: practice.isRetryUnit(unitId),
+          nextIds: upcomingIds,
         },
         ctrl.signal,
       );
