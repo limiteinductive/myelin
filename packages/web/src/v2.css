@@ -1930,7 +1930,7 @@ body,
   display: flex;
   align-items: center;
   gap: 10px;
-  padding-top: 2px;
+  padding: 2px 0 10px;
   margin-top: -2px;
   border-top: 0;
   animation: v2-in 120ms ease;
@@ -1942,12 +1942,65 @@ body,
   white-space: nowrap;
   flex: none;
 }
-.v2-bump-range {
-  -webkit-appearance: none;
-  appearance: none;
+.v2-bump-track-wrap {
+  position: relative;
   flex: 1;
   min-width: 110px;
   max-width: 240px;
+  height: 18px;
+  display: flex;
+  align-items: center;
+}
+.v2-bump-rec-tick {
+  position: absolute;
+  top: 50%;
+  width: 1.5px;
+  height: 8px;
+  border-radius: 1px;
+  background: var(--v2-ink-2);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  opacity: 0.72;
+  transition: opacity 140ms ease;
+}
+.v2-bump-rec-tick.is-active {
+  opacity: 0.35;
+}
+.v2-bump-rec-label {
+  position: absolute;
+  top: calc(100% - 1px);
+  transform: translateX(-50%);
+  appearance: none;
+  border: 0;
+  padding: 1px 3px;
+  margin: 0;
+  border-radius: 4px;
+  background: transparent;
+  font: 400 10px/1 var(--v2-font-sans);
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-3);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 120ms ease;
+}
+.v2-bump-rec-label.is-start {
+  transform: translateX(-5.5px);
+}
+.v2-bump-rec-label.is-end {
+  transform: translateX(calc(-100% + 5.5px));
+}
+.v2-bump-rec-label:hover:not(:disabled) {
+  color: var(--v2-ink-1);
+}
+.v2-bump-rec-label:disabled {
+  cursor: default;
+}
+.v2-bump-range {
+  position: relative;
+  z-index: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
   height: 18px;
   background: transparent;
   cursor: pointer;

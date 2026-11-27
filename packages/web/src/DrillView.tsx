@@ -2667,28 +2667,64 @@ export function DrillView() {
                                 (passedVerdict()?.next_in_ms && passedVerdict()!.next_in_ms! > 0
                                   ? passedVerdict()!.next_in_ms!
                                   : 20 * 60_000);
+                              const recommendedMs = () => {
+                                const v = passedVerdict();
+                                if (typeof v?.scheduled_interval_ms === "number" && v.scheduled_interval_ms > 0) {
+                                  return v.scheduled_interval_ms;
+                                }
+                                if (typeof v?.next_in_ms === "number" && v.next_in_ms > 0) {
+                                  return v.next_in_ms;
+                                }
+                                return 20 * 60_000;
+                              };
+                              const recIdx = () => nearestStopIdx(recommendedMs());
+                              const recFrac = () => recIdx() / (RELEARN_STOPS_MS.length - 1);
+                              const curIdx = () => nearestStopIdx(effectiveMs());
+                              const atRecommended = () => curIdx() === recIdx();
                               return (
                                 <div class="v2-bump-row" role="group" aria-label="Adjust next review time">
                                   <span class="v2-bump-label">Bring back</span>
-                                  <input
-                                    type="range"
-                                    class="v2-bump-range"
-                                    min={0}
-                                    max={RELEARN_STOPS_MS.length - 1}
-                                    step={1}
-                                    value={nearestStopIdx(effectiveMs())}
-                                    disabled={overriding()}
-                                    aria-label="Bring back interval"
-                                    aria-valuetext={fmtDur(effectiveMs())}
-                                    onInput={(e) => {
-                                      const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
-                                      if (ms !== undefined) setPreviewDelayMs(ms);
-                                    }}
-                                    onChange={(e) => {
-                                      const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
-                                      if (ms !== undefined) void commitDelayOverride(ms);
-                                    }}
-                                  />
+                                  <div class="v2-bump-track-wrap">
+                                    <span
+                                      class={{ "v2-bump-rec-tick": true, "is-active": atRecommended() }}
+                                      style={{ left: `calc(5.5px + (100% - 11px) * ${recFrac()})` }}
+                                      aria-hidden="true"
+                                    />
+                                    <input
+                                      type="range"
+                                      class="v2-bump-range"
+                                      min={0}
+                                      max={RELEARN_STOPS_MS.length - 1}
+                                      step={1}
+                                      value={curIdx()}
+                                      disabled={overriding()}
+                                      aria-label="Bring back interval"
+                                      aria-valuetext={fmtDur(effectiveMs())}
+                                      onInput={(e) => {
+                                        const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
+                                        if (ms !== undefined) setPreviewDelayMs(ms);
+                                      }}
+                                      onChange={(e) => {
+                                        const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
+                                        if (ms !== undefined) void commitDelayOverride(ms);
+                                      }}
+                                    />
+                                    <button
+                                      type="button"
+                                      class={{
+                                        "v2-bump-rec-label": true,
+                                        "is-start": recIdx() === 0,
+                                        "is-end": recIdx() === RELEARN_STOPS_MS.length - 1,
+                                        "is-active": atRecommended(),
+                                      }}
+                                      style={{ left: `calc(5.5px + (100% - 11px) * ${recFrac()})` }}
+                                      disabled={overriding() || atRecommended()}
+                                      data-tip={`Recommended (~${fmtDur(recommendedMs())})`}
+                                      onClick={() => void commitDelayOverride(recommendedMs())}
+                                    >
+                                      {fmtDur(recommendedMs())}
+                                    </button>
+                                  </div>
                                   <span class="v2-bump-val">{fmtDur(effectiveMs())}</span>
                                 </div>
                               );
