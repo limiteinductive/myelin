@@ -1064,6 +1064,104 @@ body,
   gap: 6px;
 }
 
+/* Interactive inline fill-in-the-blank composer (renders KaTeX/code directly with tappable wrapping holes). */
+.v2-blank-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.v2-blank-pad {
+  padding: 16px 18px 12px;
+  gap: 14px;
+}
+.v2-blank-lines {
+  display: flex;
+  flex-direction: column;
+  color: var(--v2-ink-2);
+}
+.v2-blank-lines.is-prose {
+  gap: 12px;
+  font: var(--v2-type-body);
+  line-height: 1.82;
+}
+.v2-blank-lines.is-code {
+  gap: 4px;
+  font: var(--v2-type-code-block);
+  line-height: 1.85;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+.v2-blank-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.v2-blank-marker {
+  flex: none;
+  color: var(--v2-ink-3);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.v2-blank-content {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+.v2-blank {
+  display: inline;
+  padding: 1px 7px 2px;
+  margin: 0 2px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--v2-fg) 6%, transparent);
+  border-bottom: 1.5px solid color-mix(in srgb, var(--v2-fg) 30%, transparent);
+  color: var(--v2-ink-1);
+  caret-color: var(--v2-ink-1);
+  font-weight: 500;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+  cursor: text;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+.v2-blank.is-empty {
+  display: inline-block;
+  min-width: 58px;
+  min-height: 1.35em;
+  vertical-align: baseline;
+  background: var(--v2-quiet-fill);
+  border-bottom-color: var(--v2-border-strong);
+}
+.v2-blank.is-code {
+  font: var(--v2-type-code-block);
+  font-weight: 500;
+}
+.v2-blank:hover {
+  background: color-mix(in srgb, var(--v2-fg) 8%, transparent);
+}
+.v2-blank:focus {
+  outline: none;
+  background: color-mix(in srgb, var(--v2-fg) 10%, transparent);
+  border-bottom-color: var(--v2-ink-1);
+}
+.v2-blank-count {
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-3);
+  user-select: none;
+}
+.v2-blank-note-form {
+  padding: 4px 4px 6px;
+}
+@media (pointer: coarse) {
+  .v2-blank.is-empty {
+    min-width: 68px;
+    padding: 2px 8px 3px;
+  }
+}
+
 .v2-pad {
   border-radius: 16px;
   background: var(--v2-raised);

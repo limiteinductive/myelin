@@ -2834,14 +2834,14 @@ Return ONLY valid JSON:
       direct: `Modality: DIRECT. Set "starter" to null.`,
       contrast: `Modality: SHARP CONTRAST (1-line high-signal boundary check). Ask ONE crisp contrast or edge-case question answerable in 1-2 sentences (e.g. "What breaks if X is swapped for Y?"). Set "starter" to null.`,
       faded_skeleton: `Modality: FADED WORKED SKELETON (skip boilerplate, test the exact pivot in ~30s).
-- "prompt": 1 crisp sentence naming the goal and telling the learner to fill in the missing pivot step(s).
-- "starter": ONLY for code tasks (Python/PyTorch/SQL/etc.): a clean 3-6 line plain-ASCII code snippet where routine setup is filled in and ONLY 1-2 core pivot expressions are \`___\` (NO markdown fences, NO raw LaTeX/TeX like \`$...$\` or \`\\frac\`, NO numbered prose worksheets). If the unit is conceptual or mathematical rather than code, set "starter" to null and ask the question directly in "prompt".`,
+- "prompt": 1 crisp sentence naming the goal and telling the learner to fill in the missing pivot(s) below.
+- "starter": A clean 2-5 line code snippet or concise numbered derivation with ONLY 1-3 short pivot holes marked \`___\` (outside \`$...$\` math spans; no markdown fences). Keep each hole answerable in a few words or a short expression.`,
       fix_bug: `Modality: FIX THE BUG (spot & repair ONE planted flaw in ~25s).
 - "prompt": 1 crisp sentence saying the snippet/claim has one subtle bug and asking them to fix it.
 - "starter": ONLY for code tasks: a realistic 3-6 line plain-ASCII code snippet containing ONE subtle bug right at this unit's core pivot (no hint comments, no markdown fences, NO raw LaTeX/TeX). For non-code conceptual/math units, put the flawed claim directly in "prompt" and set "starter" to null.`,
       synthesis: `Modality: MULTI-UNIT SYNTHESIS (clear the primary unit AND the bundled companion unit(s) in ONE compact ~45s task).
 - "prompt": 1-2 crisp sentences posing ONE unified concrete scenario/task that naturally exercises the primary unit AND every bundled unit together without stacking two unrelated sub-questions.
-- "starter": Optionally a compact 3-5 line plain-ASCII code skeleton with \`___\` blanks ONLY for code tasks (NEVER raw LaTeX/TeX or numbered prose blanks); otherwise null.`,
+- "starter": Optionally a compact 2-4 line worked skeleton with 1-3 concise \`___\` holes (placed outside \`$...$\` math spans; no markdown fences) if it cuts boilerplate typing, otherwise null.`,
     };
 
     const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words), its exact single-claim grading rubric ("expected_crux", max 32 words), and an optional pre-filled editor "starter" matching the requested Modality.

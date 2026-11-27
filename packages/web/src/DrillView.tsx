@@ -11,6 +11,7 @@ import {
   locateAnnotation,
   type InlineAnnotation,
 } from "./annotate.js";
+import { assembleFilledStarter, countStarterBlanks, parseStarterBlanks } from "./blanks.js";
 import { citationLabel, extractSelectionText, formatCitedMessage, type Citation } from "./cite.js";
 import {
   askDrillFollowUp,
@@ -90,10 +91,10 @@ function isRenderedStarter(starter: string | null | undefined): boolean {
   return false;
 }
 
-/** On touch devices or for prose/TeX starters, show the starter read-only above the composer instead of pre-filling raw text. */
+/** On touch devices, for prose/TeX starters, or for fillable `___` skeletons, never pre-fill raw text into the textarea. */
 function shouldPinStarterAbovePad(starter: string | null | undefined): boolean {
   if (!starter) return false;
-  return isRenderedStarter(starter) || isTouchDevice();
+  return countStarterBlanks(starter) > 0 || isRenderedStarter(starter) || isTouchDevice();
 }
 
 function beatUserPayload(b: Beat): string {
@@ -354,6 +355,8 @@ export function DrillView() {
   const [previewDelayMs, setPreviewDelayMs] = createSignal<number | null>(null);
   const [editingBeatIdx, setEditingBeatIdx] = createSignal<number | null>(null);
   const [editDraft, setEditDraft] = createSignal("");
+  const [blankValues, setBlankValues] = createSignal<string[]>([]);
+  const [blankNote, setBlankNote] = createSignal("");
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
 
@@ -468,6 +471,8 @@ export function DrillView() {
   let textarea!: HTMLTextAreaElement;
   let editTextarea!: HTMLTextAreaElement;
   let postInputEl!: HTMLInputElement;
+  let blankNoteEl: HTMLInputElement | undefined;
+  let blankEls: (HTMLSpanElement | undefined)[] = [];
   let citeTextarea!: HTMLTextAreaElement;
   let padEl!: HTMLDivElement;
   let canvas: HTMLCanvasElement | undefined;
@@ -584,6 +589,9 @@ export function DrillView() {
     setPostBusy(false);
     setEditingBeatIdx(null);
     setEditDraft("");
+    setBlankValues([]);
+    setBlankNote("");
+    blankEls = [];
     setCitePill(null);
     setCiteEditor(null);
     setCiteComment("");
@@ -972,6 +980,39 @@ export function DrillView() {
     if (busy()) return false;
     if (!isNonUnit() && passedVerdict()?.ok) return false;
     return draft().trim().length > 0 || citations().length > 0 || (sketchOpen() && hasInk());
+  };
+
+  const activeBlanks = createMemo(() => {
+    if (isNonUnit() || passedVerdict()?.ok || beats().length > 0 || editingBeatIdx() !== null) return null;
+    const starter = rep()?.starter;
+    if (!starter || countStarterBlanks(starter) === 0) return null;
+    return {
+      starter,
+      parsed: parseStarterBlanks(starter),
+      isProse: isRenderedStarter(starter),
+    };
+  });
+
+  const setBlankValue = (index: number, value: string) => {
+    setBlankValues((prev) => {
+      const next = prev.slice();
+      next[index] = value;
+      return next;
+    });
+  };
+
+  const filledBlankCount = () => blankValues().filter((v) => v && v.trim().length > 0).length;
+
+  const canSubmitBlanks = () => {
+    if (busy() || !activeBlanks()) return false;
+    return filledBlankCount() > 0 || blankNote().trim().length > 0 || citations().length > 0;
+  };
+
+  const submitFillableBlanks = async () => {
+    const b = activeBlanks();
+    if (!b || !canSubmitBlanks()) return;
+    const text = assembleFilledStarter(b.starter, blankValues(), blankNote());
+    await submitBeat(text);
   };
 
   const triggerComplete = (
@@ -2268,6 +2309,7 @@ export function DrillView() {
                 const rendered = () => isRenderedStarter(r().starter);
                 const showStarterRef = () =>
                   Boolean(r().starter) &&
+                  !activeBlanks() &&
                   (pinnedAbove() ||
                     (beats().length > 0 && !beats().some((b) => anchor() && b.user.includes(anchor()))));
                 return (
@@ -2791,187 +2833,379 @@ export function DrillView() {
 
         {/* The ONE active pad at the bottom (hidden once rep passes or while editing a derivation in place) */}
         <Show when={!passedVerdict()?.ok && editingBeatIdx() === null}>
-          <div
-            ref={padEl}
-            class={{
-              "v2-pad": true,
-              "v2-textured": true,
-              "is-compact": beats().length > 0,
-              "is-explore": isExploreMode() || Boolean(activeFrontier()),
-              "is-checking": busy(),
-            }}
-          >
-            <ComposerCitationChips />
-            <div class={{ "v2-pad-body": true, "with-sketch": sketchOpen() }}>
-              <textarea
-                ref={textarea}
-                class="v2-pad-input"
-                placeholder={
-                  activeExploreQuestion()
-                    ? "Answer or ask a follow-up…"
-                    : beats().length > 0
-                      ? "Continue, or ask…"
-                      : isExploreMode()
-                        ? "Drop a question, derivation, paper, file path, or topic to work through…"
-                        : activeFrontier()
-                          ? "Cite a line above, ask a question, or explain it back…"
-                          : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
-                            ? "Write your answer for the points above…"
-                            : "Write your attempt or ask anything…"
-                }
-                spellcheck="false"
-                autocorrect="off"
-                autocapitalize="off"
-                value={draft()}
-                onInput={(e) => {
-                  recordActivity();
-                  setDraftFor(sessionKey(), e.currentTarget.value);
-                  autoGrow();
+          <Show
+            when={activeBlanks()}
+            fallback={
+              <div
+                ref={padEl}
+                class={{
+                  "v2-pad": true,
+                  "v2-textured": true,
+                  "is-compact": beats().length > 0,
+                  "is-explore": isExploreMode() || Boolean(activeFrontier()),
+                  "is-checking": busy(),
                 }}
-                onKeyDown={(e) => {
-                  if (
-                    handlePadIndentKey(e, (next) => {
+              >
+                <ComposerCitationChips />
+                <div class={{ "v2-pad-body": true, "with-sketch": sketchOpen() }}>
+                  <textarea
+                    ref={textarea}
+                    class="v2-pad-input"
+                    placeholder={
+                      activeExploreQuestion()
+                        ? "Answer or ask a follow-up…"
+                        : beats().length > 0
+                          ? "Continue, or ask…"
+                          : isExploreMode()
+                            ? "Drop a question, derivation, paper, file path, or topic to work through…"
+                            : activeFrontier()
+                              ? "Cite a line above, ask a question, or explain it back…"
+                              : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
+                                ? "Write your answer for the points above…"
+                                : "Write your attempt or ask anything…"
+                    }
+                    spellcheck="false"
+                    autocorrect="off"
+                    autocapitalize="off"
+                    value={draft()}
+                    onInput={(e) => {
                       recordActivity();
-                      setDraftFor(sessionKey(), next);
+                      setDraftFor(sessionKey(), e.currentTarget.value);
                       autoGrow();
-                    })
-                  ) {
-                    return;
-                  }
-                  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
-                    e.preventDefault();
-                    void tidyPadText("main");
-                    return;
-                  }
-                  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                    e.preventDefault();
-                    void submitBeat();
-                  }
-                }}
-              />
-
-              <div class={{ "v2-sketch-pane": true, "has-ink": hasInk() }}>
-                <canvas
-                  ref={(el) => bindCanvas(el)}
-                  class="v2-sketch-canvas"
-                  onPointerDown={(e) => {
-                    if (!canvas) return;
-                    e.preventDefault();
-                    recordActivity();
-                    canvas.setPointerCapture(e.pointerId);
-                    drawing = true;
-                    const p = posOf(e);
-                    curStroke = [p];
-                    strokes.push(curStroke);
-                    const ctx = canvas.getContext("2d");
-                    if (ctx) {
-                      ctx.strokeStyle = getComputedStyle(canvas).color || "#e5e5e5";
-                      ctx.lineCap = "round";
-                      ctx.lineJoin = "round";
-                      ctx.lineWidth = 2;
-                      ctx.beginPath();
-                      ctx.moveTo(p.x, p.y);
-                    }
-                  }}
-                  onPointerMove={(e) => {
-                    if (!drawing || !curStroke || !canvas) return;
-                    recordActivity();
-                    const p = posOf(e);
-                    curStroke.push(p);
-                    const ctx = canvas.getContext("2d");
-                    if (ctx) {
-                      ctx.lineTo(p.x, p.y);
-                      ctx.stroke();
-                    }
-                    if (!hasInk()) setHasInk(true);
-                  }}
-                  onPointerUp={() => {
-                    drawing = false;
-                    curStroke = null;
-                  }}
-                  onPointerCancel={() => {
-                    drawing = false;
-                    curStroke = null;
-                  }}
-                />
-                <span class="v2-sketch-hint">Sketch beside your notes</span>
-                <button type="button" class="v2-sketch-clear" onClick={clearSketch}>
-                  Clear
-                </button>
-              </div>
-            </div>
-
-            <div class="v2-pad-foot">
-              <div class="v2-pad-tools">
-                <Show when={(isExploreMode() || activeFrontier()) && dueFromExplore().length > 0}>
-                  <span class="v2-pad-map-count">{dueFromExplore().length} to practice</span>
-                </Show>
-              </div>
-
-              <div class="v2-pad-actions">
-                <Show when={!isNonUnit() && !busy()}>
-                  <button
-                    type="button"
-                    class="v2-btn-secondary"
-                    data-tip="Reveal the answer and bring this card back soon"
-                    onClick={() => void submitBeat(undefined, { showPivot: true })}
-                  >
-                    Show answer
-                  </button>
-                </Show>
-                <Show when={draft().trim().length >= 12 && draft().trim() !== (rep()?.starter?.trim() ?? "")}>
-                  <button
-                    type="button"
-                    class="v2-btn-secondary"
-                    disabled={tidying() || busy()}
-                    data-tip="Format & typo tidy (⌘⇧F) · ⌘Z undoes"
-                    onClick={() => void tidyPadText("main")}
-                  >
-                    <Show
-                      when={tidying()}
-                      fallback={
-                        <>
-                          Tidy <span class="v2-kbd">⌘⇧F</span>
-                        </>
+                    }}
+                    onKeyDown={(e) => {
+                      if (
+                        handlePadIndentKey(e, (next) => {
+                          recordActivity();
+                          setDraftFor(sessionKey(), next);
+                          autoGrow();
+                        })
+                      ) {
+                        return;
                       }
-                    >
-                      <span class="v2-spinner" aria-hidden="true" />
-                      <span>Tidying</span>
+                      if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "f") {
+                        e.preventDefault();
+                        void tidyPadText("main");
+                        return;
+                      }
+                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                        e.preventDefault();
+                        void submitBeat();
+                      }
+                    }}
+                  />
+
+                  <div class={{ "v2-sketch-pane": true, "has-ink": hasInk() }}>
+                    <canvas
+                      ref={(el) => bindCanvas(el)}
+                      class="v2-sketch-canvas"
+                      onPointerDown={(e) => {
+                        if (!canvas) return;
+                        e.preventDefault();
+                        recordActivity();
+                        canvas.setPointerCapture(e.pointerId);
+                        drawing = true;
+                        const p = posOf(e);
+                        curStroke = [p];
+                        strokes.push(curStroke);
+                        const ctx = canvas.getContext("2d");
+                        if (ctx) {
+                          ctx.strokeStyle = getComputedStyle(canvas).color || "#e5e5e5";
+                          ctx.lineCap = "round";
+                          ctx.lineJoin = "round";
+                          ctx.lineWidth = 2;
+                          ctx.beginPath();
+                          ctx.moveTo(p.x, p.y);
+                        }
+                      }}
+                      onPointerMove={(e) => {
+                        if (!drawing || !curStroke || !canvas) return;
+                        recordActivity();
+                        const p = posOf(e);
+                        curStroke.push(p);
+                        const ctx = canvas.getContext("2d");
+                        if (ctx) {
+                          ctx.lineTo(p.x, p.y);
+                          ctx.stroke();
+                        }
+                        if (!hasInk()) setHasInk(true);
+                      }}
+                      onPointerUp={() => {
+                        drawing = false;
+                        curStroke = null;
+                      }}
+                      onPointerCancel={() => {
+                        drawing = false;
+                        curStroke = null;
+                      }}
+                    />
+                    <span class="v2-sketch-hint">Sketch beside your notes</span>
+                    <button type="button" class="v2-sketch-clear" onClick={clearSketch}>
+                      Clear
+                    </button>
+                  </div>
+                </div>
+
+                <div class="v2-pad-foot">
+                  <div class="v2-pad-tools">
+                    <Show when={(isExploreMode() || activeFrontier()) && dueFromExplore().length > 0}>
+                      <span class="v2-pad-map-count">{dueFromExplore().length} to practice</span>
                     </Show>
-                  </button>
-                </Show>
-                <button
-                  type="button"
-                  class={{ "v2-btn-primary": true, "is-busy": busy() }}
-                  disabled={!busy() && !canSubmit()}
-                  data-tip={busy() ? "Click or press Esc to cancel" : undefined}
-                  onClick={() => (busy() ? cancelPending() : void submitBeat())}
-                >
-                  <Show
-                    when={busy()}
-                    fallback={
-                      <>
-                        {isExploreMode()
-                          ? beats().length > 0
-                            ? "Send"
-                            : "Explore"
-                          : activeFrontier() || beats().length > 0
-                            ? "Send"
-                            : "Check"}{" "}
-                        <span class="v2-kbd">⌘↵</span>
-                      </>
-                    }
-                  >
-                    <span class="v2-spinner" aria-hidden="true" />
-                    <span class="v2-busy-label">
-                      {isNonUnit() ? "Thinking" : "Checking"}
-                    </span>
-                    <span class="v2-busy-stop">Cancel</span>
-                  </Show>
-                </button>
+                  </div>
+
+                  <div class="v2-pad-actions">
+                    <Show when={!isNonUnit() && !busy()}>
+                      <button
+                        type="button"
+                        class="v2-btn-secondary"
+                        data-tip="Reveal the answer and bring this card back soon"
+                        onClick={() => void submitBeat(undefined, { showPivot: true })}
+                      >
+                        Show answer
+                      </button>
+                    </Show>
+                    <Show when={draft().trim().length >= 12 && draft().trim() !== (rep()?.starter?.trim() ?? "")}>
+                      <button
+                        type="button"
+                        class="v2-btn-secondary"
+                        disabled={tidying() || busy()}
+                        data-tip="Format & typo tidy (⌘⇧F) · ⌘Z undoes"
+                        onClick={() => void tidyPadText("main")}
+                      >
+                        <Show
+                          when={tidying()}
+                          fallback={
+                            <>
+                              Tidy <span class="v2-kbd">⌘⇧F</span>
+                            </>
+                          }
+                        >
+                          <span class="v2-spinner" aria-hidden="true" />
+                          <span>Tidying</span>
+                        </Show>
+                      </button>
+                    </Show>
+                    <button
+                      type="button"
+                      class={{ "v2-btn-primary": true, "is-busy": busy() }}
+                      disabled={!busy() && !canSubmit()}
+                      data-tip={busy() ? "Click or press Esc to cancel" : undefined}
+                      onClick={() => (busy() ? cancelPending() : void submitBeat())}
+                    >
+                      <Show
+                        when={busy()}
+                        fallback={
+                          <>
+                            {isExploreMode()
+                              ? beats().length > 0
+                                ? "Send"
+                                : "Explore"
+                              : activeFrontier() || beats().length > 0
+                                ? "Send"
+                                : "Check"}{" "}
+                            <span class="v2-kbd">⌘↵</span>
+                          </>
+                        }
+                      >
+                        <span class="v2-spinner" aria-hidden="true" />
+                        <span class="v2-busy-label">
+                          {isNonUnit() ? "Thinking" : "Checking"}
+                        </span>
+                        <span class="v2-busy-stop">Cancel</span>
+                      </Show>
+                    </button>
+                  </div>
+                </div>
               </div>
-            </div>
-          </div>
+            }
+          >
+            {(blanks) => (
+              <div class="v2-blank-stage">
+                <div
+                  ref={padEl}
+                  class={{
+                    "v2-pad": true,
+                    "v2-textured": true,
+                    "v2-blank-pad": true,
+                    "is-checking": busy(),
+                  }}
+                >
+                  <ComposerCitationChips />
+                  <div
+                    class={{
+                      "v2-blank-lines": true,
+                      "is-prose": blanks().isProse,
+                      "is-code": !blanks().isProse,
+                    }}
+                    data-citable="true"
+                  >
+                    <For each={blanks().parsed.lines}>
+                      {(line) => (
+                        <div class={{ "v2-blank-row": true, "has-marker": Boolean(line.marker) }}>
+                          <Show when={line.marker}>
+                            <span class="v2-blank-marker" aria-hidden="true">
+                              {line.marker}
+                            </span>
+                          </Show>
+                          <div class="v2-blank-content">
+                            <For each={line.segments}>
+                              {(seg) =>
+                                seg.kind === "text" ? (
+                                  blanks().isProse ? inline(seg.text) : mathOnly(seg.text)
+                                ) : (
+                                  <span
+                                    ref={(el) => {
+                                      blankEls[seg.index] = el;
+                                      const saved = blankValues()[seg.index];
+                                      if (saved && el.textContent !== saved) el.textContent = saved;
+                                    }}
+                                    class={{
+                                      "v2-blank": true,
+                                      "is-code": !blanks().isProse,
+                                      "is-empty": !(blankValues()[seg.index]?.trim()),
+                                    }}
+                                    contenteditable={busy() ? "false" : "true"}
+                                    role="textbox"
+                                    aria-label={`Blank ${seg.index + 1} of ${blanks().parsed.blankCount}`}
+                                    spellcheck={false}
+                                    autocorrect="off"
+                                    autocapitalize="off"
+                                    enterkeyhint={seg.index < blanks().parsed.blankCount - 1 ? "next" : "send"}
+                                    onBlur={(e) => {
+                                      if (!e.currentTarget.innerText.trim()) e.currentTarget.textContent = "";
+                                    }}
+                                    onInput={(e) => {
+                                      recordActivity();
+                                      const val = (e.currentTarget.innerText || "").replace(/\r?\n/g, " ");
+                                      setBlankValue(seg.index, val);
+                                    }}
+                                    onPaste={(e) => {
+                                      e.preventDefault();
+                                      const text =
+                                        e.clipboardData?.getData("text/plain")?.replace(/\r?\n+/g, " ") ?? "";
+                                      if (typeof document.execCommand === "function") {
+                                        document.execCommand("insertText", false, text);
+                                      }
+                                    }}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                                        e.preventDefault();
+                                        void submitFillableBlanks();
+                                        return;
+                                      }
+                                      if (e.key === "Enter" && !e.shiftKey) {
+                                        e.preventDefault();
+                                        if (seg.index < blanks().parsed.blankCount - 1) {
+                                          blankEls[seg.index + 1]?.focus();
+                                        } else {
+                                          void submitFillableBlanks();
+                                        }
+                                        return;
+                                      }
+                                      if (e.key === "Tab") {
+                                        e.preventDefault();
+                                        const targetIdx = e.shiftKey ? seg.index - 1 : seg.index + 1;
+                                        if (targetIdx >= 0 && targetIdx < blanks().parsed.blankCount) {
+                                          blankEls[targetIdx]?.focus();
+                                        } else if (!e.shiftKey) {
+                                          blankNoteEl?.focus();
+                                        }
+                                      }
+                                    }}
+                                  />
+                                )
+                              }
+                            </For>
+                          </div>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+
+                  <div class="v2-pad-foot">
+                    <div class="v2-pad-tools">
+                      <span class="v2-blank-count">
+                        {filledBlankCount()}/{blanks().parsed.blankCount} filled
+                      </span>
+                    </div>
+
+                    <div class="v2-pad-actions">
+                      <Show when={!busy()}>
+                        <button
+                          type="button"
+                          class="v2-btn-secondary"
+                          data-tip="Reveal the answer and bring this card back soon"
+                          onClick={() =>
+                            void submitBeat(
+                              filledBlankCount() > 0
+                                ? assembleFilledStarter(blanks().starter, blankValues(), blankNote())
+                                : undefined,
+                              { showPivot: true },
+                            )
+                          }
+                        >
+                          Show answer
+                        </button>
+                      </Show>
+                      <button
+                        type="button"
+                        class={{ "v2-btn-primary": true, "is-busy": busy() }}
+                        disabled={!busy() && !canSubmitBlanks()}
+                        data-tip={busy() ? "Click or press Esc to cancel" : undefined}
+                        onClick={() => (busy() ? cancelPending() : void submitFillableBlanks())}
+                      >
+                        <Show
+                          when={busy()}
+                          fallback={
+                            <>
+                              Check <span class="v2-kbd">⌘↵</span>
+                            </>
+                          }
+                        >
+                          <span class="v2-spinner" aria-hidden="true" />
+                          <span class="v2-busy-label">Checking</span>
+                          <span class="v2-busy-stop">Cancel</span>
+                        </Show>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                <form
+                  class={{
+                    "v2-post-follow": true,
+                    "v2-blank-note-form": true,
+                    "has-text": blankNote().trim().length > 0,
+                  }}
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void submitFillableBlanks();
+                  }}
+                >
+                  <input
+                    ref={blankNoteEl}
+                    type="text"
+                    class="v2-post-input"
+                    placeholder="Or ask a clarifying question…"
+                    spellcheck="false"
+                    value={blankNote()}
+                    disabled={busy()}
+                    onInput={(e) => {
+                      recordActivity();
+                      setBlankNote(e.currentTarget.value);
+                    }}
+                  />
+                  <Show when={!busy() && blankNote().trim().length > 0}>
+                    <button type="submit" class="v2-post-send" aria-label="Ask question">
+                      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
+                      </svg>
+                    </button>
+                  </Show>
+                </form>
+              </div>
+            )}
+          </Show>
         </Show>
 
         <Show when={error() || practice.state.error}>
