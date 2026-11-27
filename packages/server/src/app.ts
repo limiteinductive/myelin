@@ -994,7 +994,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const depth = pickDrillDepth(u, state);
       const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
       const stats = unitExposureStats(state, u.id, depth, now);
-      const bundled = pickSynthesisCluster(u, state, dueIds, 2);
+      const bundled = pickSynthesisCluster(u, state, dueIds, 1);
       const modality = pickRepModality(u, state, depth, bundled);
       return {
         unit: u,
@@ -1016,7 +1016,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const depth = pickDrillDepth(u, state);
       const restsOn = u.rests_on.map((id) => state.units[id]?.text ?? id);
       const stats = unitExposureStats(state, u.id, depth, now);
-      const bundled = dueIds.has(u.id) ? pickSynthesisCluster(u, state, dueIds, 2) : [];
+      const bundled = dueIds.has(u.id) ? pickSynthesisCluster(u, state, dueIds, 1) : [];
       const modality = pickRepModality(u, state, depth, bundled);
       const bundledIds = bundled.map((x) => x.id);
       return {
@@ -1690,7 +1690,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     );
     const depth = pickDrillDepth(picked, state);
     const restsOn = picked.rests_on.map((id) => state.units[id]?.text ?? id);
-    const bundledUnits = isRetry ? [] : pickSynthesisCluster(picked, state, dueIds, 2);
+    const bundledUnits = isRetry ? [] : pickSynthesisCluster(picked, state, dueIds, 1);
     const bundledIds = bundledUnits.map((b) => b.id);
     const rawModality = pickRepModality(picked, state, depth, bundledUnits);
     // On cold tail retries, always test unaided retrieval instead of re-serving a faded skeleton.
@@ -1888,7 +1888,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           const d = pickDrillDepth(u, state);
           const ro = u.rests_on.map((id) => state.units[id]?.text ?? id);
           const st = unitExposureStats(state, u.id, d, now);
-          const b = pickSynthesisCluster(u, state, dueIds, 2);
+          const b = pickSynthesisCluster(u, state, dueIds, 1);
           const m = pickRepModality(u, state, d, b);
           return {
             unit: u,
@@ -2296,7 +2296,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             const d = pickDrillDepth(item, postState);
             const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
             const st = unitExposureStats(postState, item.id, d, now + 2);
-            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 2) : [];
+            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 1) : [];
             const m = pickRepModality(item, postState, d, b);
             return {
               unit: item,
@@ -2680,7 +2680,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             const d = pickDrillDepth(item, postState);
             const ro = item.rests_on.map((id) => postState.units[id]?.text ?? id);
             const st = unitExposureStats(postState, item.id, d, now + 2);
-            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 2) : [];
+            const b = postDueIds.has(item.id) ? pickSynthesisCluster(item, postState, postDueIds, 1) : [];
             const m = pickRepModality(item, postState, d, b);
             return {
               unit: item,

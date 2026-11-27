@@ -2992,7 +2992,8 @@ Return ONLY valid JSON:
 
     const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words), its exact single-claim grading rubric ("expected_crux", max 32 words), and an optional pre-filled editor "starter" matching the requested Modality.
 Rules:
-- MOTIVATE, DON'T WORKSHEET: Frame a real problem, comparison, or curiosity trigger where the brain actually needs this idea—NEVER a disembodied textbook command ("Decompose X into A and B", "State formula Y", "What identity does trick Z use?").
+- MOTIVATE, DON'T WORKSHEET: Frame a real problem, comparison, or concrete setup directly and plainly—NEVER a disembodied textbook command ("State formula Y"), AND NEVER forced faux-ownership or roleplay ("Your PyTorch LayerNorm...", "A teammate argues...").
+- CLEAN MATH TYPOGRAPHY: In "prompt", render equations, variables, and tensor shapes in KaTeX (\`$y = \\gamma \\hat{x} + \\beta$\`, \`$(B, T, D)$\`), NOT backticks! Reserve backticks strictly for actual code tokens/flags (like \`dim=-1\` or \`gradcheck\`, at most 2–3 in a prompt).
 - ZERO SPOILERS, ZERO RIDDLES: Name the starting setup/object clearly (e.g. standard attention $\\text{softmax}(QK^T)V$, a database write path, a sample mean $\\bar{x}$)—hide ONLY the solution, trick, or intermediate pivot, NEVER obfuscate the premise into a vague riddle.
 - NO SURFACE-CUE REPETITION: If Previously asked prompts are listed below, DO NOT reuse the same cover story, numbers, or phrasing—change what the learner must recognize or decide.
 - 100% SELF-CONTAINED COLD: Explicitly define every symbol or variable used.

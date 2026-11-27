@@ -1033,8 +1033,21 @@ export function DrillView() {
     return draft().trim().length > 0 || citations().length > 0 || (sketchOpen() && hasInk());
   };
 
+  const hasSubmittedBlanks = createMemo(() => {
+    const starter = rep()?.starter;
+    if (!starter) return false;
+    const anchor = starterAnchorLine(starter);
+    return beats().some((b) => {
+      if (isFailedBeat(b)) return false;
+      const u = b.user.trim();
+      if (!u) return false;
+      if (u === "Show answer.") return true;
+      return Boolean(anchor && u.includes(anchor));
+    });
+  });
+
   const activeBlanks = createMemo(() => {
-    if (isNonUnit() || passedVerdict()?.ok || beats().length > 0 || editingBeatIdx() !== null) return null;
+    if (isNonUnit() || passedVerdict()?.ok || editingBeatIdx() !== null || hasSubmittedBlanks()) return null;
     const starter = rep()?.starter;
     if (!starter || countStarterBlanks(starter) === 0) return null;
     return {
@@ -1062,8 +1075,19 @@ export function DrillView() {
   const submitFillableBlanks = async () => {
     const b = activeBlanks();
     if (!b || !canSubmitBlanks()) return;
-    const text = assembleFilledStarter(b.starter, blankValues(), blankNote());
+    const note = blankNote();
+    const text = assembleFilledStarter(b.starter, blankValues(), note);
+    if (note) setBlankNote("");
     await submitBeat(text);
+  };
+
+  /** Sends only the clarifying question below the blanks card, keeping the fillable holes open and intact. */
+  const submitBlankQuestion = async () => {
+    if (busy() || !activeBlanks()) return;
+    const q = blankNote().trim();
+    if (!q && citations().length === 0) return;
+    setBlankNote("");
+    await submitBeat(q || undefined);
   };
 
   const triggerComplete = (
@@ -3205,7 +3229,13 @@ export function DrillView() {
                               when={annoSummary().matchedCount > 0}
                               fallback={
                                 <pre
-                                  class={{ "v2-beat-code": true, "is-prose": isNonUnit() || isMcq() }}
+                                  class={{
+                                    "v2-beat-code": true,
+                                    "is-prose":
+                                      isNonUnit() ||
+                                      isMcq() ||
+                                      (!beat.user.includes("\n") && !/[=<>]|torch\.|np\.|def\s/.test(beat.user)),
+                                  }}
                                   onDblClick={() => {
                                     if (canEdit()) startEditingBeat(idx());
                                   }}
@@ -3825,7 +3855,7 @@ export function DrillView() {
                   }}
                   onSubmit={(e) => {
                     e.preventDefault();
-                    void submitFillableBlanks();
+                    void submitBlankQuestion();
                   }}
                 >
                   <input
