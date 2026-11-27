@@ -47,6 +47,28 @@ export interface PromptCacheEntry {
   mcq?: McqSpec | undefined;
 }
 
+const STARTER_PROSE_LIST_RE = /^\s*(?:\d+[.)]|[-•*])\s+[A-Z][a-z]+/;
+const STARTER_CODE_LINE_RE =
+  /(^\s*#\s|\bdef\s|\breturn\s|\btorch\.|\bnp\.|\beinsum\b|\bdim=|\bkeepdim|\bfor\s+\w+\s+in\b|\bif\s+\w+|^[a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)*\s*=\s*)/m;
+
+/**
+ * Returns true ONLY when a starter is genuine code (e.g. PyTorch/NumPy/Python assignments or calls)
+ * rather than English prose mad-libs ("1. Logit scale grows with ___ and ___.").
+ */
+export function isCodeSkeletonStarter(starter: string): boolean {
+  const s = starter.trim();
+  if (s.length < 6) return false;
+  if (STARTER_PROSE_LIST_RE.test(s)) return false;
+  if (/\$[^$]+\$/.test(s)) return false;
+  const nonEmptyLines = s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (nonEmptyLines.length === 0) return false;
+  const proseLikeLines = nonEmptyLines.filter(
+    (l) => !l.startsWith("#") && (/\?\s*$/.test(l) || /^[A-Z][a-z]+\s+[a-z]+\s+[a-z]+/.test(l)),
+  );
+  if (proseLikeLines.length > 0) return false;
+  return STARTER_CODE_LINE_RE.test(s);
+}
+
 const BANNED_MCQ_PATTERNS = [
   /\ball of the above\b/i,
   /\bnone of the above\b/i,
@@ -1129,6 +1151,14 @@ export class FastJudge {
               modality: "mcq",
               mcq: validMcq,
             });
+            continue;
+          }
+          // Evict legacy prose mad-lib starters on synthesis/faded_skeleton so they regenerate as clean open prompts.
+          if (
+            starter &&
+            (modality === "synthesis" || modality === "faded_skeleton") &&
+            !isCodeSkeletonStarter(starter)
+          ) {
             continue;
           }
           this.promptCache.set(k, {
@@ -2948,15 +2978,15 @@ Return ONLY valid JSON:
     const modalityGuide: Record<RepModality, string> = {
       direct: `Modality: DIRECT. Set "starter" to null.`,
       contrast: `Modality: SHARP CONTRAST (1-line high-signal boundary check). Ask ONE crisp contrast or edge-case question answerable in 1-2 sentences (e.g. "What breaks if X is swapped for Y?"). Set "starter" to null.`,
-      faded_skeleton: `Modality: FADED WORKED SKELETON (skip boilerplate, test the exact pivot in ~30s).
-- "prompt": 1 crisp sentence naming the goal and telling the learner to fill in the missing pivot(s) below.
-- "starter": A clean 2-5 line code snippet or concise numbered derivation with ONLY 1-3 short pivot holes marked \`___\` (outside \`$...$\` math spans; no markdown fences). Keep each hole answerable in a few words or a short expression.`,
+      faded_skeleton: `Modality: FADED CODE SKELETON (skip boilerplate, test the exact pivot in ~30s).
+- "prompt": 1 crisp sentence naming the goal and telling the learner to complete the code/expression below.
+- "starter": ONLY for code or pure symbolic assignments (e.g. PyTorch/NumPy/Python): a clean 2-5 line plain-ASCII code snippet with 1-2 short pivot holes marked \`___\` (no markdown fences, NO English prose mad-libs like "grows with ___ and ___", NO numbered prose sentences). If the unit is conceptual prose rather than code, set "starter" to null.`,
       fix_bug: `Modality: FIX THE BUG (spot & repair ONE planted flaw in ~25s).
 - "prompt": 1 crisp sentence saying the snippet/claim has one subtle bug and asking them to fix it.
 - "starter": ONLY for code tasks: a realistic 3-6 line plain-ASCII code snippet containing ONE subtle bug right at this unit's core pivot (no hint comments, no markdown fences, NO raw LaTeX/TeX). For non-code conceptual/math units, put the flawed claim directly in "prompt" and set "starter" to null.`,
       synthesis: `Modality: MULTI-UNIT SYNTHESIS (clear the primary unit AND the bundled companion unit(s) in ONE compact ~45s task).
 - "prompt": 1-2 crisp sentences posing ONE unified concrete scenario/task that naturally exercises the primary unit AND every bundled unit together without stacking two unrelated sub-questions.
-- "starter": Optionally a compact 2-4 line worked skeleton with 1-3 concise \`___\` holes (placed outside \`$...$\` math spans; no markdown fences) if it cuts boilerplate typing, otherwise null.`,
+- "starter": Default to null (open response). ONLY set a 2-4 line plain-ASCII code skeleton with 1-2 \`___\` holes when the task is explicitly writing code (e.g. PyTorch/NumPy/Python); NEVER emit prose fill-in-the-blank sentences or numbered mad-libs.`,
       mcq: `Modality: SHARP CONTRAST. Set "starter" to null.`,
     };
 
@@ -3068,9 +3098,14 @@ Rules:
               ? parsed.expected_crux.trim()
               : undefined;
           const rawStarter = typeof parsed?.starter === "string" ? parsed.starter.trim() : "";
+          const cleanedStarter = rawStarter
+            ? rawStarter.replace(/^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```$/, "$1").trim()
+            : "";
           const starterText =
-            rawStarter.length >= 6 && (modality === "fix_bug" || modality === "faded_skeleton" || modality === "synthesis")
-              ? rawStarter.replace(/^```[a-zA-Z0-9_-]*\r?\n([\s\S]*?)\r?\n```$/, "$1").trim()
+            cleanedStarter.length >= 6 &&
+            (modality === "fix_bug" ||
+              ((modality === "faded_skeleton" || modality === "synthesis") && isCodeSkeletonStarter(cleanedStarter)))
+              ? cleanedStarter
               : undefined;
           if (promptText) {
             const entry: PromptCacheEntry = {

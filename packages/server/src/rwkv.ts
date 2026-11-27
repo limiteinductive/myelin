@@ -1259,14 +1259,30 @@ export function pickSynthesisCluster(
   return scored.slice(0, maxCompanions).map((x) => x.unit);
 }
 
+const CODE_CUE_RE =
+  /(\bdef\s|\btorch\.|\bnp\.|\beinsum\b|\bdim=|\bkeepdim|\bbackward\b|\bforward\b|\bpython\b|\bpytorch\b|`[^`]+`)/i;
+
+const FORMULA_CUE_RE =
+  /(\\frac|\\sum|\\prod|\\partial|\\nabla|\\int|\bO\(|[A-Za-z0-9_)\]]\s*=\s*[^=])/i;
+
 const STRUCTURAL_CUE_RE =
   /(\$|\\[a-z]+|=|def\s|torch\.|np\.|shape|matrix|tensor|variance|gradient|softmax|kernel|sum_|log|O\(|complexity|recurrence|algorithm|equation|proof|step)/i;
+
+function stableBucket(id: string, mod: number): number {
+  let h = 2166136261;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) % mod;
+}
 
 /**
  * Selects the highest-leverage rep modality for unit `u`:
  * - `synthesis`: when 1-2 related due units are bundled into one compact multi-unit task
  * - `contrast`: sharp 1-line boundary/distinction check for definitions & distinctions
- * - `faded_skeleton`: worked setup with 1-2 pivot blanks on first contact or after a recent miss
+ * - `faded_skeleton`: code/formula scaffold ONLY for genuine code or a bounded fraction of
+ *   symbolic formula first-contact/relearn units (never prose mad-libs on conceptual explanations)
  * - `fix_bug`: compact 3-6 line snippet/derivation with ONE planted subtle bug on transfer/rebuild reps
  * - `direct`: standard concise generative prompt
  */
@@ -1293,7 +1309,17 @@ export function pickRepModality(
   const passes = probes.filter((ev) => ev.grade !== "again").length;
   const lastGrade = probes.at(-1)?.grade ?? null;
 
-  if (passes === 0 || lastGrade === "again") return "faded_skeleton";
+  if (passes === 0 || lastGrade === "again") {
+    if (CODE_CUE_RE.test(u.text)) return "faded_skeleton";
+    if (
+      FORMULA_CUE_RE.test(u.text) &&
+      (kind === "move" || kind === "mechanism" || kind === "rule" || kind === "result") &&
+      stableBucket(u.id, 3) === 0
+    ) {
+      return "faded_skeleton";
+    }
+    return "direct";
+  }
   if (depth === "use" || depth === "rebuild") return "fix_bug";
   return "direct";
 }

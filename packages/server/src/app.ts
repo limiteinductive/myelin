@@ -1692,7 +1692,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const restsOn = picked.rests_on.map((id) => state.units[id]?.text ?? id);
     const bundledUnits = isRetry ? [] : pickSynthesisCluster(picked, state, dueIds, 2);
     const bundledIds = bundledUnits.map((b) => b.id);
-    const modality = pickRepModality(picked, state, depth, bundledUnits);
+    const rawModality = pickRepModality(picked, state, depth, bundledUnits);
+    // On cold tail retries, always test unaided retrieval instead of re-serving a faded skeleton.
+    const modality: RepModality = isRetry && rawModality === "faded_skeleton" ? "direct" : rawModality;
     const stats = unitExposureStats(state, picked.id, depth, now);
 
     // 1. If this unit already has an active issued MCQ attempt, restore that exact frozen attempt & choice order.

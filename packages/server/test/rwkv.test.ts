@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { emptyState, fsrsScheduler, makeEvent, replay, uuidv7 } from "@myelin/core";
 import { computeCalibratedIntervals, pickDrillDepth, pickRepModality, pickSynthesisCluster, RwkvInstantEngine } from "../src/rwkv.js";
+import { isCodeSkeletonStarter } from "../src/judge.js";
 
 const MODEL_DIR = fileURLToPath(new URL("../../../data/models/sm72e25/sm72e25", import.meta.url));
 
@@ -168,10 +169,33 @@ print(json.dumps(out))
     const bundle = pickSynthesisCluster(state.units[uDerived]!, state, dueIds, 2);
     expect(bundle.map((u) => u.id)).toEqual([uBase, uSibling]);
 
-    // Adaptive modality selection
+    // Adaptive modality selection: synthesis when bundled, contrast for definitions,
+    // direct for conceptual prose mechanisms (no mad-libs), faded_skeleton for code units, fix_bug on use.
     expect(pickRepModality(state.units[uDerived]!, state, "use", bundle)).toBe("synthesis");
     expect(pickRepModality(state.units[uDef]!, state, "recall", [])).toBe("contrast");
-    expect(pickRepModality(state.units[uSibling]!, state, "recall", [])).toBe("faded_skeleton");
+    expect(pickRepModality(state.units[uSibling]!, state, "recall", [])).toBe("direct");
+    expect(
+      pickRepModality(
+        { ...state.units[uSibling]!, text: "Compute attention logits with torch.einsum('...id,...jd->...ij', q, k)." },
+        state,
+        "recall",
+        [],
+      ),
+    ).toBe("faded_skeleton");
     expect(pickRepModality(state.units[uDerived]!, state, "use", [])).toBe("fix_bug");
+
+    // Genuine code skeletons pass; English prose mad-libs are rejected
+    expect(isCodeSkeletonStarter('# q, k: (..., T, d)\nlogits = torch.einsum("___", ___, k)')).toBe(true);
+    expect(isCodeSkeletonStarter("dx_hat = dy * gamma\ndx = ___\ndgamma = ___")).toBe(true);
+    expect(
+      isCodeSkeletonStarter(
+        "1. Unnormalized q = x W_Q, k = x W_K: logit scale grows with ___ and ___.\n2. QK-Norm strips both, leaving only ___.",
+      ),
+    ).toBe(false);
+    expect(
+      isCodeSkeletonStarter(
+        "Before RoPE: (R_m Γ q_norm) · (R_n Γ k_norm) = ___\nWhy order matters for RMS(x) vs Γ: ___",
+      ),
+    ).toBe(false);
   });
 });
