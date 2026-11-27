@@ -1155,8 +1155,11 @@ body,
   color: var(--v2-ink-3);
   user-select: none;
 }
+.v2-blank-note-wrap {
+  padding: 0 4px;
+}
 .v2-blank-note-form {
-  padding: 4px 4px 6px;
+  padding: 4px 0 6px;
 }
 @media (pointer: coarse) {
   .v2-blank {

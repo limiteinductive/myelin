@@ -589,13 +589,14 @@ export function DrillView() {
   const focusComposer = () => {
     if (passedVerdict()?.ok) postInputEl?.focus();
     else if (isMcq()) mcqClarifyEl?.focus();
+    else if (activeBlanks()) blankNoteEl?.focus();
     else textarea?.focus();
   };
 
   const cancelPending = () => {
     // Only abort — let `submitBeat`'s `finally` release `busy` cleanly when identity matches.
     activeAbort?.abort();
-    if (!isMcq()) requestAnimationFrame(() => textarea?.focus());
+    if (!isMcq()) requestAnimationFrame(() => (activeBlanks() ? blankNoteEl : textarea)?.focus());
   };
 
   const cancelPostPending = () => {
@@ -1069,7 +1070,7 @@ export function DrillView() {
 
   const canSubmitBlanks = () => {
     if (busy() || !activeBlanks()) return false;
-    return filledBlankCount() > 0 || blankNote().trim().length > 0 || citations().length > 0;
+    return filledBlankCount() > 0;
   };
 
   const submitFillableBlanks = async () => {
@@ -3704,7 +3705,6 @@ export function DrillView() {
                     "is-checking": busy(),
                   }}
                 >
-                  <ComposerCitationChips />
                   <div
                     class={{
                       "v2-blank-lines": true,
@@ -3847,38 +3847,43 @@ export function DrillView() {
                   </div>
                 </div>
 
-                <form
-                  class={{
-                    "v2-post-follow": true,
-                    "v2-blank-note-form": true,
-                    "has-text": blankNote().trim().length > 0,
-                  }}
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    void submitBlankQuestion();
-                  }}
-                >
-                  <input
-                    ref={blankNoteEl}
-                    type="text"
-                    class="v2-post-input"
-                    placeholder="Or ask a clarifying question…"
-                    spellcheck="false"
-                    value={blankNote()}
-                    disabled={busy()}
-                    onInput={(e) => {
-                      recordActivity();
-                      setBlankNote(e.currentTarget.value);
+                <div class="v2-post-follow-wrap v2-blank-note-wrap">
+                  <ComposerCitationChips />
+                  <form
+                    class={{
+                      "v2-post-follow": true,
+                      "v2-blank-note-form": true,
+                      "has-text": blankNote().trim().length > 0 || citations().length > 0,
                     }}
-                  />
-                  <Show when={!busy() && blankNote().trim().length > 0}>
-                    <button type="submit" class="v2-post-send" aria-label="Ask question">
-                      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                        <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
-                      </svg>
-                    </button>
-                  </Show>
-                </form>
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      void submitBlankQuestion();
+                    }}
+                  >
+                    <input
+                      ref={blankNoteEl}
+                      type="text"
+                      class="v2-post-input"
+                      placeholder="Or ask a clarifying question…"
+                      aria-label="Ask a clarifying question"
+                      enterkeyhint="send"
+                      spellcheck="false"
+                      value={blankNote()}
+                      disabled={busy()}
+                      onInput={(e) => {
+                        recordActivity();
+                        setBlankNote(e.currentTarget.value);
+                      }}
+                    />
+                    <Show when={!busy() && (blankNote().trim().length > 0 || citations().length > 0)}>
+                      <button type="submit" class="v2-post-send" aria-label="Ask question">
+                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
+                        </svg>
+                      </button>
+                    </Show>
+                  </form>
+                </div>
               </div>
             )}
           </Show>
