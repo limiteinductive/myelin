@@ -3315,6 +3315,8 @@ export function DrillView() {
                           </Match>
                         </Switch>
 
+                        <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
+
                         <Show
                           when={
                             beat.question &&
@@ -3327,8 +3329,6 @@ export function DrillView() {
                             <Body text={beat.question!} />
                           </div>
                         </Show>
-
-                        <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
 
                         <Show when={isFinalPass()}>
                           <VerdictFoot label={intervalLabel} note={nextDepthNote} clean={isCleanPass} />
@@ -3437,12 +3437,12 @@ export function DrillView() {
                             </div>
                           </Match>
                         </Switch>
+                        <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
                         <Show when={beat.question && !beat.pending && !failed()}>
                           <div class="v2-beat-question-past" data-citable="true">
                             <Body text={beat.question!} />
                           </div>
                         </Show>
-                        <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
                       </div>
                     </div>
                   );
