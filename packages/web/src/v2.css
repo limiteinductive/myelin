@@ -987,6 +987,42 @@ body,
   color: var(--v2-ink-1);
 }
 
+/* Fixed sitting hairline: one tick per committed slot, in locked order. State is carried by
+   fill alone; it never names a unit. */
+.v2-sitting-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px;
+  /* Sits with the prompt, not as a section of its own: pull back most of the stage gap. */
+  margin-bottom: -12px;
+}
+.v2-sitting-tick {
+  flex: 0 1 20px;
+  min-width: 6px;
+  height: 2px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--v2-fg) 15%, transparent);
+  transition: background-color 220ms ease;
+}
+.v2-sitting-tick.is-active {
+  background: var(--v2-ink-1);
+}
+.v2-sitting-tick.is-pass {
+  background: color-mix(in srgb, var(--v2-success) 72%, var(--v2-bg));
+}
+.v2-sitting-tick.is-retry {
+  background: color-mix(in srgb, var(--v2-warn) 72%, var(--v2-bg));
+}
+.v2-sitting-tick.is-closed {
+  background: color-mix(in srgb, var(--v2-ink-3) 80%, var(--v2-bg));
+}
+.v2-sitting-line.is-receipt {
+  justify-content: center;
+  padding: 0;
+  margin-bottom: 0;
+}
+
 .v2-prompt-wrap {
   padding: 6px 2px 0;
 }
@@ -2267,33 +2303,52 @@ body,
   gap: 0;
   animation: v2-in 180ms ease;
 }
-.v2-sitting-done-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font: var(--v2-type-meta);
-  color: color-mix(in srgb, var(--v2-success) 78%, var(--v2-ink-1));
-  letter-spacing: var(--v2-track-meta);
+/* A receipt, not a reward: one heading, plain facts, and no primary action. Stopping is the default. */
+.v2-sitting-done .v2-sitting-line {
+  margin-bottom: 22px;
 }
 .v2-sitting-done .v2-prompt {
-  margin-top: 16px;
   font: var(--v2-type-display);
   letter-spacing: var(--v2-track-display);
   max-width: none;
 }
 .v2-sitting-done-sub {
-  margin: 8px 0 0;
-  color: var(--v2-ink-3);
-  font: var(--v2-type-body-sm);
+  margin: 10px 0 0;
+  color: var(--v2-ink-2);
+  font: var(--v2-type-body);
+  font-variant-numeric: tabular-nums;
   max-width: 46ch;
   text-wrap: balance;
+}
+.v2-sitting-done-notes {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 52ch;
+  color: var(--v2-ink-3);
+  font: var(--v2-type-body-sm);
+  text-wrap: balance;
+}
+.v2-sitting-done-unit {
+  color: var(--v2-ink-2);
+}
+.v2-sitting-done-next {
+  margin: 14px 0 0;
+  color: var(--v2-ink-3);
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  letter-spacing: var(--v2-track-meta);
+  font-variant-numeric: tabular-nums;
 }
 .v2-sitting-done-actions {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 10px;
-  margin-top: 26px;
+  margin-top: 30px;
   flex-wrap: wrap;
 }
 
@@ -2781,6 +2836,10 @@ body,
   letter-spacing: var(--v2-track-meta);
   color: var(--v2-ink-3);
   font-variant-numeric: tabular-nums;
+}
+/* The next assignment, stated beside the schedule in the same muted ink. Never styled as a win. */
+.v2-verdict-note {
+  color: var(--v2-ink-3);
 }
 .v2-override-btn {
   appearance: none;

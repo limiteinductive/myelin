@@ -29,9 +29,13 @@ export interface ActiveAttempt {
   updated_at: number;
 }
 
+export type ScheduleKind = "first" | "normal" | "relearn" | "lapse" | "override";
+
 export interface DrillQueueResponse {
   scheduler: string;
   total_units: number;
+  total_due?: number;
+  earliest_next_in_ms?: number | null;
   active_ids?: string[];
   active_attempts?: ActiveAttempt[];
   items: QueueUnit[];
@@ -111,6 +115,11 @@ export interface CheckDrillResponse {
   latency_ms: number | null;
   prev_latency_ms: number | null;
   next_in_ms: number | null;
+  prev_interval_ms?: number | null;
+  prev_schedule_kind?: ScheduleKind;
+  scheduled_interval_ms?: number | null;
+  schedule_kind?: ScheduleKind;
+  next_depth?: Depth;
   scheduler: string;
   jev?: {
     model: string;
@@ -272,8 +281,16 @@ async function reqStream<T>(
   return donePayload;
 }
 
-export function fetchDrillQueue(signal?: AbortSignal): Promise<DrillQueueResponse> {
-  return req<DrillQueueResponse>("/api/drill/queue", signal ? { signal } : undefined);
+export function fetchDrillQueue(
+  signal?: AbortSignal,
+  includeIds?: readonly string[],
+): Promise<DrillQueueResponse> {
+  const clean = includeIds?.filter(Boolean).slice(0, 32) ?? [];
+  const url =
+    clean.length > 0
+      ? `/api/drill/queue?include=${encodeURIComponent(clean.join(","))}`
+      : "/api/drill/queue";
+  return req<DrillQueueResponse>(url, signal ? { signal } : undefined);
 }
 
 export function tidyDraft(text: string, signal?: AbortSignal): Promise<{ text: string; changed: boolean }> {

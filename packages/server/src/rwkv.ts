@@ -55,6 +55,8 @@ export interface RwkvHeads {
   p_logits: Float32Array;
 }
 
+export type ScheduleKind = "first" | "normal" | "relearn" | "lapse" | "override";
+
 export interface RwkvUnitScore {
   unit_id: string;
   /** Instant probability of recall right now (1 - P(again)). */
@@ -64,6 +66,9 @@ export interface RwkvUnitScore {
   /** Estimated ms from now until p_curve drops below target (null if never reviewed). */
   next_in_ms: number | null;
   reviews: number;
+  /** Effective scheduled interval (effective_due_at - scheduling_event_at) from the latest scheduling decision. */
+  scheduled_interval_ms?: number | null;
+  schedule_kind?: ScheduleKind;
 }
 
 const F32_MAGIC = "ARWKVWEIGHTS1";
@@ -915,9 +920,27 @@ export function computeCalibratedIntervals(
   state: State,
   now: number,
   dueOverrides?: ReadonlyMap<string, UnitDueOverride>,
-): Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }> {
+): Map<
+  string,
+  {
+    next_in_ms: number;
+    fsrs_recall: number;
+    reviews: number;
+    scheduled_interval_ms: number | null;
+    schedule_kind: ScheduleKind;
+  }
+> {
   const sched = fsrsScheduler({ requestRetention: 0.85 });
-  const out = new Map<string, { next_in_ms: number; fsrs_recall: number; reviews: number }>();
+  const out = new Map<
+    string,
+    {
+      next_in_ms: number;
+      fsrs_recall: number;
+      reviews: number;
+      scheduled_interval_ms: number | null;
+      schedule_kind: ScheduleKind;
+    }
+  >();
 
   // Pre-collect downward DAG credit: ancestorId -> clean pass timestamps from dependents.
   const downwardCredits = new Map<string, { at: number; seq: number }[]>();
@@ -974,7 +997,13 @@ export function computeCalibratedIntervals(
     merged.sort((a, b) => a.at - b.at || a.seq - b.seq);
 
     if (merged.length === 0) {
-      out.set(u.id, { next_in_ms: 0, fsrs_recall: 0, reviews: 0 });
+      out.set(u.id, {
+        next_in_ms: 0,
+        fsrs_recall: 0,
+        reviews: 0,
+        scheduled_interval_ms: null,
+        schedule_kind: "first",
+      });
       continue;
     }
 
@@ -1019,28 +1048,42 @@ export function computeCalibratedIntervals(
     const stabilityDays = typeof mem.stability === "number" && Number.isFinite(mem.stability) && mem.stability > 0 ? mem.stability : 0.25;
     const override = dueOverrides?.get(u.id);
     let effectiveDue: number;
+    let scheduleKind: ScheduleKind;
+    let schedulingEventAt = lastAt;
     if (override && override.created_at >= lastAt) {
       effectiveDue = override.due_at;
+      scheduleKind = "override";
+      schedulingEventAt = override.created_at;
     } else if (lastGrade === "again") {
       const relearnDelay =
         priorPasses === 0
           ? FIRST_RELEARN_MS
           : Math.min(MAX_LAPSE_RELEARN_MS, Math.max(FIRST_RELEARN_MS, Math.round(stabilityDays * 0.05 * DAY_MS)));
       effectiveDue = lastAt + relearnDelay;
+      scheduleKind = "lapse";
     } else if (sameDayRelearn) {
       const overnightHours = lastGrade === "hard" ? 14 : lastGrade === "good" ? 20 : 48;
       effectiveDue = lastAt + overnightHours * 3600_000;
+      scheduleKind = "relearn";
     } else {
       effectiveDue = Math.max(rawDue, lastAt + 12 * 3600_000);
+      scheduleKind = "normal";
     }
 
+    const scheduledIntervalMs = Math.max(0, effectiveDue - schedulingEventAt);
     const nextInMs = Math.max(0, effectiveDue - now);
     const elapsedDays = Math.max(0, (now - lastAt) / DAY_MS);
     const fsrsRecall =
       elapsedDays < 1
         ? Math.pow(1 + (19 / 81) * (elapsedDays / stabilityDays), -0.5)
         : sched.recall(mem, now);
-    out.set(u.id, { next_in_ms: nextInMs, fsrs_recall: fsrsRecall, reviews: merged.length });
+    out.set(u.id, {
+      next_in_ms: nextInMs,
+      fsrs_recall: fsrsRecall,
+      reviews: merged.length,
+      scheduled_interval_ms: scheduledIntervalMs,
+      schedule_kind: scheduleKind,
+    });
   }
 
   return out;

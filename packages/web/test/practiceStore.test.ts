@@ -98,11 +98,16 @@ describe("PracticeStore (Solid 2.0)", () => {
       expect(store.state.queue[1]).toBe(u2RefBefore);
       // Stale passedVerdict on u2 was automatically cleared when u2 became due again
       expect(store.state.sessions["u2"]).toBeUndefined();
-      // u1 stays visible in Up next while showing its green card, alongside newly due u2
-      expect(store.dueQueue().map((u) => u.unit_id)).toEqual(["u1", "u2"]);
+      // Frozen sitting promise: u2 flipping due mid-sitting stays in backlog rather than enlarging this 1-card sitting
+      expect(store.dueQueue().map((u) => u.unit_id)).toEqual(["u1"]);
+      expect(store.backlogDueCount()).toBe(1);
 
-      // Clicking Next archives u1 into Done and lands straight on newly due u2
+      // Clicking Next finishes the committed 1-card sitting cleanly onto Done for now; starting next sitting opens u2
       store.advanceFromUnit("u1");
+      flush();
+      expect(store.dueQueue()).toEqual([]);
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+      store.startNextSitting();
       flush();
       expect(store.dueQueue().map((u) => u.unit_id)).toEqual(["u2"]);
       expect(store.doneQueue().map((u) => u.unit_id)).toEqual(["u1"]);
@@ -467,7 +472,10 @@ describe("PracticeStore (Solid 2.0)", () => {
       store.markUnitCompleted("u1");
       flush();
       expect(store.state.sittingRetryIds["u1"]).toBe(true);
-      expect(store.state.sittingIds).toEqual(["u2", "u3", "u4", "u1"]);
+      // Tick positions in sittingIds stay fixed while the work queue sittingOrder moves u1 to the tail!
+      expect(store.state.sittingIds).toEqual(["u1", "u2", "u3", "u4"]);
+      expect(store.state.sittingOrder).toEqual(["u2", "u3", "u4", "u1"]);
+      expect(store.sittingSlots().map((s) => s.status)).toEqual(["retry", "pending", "pending", "pending"]);
 
       // Advancing from u1 clears its old session so the tail retry loads fresh and moves to u2.
       store.advanceFromUnit("u1");
@@ -529,8 +537,112 @@ describe("PracticeStore (Solid 2.0)", () => {
       store.advanceFromUnit("u1");
       flush();
       expect(store.state.stage).toEqual({ kind: "sitting-done" });
+      expect(store.sittingPracticedCount()).toBe(4);
+      expect(store.sittingRescheduledCount()).toBe(0);
     } finally {
       dispose();
+    }
+  });
+
+  it("freezes a 3-card sitting across discovery, refresh, leave, and reload, and separates practiced vs rescheduled counts", async () => {
+    const mk = (i: number, due = true) => ({
+      unit_id: `u${i}`,
+      text: `Concept ${i}`,
+      prompt: `Q${i}?`,
+      kind: "move",
+      topic: null,
+      depth: "recall" as const,
+      p_imm: 0.4,
+      reviews: 1,
+      next_in_ms: due ? 0 : 86_400_000,
+      due,
+    });
+    let discovered = false;
+    const seenUrls: string[] = [];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      seenUrls.push(url);
+      if (url.startsWith("/api/frontiers") || url.startsWith("/api/explorations")) {
+        return new Response(JSON.stringify({ frontiers: [], explorations: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const items = discovered
+        ? Array.from({ length: 13 }, (_, idx) => mk(idx + 1, true))
+        : [mk(1, true), mk(2, true), mk(3, true)];
+      return new Response(
+        JSON.stringify({
+          scheduler: "rwkv+fsrs85",
+          total_units: items.length,
+          total_due: items.length,
+          earliest_next_in_ms: null,
+          active_ids: items.map((x) => x.unit_id),
+          items,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    let store!: PracticeStore;
+    let dispose = createRoot((d) => {
+      store = createPracticeStore("user_frozen3", { autoLoad: false });
+      return d;
+    });
+
+    await store.refreshQueue({ selectInitial: true });
+    flush();
+    expect(store.state.sittingIds).toEqual(["u1", "u2", "u3"]);
+
+    // Discover 10 new due units, refresh, leave to Explore, and reload!
+    discovered = true;
+    await store.refreshQueue({ preserveOrder: true });
+    store.selectExplore();
+    flush();
+    expect(store.state.sittingIds).toEqual(["u1", "u2", "u3"]);
+    expect(seenUrls.some((u) => u.includes("include=u1%2Cu2%2Cu3"))).toBe(true);
+    dispose();
+
+    // Re-hydrate from persisted storage: exact same 3 fixed positions remain.
+    dispose = createRoot((d) => {
+      store = createPracticeStore("user_frozen3", { autoLoad: false });
+      return d;
+    });
+    try {
+      await store.refreshQueue({ selectInitial: true });
+      flush();
+      expect(store.state.sittingIds).toEqual(["u1", "u2", "u3"]);
+
+      // Pass u1 which also credits u2 (in sitting) and u9 (NOT in sitting):
+      store.selectUnit("u1");
+      store.markUnitCompleted("u1", ["u2", "u9"]);
+      flush();
+      expect(store.sittingPracticedCount()).toBe(1);
+      expect(store.sittingRescheduledCount()).toBe(1);
+      expect(store.sittingSlots().map((s) => s.status)).toEqual(["pass", "rescheduled", "pending"]);
+
+      // Finish u3 -> lands on sitting-done and persists across reload!
+      store.advanceFromUnit("u1");
+      store.markUnitCompleted("u3");
+      store.advanceFromUnit("u3");
+      flush();
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+      expect(store.sittingPracticedCount()).toBe(2);
+      expect(store.sittingRescheduledCount()).toBe(1);
+      expect(store.sittingFinished()).toBe(true);
+    } finally {
+      dispose();
+    }
+
+    // Reload while on sitting-done -> stays on sitting-done!
+    const dispose2 = createRoot((d) => {
+      store = createPracticeStore("user_frozen3", { autoLoad: false });
+      return d;
+    });
+    try {
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+      await store.refreshQueue({ selectInitial: true });
+      flush();
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+    } finally {
+      dispose2();
     }
   });
 });

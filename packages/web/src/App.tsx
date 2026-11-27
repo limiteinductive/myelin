@@ -448,13 +448,40 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     return practice.dueQueue().some((u) => u.unit_id === s.unitId);
   };
 
-  const practiceDueTotal = () =>
-    practice.remainingCount() > 0 ? practice.remainingCount() : practice.backlogDueCount();
+  /** Size of the sitting the Practice button would start, when it would start one. */
+  const nextSittingSize = () =>
+    !practice.sittingFinished() && practice.dueQueue().length === 0
+      ? Math.min(8, practice.backlogDueCount())
+      : 0;
+
+  // Right rail of the Practice button. A finished sitting reads "Done" and stays that way: the
+  // backlog never rebounds into the rail, it is only offered from the "Done for now" receipt.
+  const practiceRail = (): string | null => {
+    if (practice.sittingFinished()) return "Done";
+    const left = practice.remainingCount();
+    if (left > 0) return String(left);
+    const slots = practice.sittingSlots();
+    if (slots.length > 0) {
+      // Last card of a committed sitting, verdict on screen: count what is still owed (a queued
+      // retry), otherwise the sitting is already done. Never the backlog.
+      const owed = slots.filter((s) => s.status === "active" || s.status === "pending" || s.status === "retry").length;
+      return owed > 0 ? String(owed) : "Done";
+    }
+    if (practice.backlogDueCount() > 0) return String(Math.min(8, practice.backlogDueCount()));
+    const soonest = practice.soonestNextMs();
+    return soonest ? `in ${fmtWait(soonest)}` : null;
+  };
 
   const canOpenPractice = () =>
-    practice.dueQueue().length > 0 || practice.backlogDueCount() > 0;
+    practice.sittingFinished() || practice.dueQueue().length > 0 || practice.backlogDueCount() > 0;
 
   const openPractice = () => {
+    if (practice.sittingFinished()) {
+      // Reopen the receipt; starting another sitting is an explicit choice made there.
+      practice.showSittingDone();
+      closeSidebarOnNarrow();
+      return;
+    }
     const due = practice.dueQueue();
     if (due.length > 0) {
       const curId = stageUnitId();
@@ -514,23 +541,12 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
                     }}
                     disabled={!canOpenPractice()}
                     aria-current={isPracticeActive() ? "true" : undefined}
-                    data-tip={
-                      practice.dueQueue().length === 0 && practice.backlogDueCount() > 0
-                        ? `Start next sitting (${Math.min(8, practice.backlogDueCount())})`
-                        : undefined
-                    }
+                    data-tip={nextSittingSize() > 0 ? `Start a sitting (${nextSittingSize()})` : undefined}
                     onClick={openPractice}
                   >
                     <span class="v2-sidebar-title">Practice</span>
-                    <Show
-                      when={practiceDueTotal() > 0}
-                      fallback={
-                        <Show when={practice.soonestNextMs()}>
-                          {(ms) => <span class="v2-sidebar-count">in {fmtWait(ms())}</span>}
-                        </Show>
-                      }
-                    >
-                      <span class="v2-sidebar-count">{practiceDueTotal()}</span>
+                    <Show when={practiceRail()}>
+                      {(rail) => <span class="v2-sidebar-count">{rail()}</span>}
                     </Show>
                   </button>
                   <Show when={layout().done}>

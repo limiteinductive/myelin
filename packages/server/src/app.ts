@@ -637,6 +637,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           // calibrated FSRS-6 (R=0.85, Build-gear-aware, >=4h floor) for due/next_in_ms spacing.
           s.next_in_ms = cal.next_in_ms;
           s.reviews = cal.reviews;
+          s.scheduled_interval_ms = cal.scheduled_interval_ms;
+          s.schedule_kind = cal.schedule_kind;
         }
       }
       return { scheduler: `${rwkv.name}+fsrs85`, scores: rwkvScores };
@@ -647,7 +649,15 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const cal = calibrated.get(u.id);
       const p = cal && cal.reviews > 0 ? cal.fsrs_recall : u.memory_reviews > 0 ? scheduler.recall(u.memory, now) : 0;
       const due = cal ? cal.next_in_ms : typeof u.memory.due === "number" ? Math.max(0, u.memory.due - now) : null;
-      scores.set(u.id, { unit_id: u.id, p_imm: p, p_rating: [1 - p, 0, p, 0], next_in_ms: due, reviews: cal?.reviews ?? u.memory_reviews });
+      scores.set(u.id, {
+        unit_id: u.id,
+        p_imm: p,
+        p_rating: [1 - p, 0, p, 0],
+        next_in_ms: due,
+        reviews: cal?.reviews ?? u.memory_reviews,
+        scheduled_interval_ms: cal?.scheduled_interval_ms ?? null,
+        schedule_kind: cal?.schedule_kind ?? "first",
+      });
     }
     return { scheduler: scheduler.name, scores };
   }
@@ -939,7 +949,43 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       state,
       scores,
     );
-    const items = candidates.slice(0, 100).map((u) => {
+    const includeParam = (c.req.query("include") ?? "").trim();
+    const includeIds = includeParam
+      ? new Set(
+          includeParam
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .slice(0, 32),
+        )
+      : null;
+
+    let totalDue = 0;
+    let earliestFutureMs: number | null = null;
+    for (const u of candidates) {
+      const s = scores.get(u.id);
+      const reviews = s?.reviews ?? 0;
+      const nextIn = s?.next_in_ms ?? null;
+      const isDue = reviews === 0 || (nextIn !== null ? nextIn <= 0 : (s?.p_imm ?? 0) < 0.85);
+      if (isDue) {
+        totalDue++;
+      } else if (nextIn !== null && nextIn > 0 && (earliestFutureMs === null || nextIn < earliestFutureMs)) {
+        earliestFutureMs = nextIn;
+      }
+    }
+
+    const page = candidates.slice(0, 100);
+    if (includeIds && includeIds.size > 0) {
+      const inPage = new Set(page.map((u) => u.id));
+      for (const u of candidates) {
+        if (includeIds.has(u.id) && !inPage.has(u.id)) {
+          page.push(u);
+          inPage.add(u.id);
+        }
+      }
+    }
+
+    const items = page.map((u) => {
       const s = scores.get(u.id);
       const pImm = s?.p_imm ?? 0;
       const reviews = s?.reviews ?? 0;
@@ -985,6 +1031,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     return c.json({
       scheduler,
       total_units: candidates.length,
+      total_due: totalDue,
+      earliest_next_in_ms: totalDue === 0 ? earliestFutureMs : null,
       active_ids: candidates.map((u) => u.id),
       active_attempts: store.getActiveAttempts().map((a) => ({
         attempt_id: a.attempt_id,
@@ -1805,6 +1853,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       let probeId: string | null = null;
       let nextInMs: number | null = null;
+      let scheduledIntervalMs: number | null = null;
+      let scheduleKind: RwkvUnitScore["schedule_kind"] = undefined;
+      let nextDepth: Depth | null = null;
+      const prevIntervalMs = preScore?.scheduled_interval_ms ?? null;
+      const prevScheduleKind = preScore?.schedule_kind ?? "first";
       const creditedUnitIds: string[] = [];
       if (verdict.ok && !verdict.failed) {
         const ev = makeEvent(
@@ -1870,7 +1923,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
 
         const after = scoreAll(store.state, store.scheduler, now + 12, store.listUnitDueOverrides());
-        nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
+        const afterScore = after.scores.get(u.id);
+        nextInMs = afterScore?.next_in_ms ?? null;
+        scheduledIntervalMs = afterScore?.scheduled_interval_ms ?? null;
+        scheduleKind = afterScore?.schedule_kind;
         // Include any due rests_on prerequisites that became non-due via downward DAG credit.
         for (const pid of u.rests_on) {
           const beforeScore = scores.get(pid);
@@ -1882,6 +1938,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
         const postState = store.state;
         const refreshedU = postState.units[u.id] ?? u;
+        nextDepth = pickDrillDepth(refreshedU, postState);
         const postCandidates = rankDrillCandidates(
           Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only && x.id !== u.id),
           postState,
@@ -1915,6 +1972,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         latency_ms: latencyMs,
         prev_latency_ms: trend.prev_ms,
         next_in_ms: nextInMs,
+        prev_interval_ms: prevIntervalMs,
+        prev_schedule_kind: prevScheduleKind,
+        scheduled_interval_ms: scheduledIntervalMs,
+        ...(scheduleKind ? { schedule_kind: scheduleKind } : {}),
+        ...(nextDepth ? { next_depth: nextDepth } : {}),
         scheduler,
       };
 
@@ -2053,6 +2115,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       let probeId: string | null = null;
       let nextInMs: number | null = null;
+      let scheduledIntervalMs: number | null = null;
+      let scheduleKind: RwkvUnitScore["schedule_kind"] = undefined;
+      let nextDepth: Depth | null = null;
+      const prevIntervalMs = preScore?.scheduled_interval_ms ?? null;
+      const prevScheduleKind = preScore?.schedule_kind ?? "first";
       const creditedUnitIds: string[] = [];
       if (verdict.ok && !verdict.failed) {
         const storedHints =
@@ -2119,7 +2186,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           }
         }
         const after = scoreAll(store.state, store.scheduler, now + 12, store.listUnitDueOverrides());
-        nextInMs = after.scores.get(u.id)?.next_in_ms ?? null;
+        const afterScore = after.scores.get(u.id);
+        nextInMs = afterScore?.next_in_ms ?? null;
+        scheduledIntervalMs = afterScore?.scheduled_interval_ms ?? null;
+        scheduleKind = afterScore?.schedule_kind;
         for (const pid of u.rests_on) {
           const beforeScore = scores.get(pid);
           const afterScore = after.scores.get(pid);
@@ -2130,6 +2200,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         // Pre-warm this unit's next variant/depth plus top upcoming due cards so the next load is ~80ms.
         const postState = store.state;
         const refreshedU = postState.units[u.id] ?? u;
+        nextDepth = pickDrillDepth(refreshedU, postState);
         const postCandidates = rankDrillCandidates(
           Object.values(postState.units).filter((x) => x.status === "active" && !x.observe_only && x.id !== u.id),
           postState,
@@ -2163,6 +2234,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         latency_ms: latencyMs,
         prev_latency_ms: trend.prev_ms,
         next_in_ms: nextInMs,
+        prev_interval_ms: prevIntervalMs,
+        prev_schedule_kind: prevScheduleKind,
+        scheduled_interval_ms: scheduledIntervalMs,
+        ...(scheduleKind ? { schedule_kind: scheduleKind } : {}),
+        ...(nextDepth ? { next_depth: nextDepth } : {}),
         scheduler,
       };
 

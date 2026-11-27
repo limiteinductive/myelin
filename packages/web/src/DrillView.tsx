@@ -1,7 +1,7 @@
 // Progressive Solveit-style Practice, Briefing & Exploration stage:
 // Always ONE single active pad at the bottom. Reads and writes directly into the account-scoped
 // PracticeStore (zero duplicated session signals, zero module-level globals, zero flush races).
-import { uuidv7 } from "@myelin/core";
+import { uuidv7, type Depth } from "@myelin/core";
 import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, snapshot, Switch, useContext } from "solid-js";
 import {
   buildAnnotatedLines,
@@ -26,7 +26,7 @@ import {
   type CheckDrillResponse,
   type Frontier,
 } from "./drillApi.js";
-import { PracticeContext, sessionHasWork, type Beat } from "./practiceStore.js";
+import { PracticeContext, sessionHasWork, type Beat, type SittingSlot, type SittingSlotStatus } from "./practiceStore.js";
 import { handlePadIndentKey } from "./padKeys.js";
 import { Body, inline, mathOnly } from "./text.js";
 
@@ -209,6 +209,47 @@ function fmtDur(ms: number): string {
   const h = Math.round(m / 60);
   if (h < 36) return `${h}h`;
   return `${Math.round(h / 24)}d`;
+}
+
+const DEPTH_LABEL: Record<Depth, string> = {
+  recall: "recall",
+  rebuild: "rebuild",
+  explain: "explain",
+  use: "apply",
+};
+
+/** Slot states that are finished for this sitting (a `retry` still owes its end-of-sitting attempt). */
+const isSlotResolved = (status: SittingSlotStatus) =>
+  status === "pass" || status === "missed" || status === "rescheduled" || status === "removed";
+
+/**
+ * The committed sitting as a fixed row of hairline ticks, one per slot in locked order.
+ * Carries no unit names, prompts or topics: position and state only.
+ */
+function SittingHairline(props: { slots: readonly SittingSlot[]; receipt?: boolean }) {
+  const label = () => {
+    const total = props.slots.length;
+    const resolved = props.slots.filter((s) => isSlotResolved(s.status)).length;
+    const retry = props.slots.filter((s) => s.status === "retry").length;
+    return `Sitting progress: ${resolved} of ${total} resolved${retry > 0 ? `, ${retry} to retry` : ""}`;
+  };
+  return (
+    <div class={{ "v2-sitting-line": true, "is-receipt": Boolean(props.receipt) }} role="img" aria-label={label()}>
+      <For each={props.slots} keyed={(s) => s.unitId}>
+        {(s) => (
+          <span
+            class={{
+              "v2-sitting-tick": true,
+              "is-active": s().status === "active",
+              "is-pass": s().status === "pass",
+              "is-retry": s().status === "retry",
+              "is-closed": s().status === "missed" || s().status === "rescheduled" || s().status === "removed",
+            }}
+          />
+        )}
+      </For>
+    </div>
+  );
 }
 
 function QuoteIcon() {
@@ -1972,36 +2013,60 @@ export function DrillView() {
     }
   };
 
-  const latencyTrace = () => {
-    const v = passedVerdict();
-    if (!v || !v.ok || v.latency_ms === null) return "";
-    const delta = v.prev_latency_ms !== null ? v.prev_latency_ms - v.latency_ms : null;
-    const faster = delta !== null && delta >= 2000 ? ` (${fmtDur(delta)} faster)` : "";
-    return `${fmtDur(v.latency_ms)}${faster}`;
-  };
-
+  // One truthful scheduling line. Answer time is deliberately not shown or compared: the timer
+  // measures typing activity, so it penalises thinking pauses and rewards shorter answers.
   const intervalLabel = () => {
     const v = passedVerdict();
     if (!v || !v.ok) return "";
+    const lapse = v.grade === "again";
+    const soon = (ms: number) =>
+      lapse && ms < 4 * 3_600_000 ? `back soon (~${fmtDur(ms)})` : `next ~${fmtDur(ms)}`;
     const preview = previewDelayMs();
-    if (preview !== null) {
-      return v.grade === "again" && preview < 4 * 3_600_000
-        ? `back soon (~${fmtDur(preview)})`
-        : `next ~${fmtDur(preview)}`;
+    if (preview !== null) return soon(preview);
+    const next = v.next_in_ms !== null && v.next_in_ms > 0 ? v.next_in_ms : null;
+    if (overridden()) return next !== null ? `next ~${fmtDur(next)}` : "scheduled";
+    if (lapse && practice.state.sittingRetryIds[sessionKey()]) return "end of sitting";
+    if (next === null) return lapse ? "back soon" : "";
+    if (v.schedule_kind === "relearn") return `relearn · next ~${fmtDur(next)}`;
+    const prev = v.prev_interval_ms;
+    const planned = v.scheduled_interval_ms;
+    if (
+      v.schedule_kind === "normal" &&
+      v.prev_schedule_kind !== "first" &&
+      v.prev_schedule_kind !== "override" &&
+      typeof prev === "number" &&
+      prev > 0 &&
+      typeof planned === "number" &&
+      planned > 0 &&
+      fmtDur(prev) !== fmtDur(planned) &&
+      fmtDur(prev) !== fmtDur(next)
+    ) {
+      return `~${fmtDur(prev)} → ~${fmtDur(next)}`;
     }
-    if (v.grade === "again") {
-      if (!overridden() && practice.state.sittingRetryIds[sessionKey()]) {
-        return "end of sitting";
-      }
-      if (v.next_in_ms !== null && v.next_in_ms > 0) {
-        return v.next_in_ms < 4 * 3_600_000
-          ? `back soon (~${fmtDur(v.next_in_ms)})`
-          : `next ~${fmtDur(v.next_in_ms)}`;
-      }
-      return "back soon";
-    }
-    if (v.next_in_ms !== null && v.next_in_ms > 0) return `next ~${fmtDur(v.next_in_ms)}`;
-    return overridden() ? "scheduled" : "";
+    return soon(next);
+  };
+
+  // What the next rep will ask for, when it differs from this one. Stated as an assignment, not an award.
+  const nextDepthNote = () => {
+    const v = passedVerdict();
+    const depth = rep()?.depth;
+    if (!v || !v.ok || v.grade === "again" || !v.next_depth || !depth || v.next_depth === depth) return "";
+    return `next time: ${DEPTH_LABEL[v.next_depth]}`;
+  };
+
+  const inSittingLine = () => {
+    const id = activeUnitId();
+    return !isNonUnit() && Boolean(id) && practice.sittingSlots().some((s) => s.unitId === id);
+  };
+
+  const receiptSummary = () => {
+    const p = practice.sittingPracticedCount();
+    const r = practice.sittingRescheduledCount();
+    const rescheduled = (related: boolean) =>
+      `${r} ${related ? "related " : ""}${r === 1 ? "review was" : "reviews were"} rescheduled.`;
+    if (p === 0) return r > 0 ? rescheduled(false) : "";
+    const practiced = `You practiced ${p} ${p === 1 ? "unit" : "units"}.`;
+    return r > 0 ? `${practiced} ${rescheduled(true)}` : practiced;
   };
 
   const posOf = (e: PointerEvent) => {
@@ -2069,32 +2134,29 @@ export function DrillView() {
           when={!isSittingDone()}
           fallback={
             <div class="v2-sitting-done">
-              <div class="v2-sitting-done-badge">
-                <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M3.2 8.4l3.2 3.2 6.4-7" />
-                </svg>
-                <span>Sitting complete</span>
-              </div>
-              <h1 class="v2-prompt">
-                {practice.sittingDoneCount() === 1
-                  ? "1 card cleared."
-                  : `${practice.sittingDoneCount()} cards cleared.`}
-              </h1>
-              <p class="v2-sitting-done-sub">
-                {practice.backlogDueCount() > 0
-                  ? `${practice.backlogDueCount()} more due card${practice.backlogDueCount() === 1 ? "" : "s"} waiting whenever you want another sitting.`
-                  : "Everything due right now is scheduled for later. Great stopping point."}
-              </p>
+              <Show when={practice.sittingSlots().length > 0}>
+                <SittingHairline slots={practice.sittingSlots()} receipt />
+              </Show>
+              <h1 class="v2-prompt">Done for now.</h1>
+              <Show when={receiptSummary()}>
+                <p class="v2-sitting-done-sub">{receiptSummary()}</p>
+              </Show>
+              <Show when={practice.sittingReconstructed().length > 0}>
+                <ul class="v2-sitting-done-notes">
+                  <For each={practice.sittingReconstructed().slice(0, 2)} keyed={(item) => item.unitId}>
+                    {(item) => (
+                      <li>
+                        Reconstructed <span class="v2-sitting-done-unit">{inline(item().label)}</span> on the
+                        second try.
+                      </li>
+                    )}
+                  </For>
+                </ul>
+              </Show>
+              <Show when={practice.soonestNextMs()}>
+                {(ms) => <p class="v2-sitting-done-next">Next review in {fmtDur(ms())}.</p>}
+              </Show>
               <div class="v2-sitting-done-actions">
-                <Show when={practice.backlogDueCount() > 0}>
-                  <button
-                    type="button"
-                    class="v2-btn-primary"
-                    onClick={() => practice.startNextSitting()}
-                  >
-                    Start next sitting ({Math.min(8, practice.backlogDueCount())})
-                  </button>
-                </Show>
                 <button
                   type="button"
                   class="v2-btn-secondary"
@@ -2102,10 +2164,22 @@ export function DrillView() {
                 >
                   Explore something new
                 </button>
+                <Show when={practice.backlogDueCount() > 0}>
+                  <button
+                    type="button"
+                    class="v2-btn-secondary"
+                    onClick={() => practice.startNextSitting()}
+                  >
+                    Start another sitting ({Math.min(8, practice.backlogDueCount())})
+                  </button>
+                </Show>
               </div>
             </div>
           }
         >
+        <Show when={inSittingLine()}>
+          <SittingHairline slots={practice.sittingSlots()} />
+        </Show>
         <div class="v2-prompt-wrap">
           <Switch fallback={<h1 class="v2-prompt v2-prompt--open">What do you want to work through?</h1>}>
             <Match when={activeExploration()}>
@@ -2446,12 +2520,6 @@ export function DrillView() {
                         <Show when={isFinalPass()}>
                           <div class="v2-verdict-foot">
                             <span class="v2-verdict-trace">
-                              <Show when={latencyTrace()}>
-                                <span>{latencyTrace()}</span>
-                                <Show when={intervalLabel()}>
-                                  <span aria-hidden="true"> · </span>
-                                </Show>
-                              </Show>
                               <Show when={intervalLabel()}>
                                 <Show
                                   when={rep()?.unit_id}
@@ -2476,6 +2544,14 @@ export function DrillView() {
                                     </svg>
                                   </button>
                                 </Show>
+                              </Show>
+                              <Show when={nextDepthNote()}>
+                                <span class="v2-verdict-note">
+                                  <Show when={intervalLabel()}>
+                                    <span aria-hidden="true"> · </span>
+                                  </Show>
+                                  {nextDepthNote()}
+                                </span>
                               </Show>
                             </span>
                             <div class="v2-pass-actions">
