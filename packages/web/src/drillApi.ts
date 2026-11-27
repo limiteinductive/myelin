@@ -23,14 +23,42 @@ export interface McqChoice {
   text: string;
 }
 
-export type McqOutcome = "correct" | "assisted_correct" | "wrong" | "revealed";
+export type McqOutcome = "correct" | "assisted_correct" | "wrong" | "idk" | "revealed";
+export type McqRole = "standalone" | "preliminary";
 
 export interface McqResult {
+  role?: McqRole;
   outcome: McqOutcome;
   selected_choice_id: string | null;
   correct_id: string;
   explanation: string;
   why_wrong_selected: string | null;
+  worked_step?: string | null;
+  can_continue_production?: boolean;
+  next_review_mode?: "relearn" | "production" | "any";
+}
+
+export interface GateSummary {
+  prompt: string;
+  chosen_text: string;
+  outcome: McqOutcome;
+  assisted?: boolean;
+  continued_after_miss?: boolean;
+  choices?: McqChoice[];
+  correct_id?: string | null;
+  selected_choice_id?: string | null;
+  explanation?: string | null;
+  why_wrong_selected?: string | null;
+  worked_step?: string | null;
+}
+
+export interface GateNextStage {
+  attempt_id: string;
+  depth: Depth;
+  prompt: string;
+  modality: RepModality;
+  starter?: string | null;
+  gate_summary: GateSummary;
 }
 
 export interface ActiveAttempt {
@@ -39,7 +67,9 @@ export interface ActiveAttempt {
   depth: Depth;
   prompt: string;
   modality?: RepModality;
-  mcq?: { choices: McqChoice[] };
+  starter?: string | null;
+  mcq?: { role?: McqRole; choices: McqChoice[] };
+  gate_summary?: GateSummary | null;
   turns: { user: string; coach: string; kind?: "clarify" | "starter"; failed?: boolean; annotations?: InlineAnnotation[]; added?: AddedUnit[] }[];
   assistance_count: number;
   active_ms: number | null;
@@ -104,7 +134,8 @@ export interface DrillRep {
   prompt: string;
   modality?: RepModality;
   attempt_id?: string;
-  mcq?: { choices: McqChoice[] };
+  mcq?: { role?: McqRole; choices: McqChoice[] };
+  gate_summary?: GateSummary | null;
   starter?: string | null;
   bundled_unit_ids?: string[];
   rests_on: string[];
@@ -144,6 +175,9 @@ export interface CheckDrillResponse {
   next_depth?: Depth;
   scheduler: string;
   mcq_result?: McqResult;
+  gate_passed?: boolean;
+  gate_transition?: "production";
+  next_stage?: GateNextStage;
   jev?: {
     model: string;
     latency_ms: number;
@@ -502,6 +536,7 @@ export function fetchNextDrill(
     sittingId?: string | null;
     sittingSize?: number | null;
     directDone?: number | null;
+    compact?: boolean;
     manual?: boolean;
     retry?: boolean;
     nextIds?: readonly string[];
@@ -514,6 +549,7 @@ export function fetchNextDrill(
   if (opts.sittingId) qs.set("sitting_id", opts.sittingId);
   if (typeof opts.sittingSize === "number" && opts.sittingSize > 0) qs.set("sitting_size", String(opts.sittingSize));
   if (typeof opts.directDone === "number" && opts.directDone >= 0) qs.set("direct_done", String(opts.directDone));
+  if (opts.compact) qs.set("compact", "1");
   if (opts.manual) qs.set("manual", "1");
   if (opts.retry) qs.set("retry", "1");
   const nextClean = opts.nextIds?.filter(Boolean).slice(0, 6) ?? [];
@@ -527,7 +563,9 @@ export function submitMcqChoice(
     attempt_id: string;
     unit_id: string;
     choice_id?: string;
+    idk?: boolean;
     reveal?: boolean;
+    continue_to_production?: boolean;
     latency_ms: number | null;
   },
   signal?: AbortSignal,

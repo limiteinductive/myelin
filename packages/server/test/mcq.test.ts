@@ -8,6 +8,7 @@ import { FastJudge, validateMcqSpec } from "../src/judge.js";
 import { Registry } from "../src/registry.js";
 import {
   computeCalibratedIntervals,
+  decideMcqRole,
   hasPendingMcqProductionCheck,
   isMcqEligible,
   MCQ_CLEAN_DELAY_MS,
@@ -58,6 +59,18 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
     expect(valid).not.toBeNull();
     expect(valid!.choices).toHaveLength(4);
     expect(valid!.correct_id).toBe("opt1");
+
+    // Accepts 3 substantive options (when a 4th would be filler) plus optional worked_step
+    const valid3 = validateMcqSpec({
+      choices: VALID_MCQ_RAW.choices.slice(0, 3),
+      correct_id: "opt1",
+      explanation: VALID_MCQ_RAW.explanation,
+      why_wrong: { opt2: VALID_MCQ_RAW.why_wrong.opt2, opt3: VALID_MCQ_RAW.why_wrong.opt3 },
+      worked_step: "Check $Y = X^2$ with symmetric $X \\sim \\mathcal{N}(0,1)$: $E[XY] = E[X^3] = 0$.",
+    });
+    expect(valid3).not.toBeNull();
+    expect(valid3!.choices).toHaveLength(3);
+    expect(valid3!.worked_step).toContain("Y = X^2");
 
     // Rejects "all of the above" meta-option
     expect(
@@ -371,7 +384,7 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
-      if (bodyStr.includes("diagnostic 4-choice MCQ")) {
+      if (bodyStr.includes("competitive 3- or 4-choice MCQ")) {
         return new Response(
           JSON.stringify({ choices: [{ message: { content: JSON.stringify(VALID_MCQ_RAW) } }] }),
           { status: 200, headers: { "content-type": "application/json" } },
@@ -423,10 +436,8 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
     ]);
 
     const sittingId = uuidv7();
-    // Gate check: sitting_size < 8, direct_done < 2, manual=1, and retry=1 all stay on open contrast!
+    // Gate check: manual=1 and retry=1 always stay on open contrast!
     for (const qs of [
-      `unit_id=${u1}&sitting_id=${sittingId}&sitting_size=5&direct_done=2`,
-      `unit_id=${u1}&sitting_id=${sittingId}&sitting_size=8&direct_done=1`,
       `unit_id=${u1}&sitting_id=${sittingId}&sitting_size=8&direct_done=2&manual=1`,
       `unit_id=${u1}&sitting_id=${sittingId}&sitting_size=8&direct_done=2&retry=1`,
     ]) {
@@ -436,9 +447,9 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
       expect(d.rep.mcq).toBeUndefined();
     }
 
-    // Eligible request issues MCQ with opaque IDs and ZERO secret answer fields!
+    // Eligible request (even in slot 1, direct_done=0!) issues standalone MCQ with opaque IDs and ZERO secret answer fields!
     const mcqRes1 = await app.request(
-      `/api/drill/next?unit_id=${u1}&sitting_id=${sittingId}&sitting_size=8&direct_done=2`,
+      `/api/drill/next?unit_id=${u1}&sitting_id=${sittingId}&sitting_size=8&direct_done=0`,
       { headers: authed() },
     );
     expect(mcqRes1.status).toBe(200);
@@ -447,22 +458,41 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
         attempt_id: string;
         modality: string;
         prompt: string;
-        mcq: { choices: { id: string; text: string }[]; correct_id?: unknown; why_wrong?: unknown };
+        mcq: { role?: string; choices: { id: string; text: string }[]; correct_id?: unknown; why_wrong?: unknown };
       };
     };
     expect(mcq1.rep.modality).toBe("mcq");
+    expect(mcq1.rep.mcq.role).toBe("standalone");
     expect(mcq1.rep.attempt_id).toBeTruthy();
     expect(mcq1.rep.mcq.choices).toHaveLength(4);
     expect(mcq1.rep.mcq.correct_id).toBeUndefined();
     expect(mcq1.rep.mcq.why_wrong).toBeUndefined();
 
-    // Second eligible unit in the SAME sitting MUST fall back to open contrast (max 1 MCQ per sitting!)
+    // Second eligible unit in an 8-slot desktop sitting gets the 2nd standalone slot (budget = 2)!
     const u2Res = await app.request(
-      `/api/drill/next?unit_id=${u2}&sitting_id=${sittingId}&sitting_size=8&direct_done=3`,
+      `/api/drill/next?unit_id=${u2}&sitting_id=${sittingId}&sitting_size=8&direct_done=0`,
       { headers: authed() },
     );
-    const u2Data = (await u2Res.json()) as { rep: { modality: string } };
-    expect(u2Data.rep.modality).toBe("contrast");
+    const u2Data = (await u2Res.json()) as { rep: { modality: string; mcq?: { role?: string } } };
+    expect(u2Data.rep.modality).toBe("mcq");
+    expect(u2Data.rep.mcq?.role).toBe("standalone");
+
+    // A 3rd eligible unit in the same desktop sitting respects the 2-standalone desktop budget and falls back to contrast!
+    const u3 = uuidv7(sixHoursAgo - 500);
+    store.append([
+      makeEvent(
+        "unit.found",
+        { unit_id: u3, text: "Orthogonality vs uncorrelatedness when means are non-zero.", kind: "concept", topic: "Covariance", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(sixHoursAgo - 500), device_id: "server:drill", ts: sixHoursAgo - 500 },
+      ),
+    ]);
+    const u3Res = await app.request(
+      `/api/drill/next?unit_id=${u3}&sitting_id=${sittingId}&sitting_size=8&direct_done=0`,
+      { headers: authed() },
+    );
+    const u3Data = (await u3Res.json()) as { rep: { modality: string; mcq?: unknown } };
+    expect(u3Data.rep.modality).not.toBe("mcq");
+    expect(u3Data.rep.mcq).toBeUndefined();
 
     // Reloading u1 returns the EXACT frozen attempt_id and option order with ZERO extra LLM calls!
     const callsBeforeReload = llmCalls;
@@ -569,7 +599,251 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
     expect(u1Evidence).toHaveLength(2);
     const mcqEv = store.state.evidence[gradeData.probe_id]!;
     expect(mcqEv.modality).toBe("mcq");
+    expect(mcqEv.mcq_role).toBe("standalone");
     expect(mcqEv.mcq_outcome).toBe("assisted_correct");
     expect(store.state.units[u1]!.memory_reviews).toBe(1);
+  });
+
+  it("supports v2 standalone FSRS credit, explicit IDK, and two-stage preliminary gate pass/miss/resume/anti-spoiler", async () => {
+    dir = mkdtempSync(join(tmpdir(), "myelin-mcq-v2-"));
+    registry = new Registry(dir);
+    stores = new Stores(dir);
+    const user = registry.createUser("ben");
+    const link = registry.issueLink(user.id);
+
+    let leakMode = false;
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const bodyStr = String(init?.body ?? "");
+      if (bodyStr.includes("preliminary MCQ gate before a production problem")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    chosen_id: "g1",
+                    leaks_production: leakMode,
+                    reason: leakMode ? "Leaks max-shift formula" : "Clean prerequisite check",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("PRELIMINARY CHECK")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    prompt: "For a 3x4 logit matrix, computing row-wise log-sum-exp at row 2 depends on which entries?",
+                    expected_crux: "Only the 4 entries in row 2 contribute to row 2's reduction.",
+                    choices: [
+                      { id: "g1", text: "All 4 entries in row 2 along dim=-1." },
+                      { id: "g2", text: "All 3 entries in column 2 along dim=0." },
+                      { id: "g3", text: "Every entry across all 3 rows and 4 columns." },
+                    ],
+                    correct_id: "g1",
+                    explanation: "Row-wise reduction aggregates across columns (dim=-1) independently for each row.",
+                    why_wrong: {
+                      g2: "Reducing along dim=0 mixes different rows instead of normalizing a single row.",
+                      g3: "Global reduction collapses the entire matrix into a single scalar.",
+                    },
+                    worked_step: "For row 2, extract $z_{2,0}, z_{2,1}, z_{2,2}, z_{2,3}$ and reduce along `dim=-1`.",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("blind verifier")) {
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: JSON.stringify({ chosen_id: "opt1", reason: "Unique." }) } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("competitive 3- or 4-choice MCQ")) {
+        return new Response(
+          JSON.stringify({ choices: [{ message: { content: JSON.stringify(VALID_MCQ_RAW) } }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      // Production prompt or production grader
+      if (bodyStr.includes("Write ONE concise") || bodyStr.includes("micro-production prompt") || bodyStr.includes("starter")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    prompt: "Implement numerically stable row-wise log-sum-exp in PyTorch.",
+                    expected_crux: "Subtract row max with keepdim=True before exp, sum along dim=-1, log, add max back.",
+                    starter: "def logsumexp_rows(x):\n    m = x.max(dim=-1, keepdim=True).values\n    return ___",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  ok: true,
+                  grade: "good",
+                  message: "Clean max-shift implementation.",
+                  annotations: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const app = createApp({ registry, stores, judge: new FastJudge({ apiKey: "test-key", fetchFn: mockFetch }), dataDir: dir });
+    const loginRes = await app.request("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link }),
+    });
+    const cookie = loginRes.headers.get("set-cookie")!.split(";")[0]!;
+    const authed = (headers: Record<string, string> = {}) => ({ cookie, ...headers });
+
+    const store = stores.get(user.id);
+    const now = Date.now();
+    const uConcept = uuidv7(now - 3000);
+    const uCode = uuidv7(now - 2000);
+    const uCode2 = uuidv7(now - 1000);
+    store.append([
+      makeEvent(
+        "unit.found",
+        { unit_id: uConcept, text: "Zero covariance does not imply statistical independence.", kind: "concept", topic: "Probability", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 3000), device_id: "server:drill", ts: now - 3000 },
+      ),
+      makeEvent(
+        "unit.found",
+        { unit_id: uCode, text: "Implement stable row-wise logsumexp in torch using dim=-1 and keepdim=True.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 2000), device_id: "server:drill", ts: now - 2000 },
+      ),
+      makeEvent(
+        "unit.found",
+        { unit_id: uCode2, text: "Implement stable softmax backward in torch along dim=-1.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 1000), device_id: "server:drill", ts: now - 1000 },
+      ),
+    ]);
+
+    // 1. Standalone MCQ on a `concept` unit works immediately, and clean correct advances FSRS conservatively!
+    const sitting1 = uuidv7();
+    const cRes = await app.request(`/api/drill/next?unit_id=${uConcept}&sitting_id=${sitting1}&sitting_size=4`, { headers: authed() });
+    const cData = (await cRes.json()) as { rep: { attempt_id: string; modality: string; mcq: { role: string; choices: { id: string; text: string }[] } } };
+    expect(cData.rep.modality).toBe("mcq");
+    expect(cData.rep.mcq.role).toBe("standalone");
+    const cRight = cData.rep.mcq.choices.find((ch) => ch.text.includes("uncorrelated"))!;
+    const cGrade = await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({ attempt_id: cData.rep.attempt_id, unit_id: uConcept, choice_id: cRight.id, latency_ms: 4200 }),
+      })
+    ).json() as { ok: boolean; grade: string; next_in_ms: number; mcq_result: { outcome: string; role: string; next_review_mode: string } };
+    expect(cGrade.ok).toBe(true);
+    expect(cGrade.grade).toBe("hard");
+    expect(cGrade.mcq_result.outcome).toBe("correct");
+    expect(cGrade.mcq_result.role).toBe("standalone");
+    expect(cGrade.mcq_result.next_review_mode).toBe("any");
+    expect(cGrade.next_in_ms).toBeGreaterThanOrEqual(11 * 3_600_000); // real FSRS review interval, not 4h v1 pending check!
+    store.catchUp();
+    expect(store.state.units[uConcept]!.memory_reviews).toBe(1);
+    // Back-to-back MCQ guard: next review on uConcept must require cold production!
+    expect(decideMcqRole(store.state.units[uConcept]!, store.state, "recall", "direct", { sittingSize: 8, standaloneUsed: 0, preliminaryUsed: 0 }).role).toBe("none");
+
+    // 2. Anti-spoiler verifier rejects leaking preliminary gate -> falls back cleanly to ordinary production!
+    leakMode = true;
+    const leakRes = await (
+      await app.request(`/api/drill/next?unit_id=${uCode}&sitting_id=${sitting1}&sitting_size=8`, { headers: authed() })
+    ).json() as { rep: { modality: string; mcq?: unknown } };
+    expect(leakRes.rep.modality).not.toBe("mcq");
+    expect(leakRes.rep.mcq).toBeUndefined();
+
+    // 3. Clean preliminary gate -> Pass Stage 1 -> zero probe emitted yet -> atomic Stage 2 resume -> Stage 2 settle emits 1 probe!
+    leakMode = false;
+    const sitting2 = uuidv7();
+    const gRes = await (
+      await app.request(`/api/drill/next?unit_id=${uCode}&sitting_id=${sitting2}&sitting_size=8`, { headers: authed() })
+    ).json() as { rep: { attempt_id: string; modality: string; mcq: { role: string; choices: { id: string; text: string }[] } } };
+    expect(gRes.rep.modality).toBe("mcq");
+    expect(gRes.rep.mcq.role).toBe("preliminary");
+    expect(gRes.rep.mcq.choices).toHaveLength(3);
+    const gRight = gRes.rep.mcq.choices.find((ch) => ch.text.includes("row 2"))!;
+    const gPass = await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({ attempt_id: gRes.rep.attempt_id, unit_id: uCode, choice_id: gRight.id, latency_ms: 3500 }),
+      })
+    ).json() as { ok: boolean; gate_passed: boolean; next_stage: { attempt_id: string; prompt: string; gate_summary: { chosen_text: string } } };
+    expect(gPass.ok).toBe(true);
+    expect(gPass.gate_passed).toBe(true);
+    expect(gPass.next_stage.attempt_id).toBe(gRes.rep.attempt_id);
+    expect(gPass.next_stage.prompt).toContain("log-sum-exp");
+    expect(gPass.next_stage.gate_summary.chosen_text).toContain("row 2");
+
+    // Zero probe events emitted on gate pass (paired rep counts ONCE when Stage 2 finishes!)
+    store.catchUp();
+    expect(Object.values(store.state.evidence).filter((e) => e.unit_id === uCode)).toHaveLength(0);
+
+    // Reloading or resuming on another device restores Stage 2 directly with collapsed gate_summary!
+    const resumeRes = await (
+      await app.request(`/api/drill/next?unit_id=${uCode}&sitting_id=${sitting2}&sitting_size=8`, { headers: authed() })
+    ).json() as { rep: { attempt_id: string; modality: string; prompt: string; gate_summary?: { chosen_text: string } } };
+    expect(resumeRes.rep.attempt_id).toBe(gRes.rep.attempt_id);
+    expect(resumeRes.rep.modality).not.toBe("mcq");
+    expect(resumeRes.rep.prompt).toContain("log-sum-exp");
+    expect(resumeRes.rep.gate_summary?.chosen_text).toContain("row 2");
+
+    // 4. Explicit IDK on a preliminary gate short-circuits cleanly & allows "Try the full problem anyway"!
+    const sitting3 = uuidv7();
+    const g2Res = await (
+      await app.request(`/api/drill/next?unit_id=${uCode2}&sitting_id=${sitting3}&sitting_size=8`, { headers: authed() })
+    ).json() as { rep: { attempt_id: string; modality: string; mcq: { role: string } } };
+    expect(g2Res.rep.modality).toBe("mcq");
+    expect(g2Res.rep.mcq.role).toBe("preliminary");
+    const idkRes = await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({ attempt_id: g2Res.rep.attempt_id, unit_id: uCode2, idk: true, latency_ms: 2100 }),
+      })
+    ).json() as { ok: boolean; grade: string; probe_id: string; mcq_result: { outcome: string; role: string; worked_step: string | null; can_continue_production: boolean } };
+    expect(idkRes.ok).toBe(true);
+    expect(idkRes.grade).toBe("again");
+    expect(idkRes.mcq_result.outcome).toBe("idk");
+    expect(idkRes.mcq_result.role).toBe("preliminary");
+    expect(idkRes.mcq_result.worked_step).toContain("dim=-1");
+    expect(idkRes.mcq_result.can_continue_production).toBe(true);
+
+    // "Try the full problem anyway" spawns a fresh guided Stage 2 attempt without mutating Stage 1's settled attempt!
+    const contRes = await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({ attempt_id: g2Res.rep.attempt_id, unit_id: uCode2, continue_to_production: true }),
+      })
+    ).json() as { ok: boolean; gate_transition: string; attempt_id: string; next_stage: { attempt_id: string; gate_summary: { continued_after_miss: boolean } } };
+    expect(contRes.ok).toBe(true);
+    expect(contRes.gate_transition).toBe("production");
+    expect(contRes.attempt_id).not.toBe(g2Res.rep.attempt_id);
+    expect(contRes.next_stage.gate_summary.continued_after_miss).toBe(true);
   });
 });

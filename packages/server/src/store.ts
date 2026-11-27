@@ -12,6 +12,9 @@ import {
   newPage,
   PageEditError,
   parseEvent,
+  type Depth,
+  type McqOutcome,
+  type McqRole,
   type MyelinEvent,
   type PageState,
   type Scheduler,
@@ -47,17 +50,37 @@ export interface StoredMcqChoice {
   text: string;
 }
 
+export interface StoredMcqProduction {
+  depth: Depth;
+  prompt: string;
+  modality: string;
+  starter?: string | null;
+  expected_crux?: string | null;
+}
+
 export interface StoredMcqAttempt {
   item_id: string;
   version: number;
+  role?: McqRole;
   choices: StoredMcqChoice[];
   correct_id: string;
   explanation: string;
   why_wrong: Record<string, string>;
+  worked_step?: string | null;
   sitting_id?: string | null;
   assisted?: boolean;
   selected_choice_id?: string | null;
-  outcome?: "correct" | "assisted_correct" | "wrong" | "revealed" | null;
+  outcome?: McqOutcome | null;
+  /** Two-stage preliminary gate phase: "gate" -> "production" (on pass) or "settled" (on short-circuit). */
+  phase?: "gate" | "production" | "settled";
+  /** Original Stage 1 gate stem preserved when attempt transitions to Stage 2 production. */
+  gate_prompt?: string | null;
+  /** Paired production exercise held server-side for Stage 2 of a preliminary gate. */
+  production?: StoredMcqProduction | null;
+  gate_latency_ms?: number | null;
+  gate_passed_at?: number | null;
+  /** True when the learner missed/IDK'd a preliminary gate and opted into "Try the full problem anyway". */
+  gate_continued?: boolean;
 }
 
 export interface DrillAttemptRecord {
@@ -239,12 +262,34 @@ export class EventStore {
         created_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS mcq_issuances (
-        sitting_id TEXT PRIMARY KEY,
+        attempt_id TEXT PRIMARY KEY,
+        sitting_id TEXT NOT NULL,
         unit_id TEXT NOT NULL,
-        attempt_id TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'standalone',
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS mcq_issuances_unit_idx ON mcq_issuances(unit_id);
+    `);
+    const mcqCols = this.db.prepare("PRAGMA table_info(mcq_issuances)").all() as unknown as { name?: string; pk?: number }[];
+    if (!mcqCols.some((c) => c.name === "role") || mcqCols.find((c) => c.name === "attempt_id")?.pk !== 1) {
+      this.db.exec(`
+        CREATE TABLE mcq_issuances_v2 (
+          attempt_id TEXT PRIMARY KEY,
+          sitting_id TEXT NOT NULL,
+          unit_id TEXT NOT NULL,
+          role TEXT NOT NULL DEFAULT 'standalone',
+          created_at INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO mcq_issuances_v2 (attempt_id, sitting_id, unit_id, role, created_at)
+        SELECT attempt_id, sitting_id, unit_id, 'standalone', created_at FROM mcq_issuances;
+        DROP TABLE mcq_issuances;
+        ALTER TABLE mcq_issuances_v2 RENAME TO mcq_issuances;
+      `);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS mcq_issuances_unit_idx ON mcq_issuances(unit_id);
+      CREATE INDEX IF NOT EXISTS mcq_issuances_sitting_role_idx ON mcq_issuances(sitting_id, role);
+      CREATE UNIQUE INDEX IF NOT EXISTS mcq_issuances_sitting_unit_idx ON mcq_issuances(sitting_id, unit_id);
     `);
     const expCols = this.db.prepare("PRAGMA table_info(explorations)").all() as unknown as { name?: string }[];
     if (!expCols.some((c) => c.name === "archived")) {
@@ -418,6 +463,9 @@ export class EventStore {
           (attempt_id, unit_id, depth, prompt, first_attempt, turns_json, status, assistance_count, active_ms, probe_id, grade, result_json, mcq_json, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(attempt_id) DO UPDATE SET
+          depth = excluded.depth,
+          prompt = excluded.prompt,
+          first_attempt = excluded.first_attempt,
           turns_json = excluded.turns_json,
           status = excluded.status,
           assistance_count = excluded.assistance_count,
@@ -447,32 +495,85 @@ export class EventStore {
       );
   }
 
-  /** Returns the MCQ issued for a given sitting (if any), enforcing at most 1 per sitting. */
-  getMcqIssuance(sittingId: string): { sitting_id: string; unit_id: string; attempt_id: string; created_at: number } | null {
+  /** Returns the latest MCQ issued for a given sitting (if any). */
+  getMcqIssuance(sittingId: string): { sitting_id: string; unit_id: string; attempt_id: string; role: McqRole; created_at: number } | null {
     const r = this.db
-      .prepare("SELECT sitting_id, unit_id, attempt_id, created_at FROM mcq_issuances WHERE sitting_id = ?")
+      .prepare("SELECT sitting_id, unit_id, attempt_id, role, created_at FROM mcq_issuances WHERE sitting_id = ? ORDER BY created_at DESC LIMIT 1")
       .get(sittingId) as Record<string, unknown> | undefined;
     if (!r) return null;
     return {
       sitting_id: String(r.sitting_id),
       unit_id: String(r.unit_id),
       attempt_id: String(r.attempt_id),
+      role: r.role === "preliminary" ? "preliminary" : "standalone",
       created_at: Number(r.created_at ?? 0),
     };
   }
 
-  /** True if this unit has ever been issued an MCQ (v1: at most one MCQ presentation per unit). */
+  /** Counts MCQs issued in a sitting, optionally filtered by role. */
+  countMcqIssuances(sittingId: string, role?: McqRole): number {
+    const r = role
+      ? (this.db.prepare("SELECT COUNT(*) as n FROM mcq_issuances WHERE sitting_id = ? AND role = ?").get(sittingId, role) as { n?: number } | undefined)
+      : (this.db.prepare("SELECT COUNT(*) as n FROM mcq_issuances WHERE sitting_id = ?").get(sittingId) as { n?: number } | undefined);
+    return Number(r?.n ?? 0);
+  }
+
+  /** True if this unit already received an MCQ in this sitting. */
+  hasSittingUnitMcqIssuance(sittingId: string, unitId: string): boolean {
+    const r = this.db
+      .prepare("SELECT 1 FROM mcq_issuances WHERE sitting_id = ? AND unit_id = ? LIMIT 1")
+      .get(sittingId, unitId);
+    return Boolean(r);
+  }
+
+  /** True if this unit has ever been issued an MCQ (kept for legacy callers/tests). */
   hasUnitMcqIssuance(unitId: string): boolean {
     const r = this.db.prepare("SELECT 1 FROM mcq_issuances WHERE unit_id = ? LIMIT 1").get(unitId);
     return Boolean(r);
   }
 
-  /** Atomically reserves the single MCQ slot for a sitting; returns true iff reserved by this call. */
-  reserveMcqIssuance(sittingId: string, unitId: string, attemptId: string, now = Date.now()): boolean {
-    const res = this.db
-      .prepare("INSERT OR IGNORE INTO mcq_issuances (sitting_id, unit_id, attempt_id, created_at) VALUES (?, ?, ?, ?)")
-      .run(sittingId, unitId, attemptId, now);
-    return Number(res.changes ?? 0) > 0;
+  /**
+   * Atomically reserves an MCQ slot for (sittingId, unitId) respecting the per-role sitting budget
+   * and at most one MCQ issuance per unit per sitting. Returns true iff reserved by this call.
+   */
+  reserveMcqIssuance(
+    sittingId: string,
+    unitId: string,
+    attemptId: string,
+    now = Date.now(),
+    role: McqRole = "standalone",
+    maxForRole = 1,
+  ): boolean {
+    if (maxForRole <= 0) return false;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const existingUnit = this.db
+        .prepare("SELECT 1 FROM mcq_issuances WHERE sitting_id = ? AND unit_id = ? LIMIT 1")
+        .get(sittingId, unitId);
+      if (existingUnit) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+      const row = this.db
+        .prepare("SELECT COUNT(*) as n FROM mcq_issuances WHERE sitting_id = ? AND role = ?")
+        .get(sittingId, role) as { n?: number } | undefined;
+      if (Number(row?.n ?? 0) >= maxForRole) {
+        this.db.exec("ROLLBACK");
+        return false;
+      }
+      const res = this.db
+        .prepare("INSERT OR IGNORE INTO mcq_issuances (attempt_id, sitting_id, unit_id, role, created_at) VALUES (?, ?, ?, ?, ?)")
+        .run(attemptId, sittingId, unitId, role, now);
+      this.db.exec("COMMIT");
+      return Number(res.changes ?? 0) > 0;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* ignore */
+      }
+      throw err;
+    }
   }
 
   abandonActiveAttempts(unitId: string, exceptAttemptId?: string, now = Date.now()): void {

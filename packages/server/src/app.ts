@@ -19,6 +19,8 @@ import {
   type Depth,
   type Grade,
   type Mark,
+  type McqOutcome,
+  type McqRole,
   type State,
   type Unit,
 } from "@myelin/core";
@@ -33,7 +35,8 @@ import { formatServerTiming, PerfLog, type PerfOp, type PerfRecord } from "./per
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
 import {
   computeCalibratedIntervals,
-  isMcqEligible,
+  decideMcqRole,
+  hasPendingMcqProductionCheck,
   pickDrillDepth,
   pickRepModality,
   pickSynthesisCluster,
@@ -1535,28 +1538,67 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       for (const u of candidates.slice(0, 6)) warmOrdered.push(u);
     }
     judge.warmPrompts(warmOrdered.slice(0, 12).map(buildWarmItem));
+    // Prewarm up to 2 verified standalone MCQs for due conceptual units so 1-tap MCQs open immediately.
+    const mcqWarmItems = warmOrdered
+      .filter((u) => {
+        const s = scores.get(u.id);
+        const isDue = (s?.reviews ?? 0) === 0 || (s?.next_in_ms != null ? s.next_in_ms <= 0 : (s?.p_imm ?? 0) < 0.85);
+        if (!isDue) return false;
+        const d = pickDrillDepth(u, state);
+        const m = pickRepModality(u, state, d, []);
+        return decideMcqRole(u, state, d, m, { sittingSize: 8, standaloneUsed: 0, preliminaryUsed: 1, now }).role === "standalone";
+      })
+      .slice(0, 2)
+      .map((u) => {
+        const d = pickDrillDepth(u, state);
+        const ro = u.rests_on.map((id) => state.units[id]?.text ?? id);
+        const st = unitExposureStats(state, u.id, d, now);
+        return { unit: u, restsOn: ro, variant: st.depthExposures, priorPrompts: st.priorPrompts, role: "standalone" as const };
+      });
+    if (mcqWarmItems.length > 0) judge.warmMcqs(mcqWarmItems);
     return c.json({
       scheduler,
       total_units: candidates.length,
       total_due: totalDue,
       earliest_next_in_ms: totalDue === 0 ? earliestFutureMs : null,
       active_ids: candidates.map((u) => u.id),
-      active_attempts: store.getActiveAttempts().map((a) => ({
-        attempt_id: a.attempt_id,
-        unit_id: a.unit_id,
-        depth: a.depth,
-        prompt: a.prompt,
-        ...(a.mcq
-          ? {
-              modality: "mcq" as const,
-              mcq: { choices: a.mcq.choices.map((ch) => ({ id: ch.id, text: ch.text })) },
-            }
-          : {}),
-        turns: a.turns,
-        assistance_count: a.assistance_count,
-        active_ms: a.active_ms,
-        updated_at: a.updated_at,
-      })),
+      active_attempts: store.getActiveAttempts().map((a) => {
+        const isStage2 = Boolean(a.mcq?.phase === "production" && a.mcq.production);
+        const chosenChoice = a.mcq?.selected_choice_id
+          ? a.mcq.choices.find((ch) => ch.id === a.mcq!.selected_choice_id)
+          : undefined;
+        return {
+          attempt_id: a.attempt_id,
+          unit_id: a.unit_id,
+          depth: a.depth,
+          prompt: a.prompt,
+          ...(isStage2 && a.mcq?.production
+            ? {
+                modality: a.mcq.production.modality as RepModality,
+                ...(a.mcq.production.starter ? { starter: a.mcq.production.starter } : {}),
+                gate_summary: {
+                  prompt: a.mcq.gate_prompt ?? "",
+                  chosen_text: chosenChoice?.text ?? "",
+                  outcome: a.mcq.outcome ?? "correct",
+                  assisted: Boolean(a.mcq.assisted),
+                  continued_after_miss: Boolean(a.mcq.gate_continued),
+                },
+              }
+            : a.mcq
+              ? {
+                  modality: "mcq" as const,
+                  mcq: {
+                    role: a.mcq.role ?? "standalone",
+                    choices: a.mcq.choices.map((ch) => ({ id: ch.id, text: ch.text })),
+                  },
+                }
+              : {}),
+          turns: a.turns,
+          assistance_count: a.assistance_count,
+          active_ms: a.active_ms,
+          updated_at: a.updated_at,
+        };
+      }),
       items,
     });
   });
@@ -2080,7 +2122,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const excludeId = c.req.query("exclude");
     const sittingId = (c.req.query("sitting_id") ?? "").trim() || null;
     const sittingSize = Math.max(0, Number.parseInt(c.req.query("sitting_size") ?? "0", 10) || 0);
-    const directDone = Math.max(0, Number.parseInt(c.req.query("direct_done") ?? "0", 10) || 0);
+    const isCompact = c.req.query("compact") === "1";
     const isManual = c.req.query("manual") === "1";
     const isRetry = c.req.query("retry") === "1";
     const { scheduler, scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
@@ -2128,12 +2170,47 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const modality: RepModality = isRetry && rawModality === "faded_skeleton" ? "direct" : rawModality;
     const stats = unitExposureStats(state, picked.id, depth, now);
 
-    // 1. If this unit already has an active issued MCQ attempt, restore that exact frozen attempt & choice order.
+    // 1. If this unit already has an active issued MCQ (or Stage 2 gate->production) attempt, restore its exact phase.
     const existingActiveMcq = !isRetry
       ? store.getActiveAttempts().find((a) => a.unit_id === picked!.id && Boolean(a.mcq))
       : undefined;
     if (existingActiveMcq?.mcq) {
       const trend = latencyTrend(state, picked);
+      if (existingActiveMcq.mcq.phase === "production" && existingActiveMcq.mcq.production) {
+        const prod = existingActiveMcq.mcq.production;
+        const chosenChoice = existingActiveMcq.mcq.selected_choice_id
+          ? existingActiveMcq.mcq.choices.find((ch) => ch.id === existingActiveMcq.mcq!.selected_choice_id)
+          : undefined;
+        return c.json({
+          scheduler,
+          total_units: candidates.length,
+          active_habits: habits,
+          judge_enabled: judge.enabled,
+          rep: {
+            attempt_id: existingActiveMcq.attempt_id,
+            unit_id: picked.id,
+            text: picked.text,
+            kind: picked.kind,
+            topic: picked.topic,
+            depth: prod.depth,
+            prompt: prod.prompt,
+            modality: prod.modality as RepModality,
+            ...(prod.starter ? { starter: prod.starter } : {}),
+            gate_summary: {
+              prompt: existingActiveMcq.mcq.gate_prompt ?? "",
+              chosen_text: chosenChoice?.text ?? "",
+              outcome: existingActiveMcq.mcq.outcome ?? "correct",
+              assisted: Boolean(existingActiveMcq.mcq.assisted),
+              continued_after_miss: Boolean(existingActiveMcq.mcq.gate_continued),
+            },
+            rests_on: restsOn,
+            p_imm: score?.p_imm ?? 0,
+            reviews: score?.reviews ?? 0,
+            prev_latency_ms: trend.prev_ms,
+            first_latency_ms: trend.first_ms,
+          },
+        });
+      }
       return c.json({
         scheduler,
         total_units: candidates.length,
@@ -2149,6 +2226,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           prompt: existingActiveMcq.prompt,
           modality: "mcq" as RepModality,
           mcq: {
+            role: existingActiveMcq.mcq.role ?? "standalone",
             choices: existingActiveMcq.mcq.choices.map((ch) => ({ id: ch.id, text: ch.text })),
           },
           rests_on: restsOn,
@@ -2160,115 +2238,162 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       });
     }
 
-    // 2. Narrow v1 bounded MCQ issuance: at most 1 per full 8-slot sitting after >=2 direct completions,
-    //    unique per unit, directly selected, due, recall+contrast, 1 prior production miss >=4h ago.
-    const canIssueMcq =
-      Boolean(requestedId) &&
+    // 2. v2 MCQ issuance policy: standalone competitive MCQs + two-stage preliminary triage gates.
+    let preloadedProdEntry: Awaited<ReturnType<typeof judge.promptEntryFor>> | null = null;
+    const canConsiderMcq =
       !isManual &&
       !isRetry &&
       dueIds.has(picked.id) &&
       bundledUnits.length === 0 &&
       Boolean(sittingId) &&
-      sittingSize >= 8 &&
-      directDone >= 2 &&
-      !store.getMcqIssuance(sittingId!) &&
-      !store.hasUnitMcqIssuance(picked.id) &&
-      isMcqEligible(picked, state, depth, modality, now);
+      !store.hasSittingUnitMcqIssuance(sittingId!, picked.id);
 
-    if (canIssueMcq && sittingId) {
-      const mcqEntry = await judge.generateMcqEntry(picked, restsOn, {
-        variant: stats.depthExposures,
-        priorPrompts: stats.priorPrompts,
-        learnerMemory: learnerMemoryOf(store),
+    if (canConsiderMcq && sittingId) {
+      const standaloneUsed = store.countMcqIssuances(sittingId, "standalone");
+      const preliminaryUsed = store.countMcqIssuances(sittingId, "preliminary");
+      const decision = decideMcqRole(picked, state, depth, modality, {
+        sittingSize: Math.max(1, sittingSize || 8),
+        compact: isCompact,
+        standaloneUsed,
+        preliminaryUsed,
+        now,
       });
-      if (mcqEntry?.mcq) {
-        const shuffledSource = [...mcqEntry.mcq.choices];
-        for (let i = shuffledSource.length - 1; i > 0; i--) {
-          const j = randomInt(i + 1);
-          [shuffledSource[i], shuffledSource[j]] = [shuffledSource[j]!, shuffledSource[i]!];
-        }
-        const opaqueChoices: StoredMcqChoice[] = shuffledSource.map((ch, idx) => ({
-          id: `c${idx + 1}`,
-          source_id: ch.id,
-          text: ch.text,
-        }));
-        const sourceToOpaque = new Map(opaqueChoices.map((ch) => [ch.source_id, ch.id]));
-        const opaqueCorrectId = sourceToOpaque.get(mcqEntry.mcq.correct_id);
-        const opaqueWhyWrong: Record<string, string> = {};
-        for (const [srcId, reason] of Object.entries(mcqEntry.mcq.why_wrong)) {
-          const opId = sourceToOpaque.get(srcId);
-          if (opId) opaqueWhyWrong[opId] = reason;
-        }
-        const mcqAttemptId = uuidv7(now);
-        if (opaqueCorrectId && store.reserveMcqIssuance(sittingId, picked.id, mcqAttemptId, now)) {
-          const storedMcq: StoredMcqAttempt = {
-            item_id: mcqEntry.mcq.item_id,
-            version: mcqEntry.mcq.version,
-            choices: opaqueChoices,
-            correct_id: opaqueCorrectId,
-            explanation: mcqEntry.mcq.explanation,
-            why_wrong: opaqueWhyWrong,
-            sitting_id: sittingId,
-            assisted: false,
-            selected_choice_id: null,
-            outcome: null,
-          };
-          store.abandonActiveAttempts(picked.id, mcqAttemptId, now);
-          store.upsertAttempt({
-            attempt_id: mcqAttemptId,
-            unit_id: picked.id,
-            depth: "recall",
-            prompt: mcqEntry.prompt,
-            first_attempt: "",
-            turns: [],
-            status: "active",
-            assistance_count: 0,
-            active_ms: null,
-            probe_id: null,
-            grade: null,
-            result: null,
-            mcq: storedMcq,
-            created_at: now,
-            updated_at: now,
+
+      if (decision.role === "standalone" || decision.role === "preliminary") {
+        let pairedProduction: { prompt: string; depth: Depth; expectedCrux?: string | undefined } | undefined;
+        if (decision.role === "preliminary") {
+          preloadedProdEntry = await judge.promptEntryFor(picked, restsOn, depth, {
+            variant: stats.depthExposures,
+            priorPrompts: stats.priorPrompts,
+            delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
+            learnerMemory: learnerMemoryOf(store),
+            modality,
+            bundledUnits: [],
           });
-          const trend = latencyTrend(state, picked);
-          return c.json({
-            scheduler,
-            total_units: candidates.length,
-            active_habits: habits,
-            judge_enabled: judge.enabled,
-            rep: {
+          pairedProduction = {
+            prompt: preloadedProdEntry.prompt,
+            depth,
+            expectedCrux: preloadedProdEntry.crux,
+          };
+        }
+
+        const mcqEntry = await judge.generateMcqEntry(picked, restsOn, {
+          variant: stats.depthExposures,
+          priorPrompts: stats.priorPrompts,
+          learnerMemory: learnerMemoryOf(store),
+          role: decision.role,
+          ...(pairedProduction ? { pairedProduction } : {}),
+        });
+
+        if (mcqEntry?.mcq) {
+          const shuffledSource = [...mcqEntry.mcq.choices];
+          for (let i = shuffledSource.length - 1; i > 0; i--) {
+            const j = randomInt(i + 1);
+            [shuffledSource[i], shuffledSource[j]] = [shuffledSource[j]!, shuffledSource[i]!];
+          }
+          const opaqueChoices: StoredMcqChoice[] = shuffledSource.map((ch, idx) => ({
+            id: `c${idx + 1}`,
+            source_id: ch.id,
+            text: ch.text,
+          }));
+          const sourceToOpaque = new Map(opaqueChoices.map((ch) => [ch.source_id, ch.id]));
+          const opaqueCorrectId = sourceToOpaque.get(mcqEntry.mcq.correct_id);
+          const opaqueWhyWrong: Record<string, string> = {};
+          for (const [srcId, reason] of Object.entries(mcqEntry.mcq.why_wrong)) {
+            const opId = sourceToOpaque.get(srcId);
+            if (opId) opaqueWhyWrong[opId] = reason;
+          }
+          const mcqAttemptId = uuidv7(now);
+          if (
+            opaqueCorrectId &&
+            store.reserveMcqIssuance(sittingId, picked.id, mcqAttemptId, now, decision.role, decision.budgetForRole)
+          ) {
+            const storedMcq: StoredMcqAttempt = {
+              item_id: mcqEntry.mcq.item_id,
+              version: mcqEntry.mcq.version,
+              role: decision.role,
+              choices: opaqueChoices,
+              correct_id: opaqueCorrectId,
+              explanation: mcqEntry.mcq.explanation,
+              why_wrong: opaqueWhyWrong,
+              worked_step: mcqEntry.mcq.worked_step ?? null,
+              sitting_id: sittingId,
+              assisted: false,
+              selected_choice_id: null,
+              outcome: null,
+              phase: "gate",
+              gate_prompt: mcqEntry.prompt,
+              production:
+                decision.role === "preliminary" && preloadedProdEntry
+                  ? {
+                      depth,
+                      prompt: preloadedProdEntry.prompt,
+                      modality: preloadedProdEntry.modality ?? modality,
+                      starter: preloadedProdEntry.starter ?? null,
+                      expected_crux: preloadedProdEntry.crux ?? null,
+                    }
+                  : null,
+            };
+            store.abandonActiveAttempts(picked.id, mcqAttemptId, now);
+            store.upsertAttempt({
               attempt_id: mcqAttemptId,
               unit_id: picked.id,
-              text: picked.text,
-              kind: picked.kind,
-              topic: picked.topic,
-              depth: "recall" as Depth,
+              depth: decision.role === "preliminary" ? depth : "recall",
               prompt: mcqEntry.prompt,
-              modality: "mcq" as RepModality,
-              mcq: {
-                choices: opaqueChoices.map((ch) => ({ id: ch.id, text: ch.text })),
+              first_attempt: "",
+              turns: [],
+              status: "active",
+              assistance_count: 0,
+              active_ms: null,
+              probe_id: null,
+              grade: null,
+              result: null,
+              mcq: storedMcq,
+              created_at: now,
+              updated_at: now,
+            });
+            const trend = latencyTrend(state, picked);
+            return c.json({
+              scheduler,
+              total_units: candidates.length,
+              active_habits: habits,
+              judge_enabled: judge.enabled,
+              rep: {
+                attempt_id: mcqAttemptId,
+                unit_id: picked.id,
+                text: picked.text,
+                kind: picked.kind,
+                topic: picked.topic,
+                depth: decision.role === "preliminary" ? depth : ("recall" as Depth),
+                prompt: mcqEntry.prompt,
+                modality: "mcq" as RepModality,
+                mcq: {
+                  role: decision.role,
+                  choices: opaqueChoices.map((ch) => ({ id: ch.id, text: ch.text })),
+                },
+                rests_on: restsOn,
+                p_imm: score?.p_imm ?? 0,
+                reviews: score?.reviews ?? 0,
+                prev_latency_ms: trend.prev_ms,
+                first_latency_ms: trend.first_ms,
               },
-              rests_on: restsOn,
-              p_imm: score?.p_imm ?? 0,
-              reviews: score?.reviews ?? 0,
-              prev_latency_ms: trend.prev_ms,
-              first_latency_ms: trend.first_ms,
-            },
-          });
+            });
+          }
         }
       }
     }
 
-    const cacheHit = judge.peekPromptEntry(picked, depth, restsOn, stats.depthExposures, modality, bundledIds) !== null;
-    const promptEntry = await judge.promptEntryFor(picked, restsOn, depth, {
-      variant: stats.depthExposures,
-      priorPrompts: stats.priorPrompts,
-      delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
-      learnerMemory: learnerMemoryOf(store),
-      modality,
-      bundledUnits: bundledUnits.map((b) => ({ id: b.id, text: b.text, kind: b.kind })),
-    });
+    const cacheHit = preloadedProdEntry !== null || judge.peekPromptEntry(picked, depth, restsOn, stats.depthExposures, modality, bundledIds) !== null;
+    const promptEntry =
+      preloadedProdEntry ??
+      (await judge.promptEntryFor(picked, restsOn, depth, {
+        variant: stats.depthExposures,
+        priorPrompts: stats.priorPrompts,
+        delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
+        learnerMemory: learnerMemoryOf(store),
+        modality,
+        bundledUnits: bundledUnits.map((b) => ({ id: b.id, text: b.text, kind: b.kind })),
+      }));
     const prompt = promptEntry.prompt;
     const trend = latencyTrend(state, picked);
     const nextRec: PerfRecord = {
@@ -2333,6 +2458,29 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           };
         }),
       );
+      if (sittingId) {
+        const sUsed = store.countMcqIssuances(sittingId, "standalone");
+        const pUsed = store.countMcqIssuances(sittingId, "preliminary");
+        const mcqWarm: { unit: Unit; restsOn: string[]; variant: number; priorPrompts: string[]; role: "standalone" | "preliminary" }[] = [];
+        for (const u of upcoming) {
+          if (mcqWarm.length >= 2 || !dueIds.has(u.id)) continue;
+          const d = pickDrillDepth(u, state);
+          const m = pickRepModality(u, state, d, []);
+          const dec = decideMcqRole(u, state, d, m, {
+            sittingSize: Math.max(1, sittingSize || 8),
+            compact: isCompact,
+            standaloneUsed: sUsed + mcqWarm.length,
+            preliminaryUsed: pUsed,
+            now,
+          });
+          if (dec.role === "standalone") {
+            const ro = u.rests_on.map((id) => state.units[id]?.text ?? id);
+            const st = unitExposureStats(state, u.id, d, now);
+            mcqWarm.push({ unit: u, restsOn: ro, variant: st.depthExposures, priorPrompts: st.priorPrompts, role: "standalone" });
+          }
+        }
+        if (mcqWarm.length > 0) judge.warmMcqs(mcqWarm);
+      }
     }
 
     return c.json({
@@ -2370,7 +2518,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       prompt?: string;
       attempt?: string;
       choice_id?: string;
+      idk?: boolean;
       reveal?: boolean;
+      continue_to_production?: boolean;
       sketch_data_url?: string | null;
       history?: { attempt: string; feedback: string }[];
       latency_ms?: number | null;
@@ -2387,14 +2537,73 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     // Resolve an issued attempt BEFORE trusting client modality, depth, prompt, or bundle fields.
     const reqAttemptId = typeof body?.attempt_id === "string" && body.attempt_id.trim() ? body.attempt_id.trim() : null;
     const preAttempt = reqAttemptId ? store.getAttempt(reqAttemptId) : null;
+
+    // Explicit "Try the full problem anyway" after a preliminary gate short-circuit (wrong/idk):
+    // spawns a fresh Stage 2 guided production attempt without mutating the settled Stage 1 record.
+    if (body?.continue_to_production === true && preAttempt?.mcq?.role === "preliminary" && preAttempt.mcq.production) {
+      const prod = preAttempt.mcq.production;
+      const nowCont = Date.now();
+      const newAttemptId = uuidv7(nowCont);
+      const chosenChoice = preAttempt.mcq.selected_choice_id
+        ? preAttempt.mcq.choices.find((ch) => ch.id === preAttempt.mcq!.selected_choice_id)
+        : undefined;
+      const continuedMcq: StoredMcqAttempt = {
+        ...preAttempt.mcq,
+        phase: "production",
+        assisted: true,
+        gate_continued: true,
+      };
+      store.abandonActiveAttempts(preAttempt.unit_id, newAttemptId, nowCont);
+      store.upsertAttempt({
+        attempt_id: newAttemptId,
+        unit_id: preAttempt.unit_id,
+        depth: prod.depth,
+        prompt: prod.prompt,
+        first_attempt: "",
+        turns: [],
+        status: "active",
+        assistance_count: 1,
+        active_ms: null,
+        probe_id: null,
+        grade: null,
+        result: null,
+        mcq: continuedMcq,
+        created_at: nowCont,
+        updated_at: nowCont,
+      });
+      return c.json({
+        ok: true,
+        gate_passed: false,
+        gate_transition: "production",
+        attempt_id: newAttemptId,
+        next_stage: {
+          attempt_id: newAttemptId,
+          depth: prod.depth,
+          prompt: prod.prompt,
+          modality: prod.modality as RepModality,
+          starter: prod.starter ?? null,
+          gate_summary: {
+            prompt: preAttempt.mcq.gate_prompt ?? preAttempt.prompt,
+            chosen_text: chosenChoice?.text ?? "",
+            outcome: preAttempt.mcq.outcome ?? "idk",
+            assisted: true,
+            continued_after_miss: true,
+          },
+        },
+      });
+    }
+
     if (preAttempt?.status === "passed" && preAttempt.result) {
-      if (preAttempt.mcq) {
+      if (preAttempt.mcq && preAttempt.mcq.phase !== "production") {
+        const isIdk = Boolean(body?.idk);
         const isReveal = Boolean(body?.reveal || body?.show_pivot);
         const choiceId = typeof body?.choice_id === "string" ? body.choice_id.trim() : "";
-        const wasReveal = preAttempt.mcq.outcome === "revealed";
-        const matchesStored = isReveal
-          ? wasReveal
-          : Boolean(choiceId && !wasReveal && preAttempt.mcq.selected_choice_id === choiceId);
+        const storedOutcome = preAttempt.mcq.outcome;
+        const matchesStored = isIdk
+          ? storedOutcome === "idk" || storedOutcome === "revealed"
+          : isReveal
+            ? storedOutcome === "revealed" || storedOutcome === "idk"
+            : Boolean(choiceId && storedOutcome !== "revealed" && storedOutcome !== "idk" && preAttempt.mcq.selected_choice_id === choiceId);
         if (!matchesStored) {
           return c.json({ error: "MCQ attempt already settled with a different answer" }, 409);
         }
@@ -2402,16 +2611,53 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       return c.json(preAttempt.result);
     }
 
-    // Deterministic, zero-LLM grading for server-issued MCQ attempts.
-    if (preAttempt?.mcq) {
+    // Idempotent retry of a preliminary gate pass when the attempt already advanced to Stage 2 production.
+    if (
+      preAttempt?.mcq?.role === "preliminary" &&
+      preAttempt.mcq.phase === "production" &&
+      preAttempt.mcq.production &&
+      typeof body?.choice_id === "string" &&
+      body.choice_id.trim() &&
+      !body?.attempt
+    ) {
+      if (body.choice_id.trim() !== preAttempt.mcq.selected_choice_id) {
+        return c.json({ error: "Preliminary gate already settled with a different answer" }, 409);
+      }
+      const prod = preAttempt.mcq.production;
+      const chosenChoice = preAttempt.mcq.choices.find((ch) => ch.id === preAttempt.mcq!.selected_choice_id);
+      return c.json({
+        ok: true,
+        gate_passed: true,
+        gate_transition: "production",
+        attempt_id: preAttempt.attempt_id,
+        next_stage: {
+          attempt_id: preAttempt.attempt_id,
+          depth: prod.depth,
+          prompt: prod.prompt,
+          modality: prod.modality as RepModality,
+          starter: prod.starter ?? null,
+          gate_summary: {
+            prompt: preAttempt.mcq.gate_prompt ?? preAttempt.prompt,
+            chosen_text: chosenChoice?.text ?? "",
+            outcome: preAttempt.mcq.outcome ?? "correct",
+            assisted: Boolean(preAttempt.mcq.assisted),
+            continued_after_miss: Boolean(preAttempt.mcq.gate_continued),
+          },
+        },
+      });
+    }
+
+    // Deterministic, zero-LLM grading for server-issued MCQ attempts (Stage 1 gate or standalone).
+    if (preAttempt?.mcq && preAttempt.mcq.phase !== "production") {
       const mcq = preAttempt.mcq;
       const uMcq = resolveUnit(store.state, preAttempt.unit_id);
       if (!uMcq) return c.json({ error: "unknown unit" }, 404);
-      const isReveal = Boolean(body?.reveal || body?.show_pivot);
+      const isIdk = Boolean(body?.idk);
+      const isReveal = !isIdk && Boolean(body?.reveal || body?.show_pivot);
       const choiceId = typeof body?.choice_id === "string" ? body.choice_id.trim() : "";
-      const chosen = !isReveal && choiceId ? mcq.choices.find((ch) => ch.id === choiceId) : undefined;
-      if (!isReveal && !chosen) {
-        return c.json({ error: "valid choice_id or reveal required" }, 400);
+      const chosen = !isIdk && !isReveal && choiceId ? mcq.choices.find((ch) => ch.id === choiceId) : undefined;
+      if (!isIdk && !isReveal && !chosen) {
+        return c.json({ error: "valid choice_id, idk, or reveal required" }, 400);
       }
 
       const now = Date.now();
@@ -2419,11 +2665,15 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const preScore = scores.get(uMcq.id);
       const latencyMs = typeof body?.latency_ms === "number" && body.latency_ms >= 0 ? Math.round(body.latency_ms) : null;
       const assisted = Boolean(mcq.assisted);
-      let outcome: "correct" | "assisted_correct" | "wrong" | "revealed";
+      let outcome: McqOutcome;
       let grade: Grade;
       let message: string;
       let whyWrongSelected: string | null = null;
-      if (isReveal) {
+      if (isIdk) {
+        outcome = "idk";
+        grade = "again";
+        message = mcq.explanation;
+      } else if (isReveal) {
         outcome = "revealed";
         grade = "again";
         message = mcq.explanation;
@@ -2436,6 +2686,50 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         grade = "again";
         whyWrongSelected = mcq.why_wrong[chosen!.id] ?? null;
         message = whyWrongSelected ? `${whyWrongSelected}\n\n${mcq.explanation}` : mcq.explanation;
+      }
+
+      // Two-stage Preliminary Gate PASS: advance atomically to Stage 2 production without emitting a separate probe yet!
+      if (mcq.role === "preliminary" && (outcome === "correct" || outcome === "assisted_correct") && mcq.production) {
+        const prod = mcq.production;
+        const gatePrompt = mcq.gate_prompt ?? preAttempt.prompt;
+        const nextMcq: StoredMcqAttempt = {
+          ...mcq,
+          phase: "production",
+          gate_prompt: gatePrompt,
+          selected_choice_id: chosen!.id,
+          outcome,
+          gate_latency_ms: latencyMs,
+          gate_passed_at: now,
+        };
+        store.upsertAttempt({
+          ...preAttempt,
+          depth: prod.depth,
+          prompt: prod.prompt,
+          status: "active",
+          assistance_count: assisted ? Math.max(1, preAttempt.assistance_count) : preAttempt.assistance_count,
+          mcq: nextMcq,
+          updated_at: now,
+        });
+        return c.json({
+          ok: true,
+          gate_passed: true,
+          gate_transition: "production",
+          attempt_id: preAttempt.attempt_id,
+          next_stage: {
+            attempt_id: preAttempt.attempt_id,
+            depth: prod.depth,
+            prompt: prod.prompt,
+            modality: prod.modality as RepModality,
+            starter: prod.starter ?? null,
+            gate_summary: {
+              prompt: gatePrompt,
+              chosen_text: chosen!.text,
+              outcome,
+              assisted,
+              continued_after_miss: false,
+            },
+          },
+        });
       }
 
       const ev = makeEvent(
@@ -2453,6 +2747,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           scheduler,
           predicted_recall: preScore ? preScore.p_imm : null,
           modality: "mcq",
+          ...(mcq.role ? { mcq_role: mcq.role } : {}),
           mcq_item_id: mcq.item_id,
           mcq_outcome: outcome,
           ...(chosen ? { mcq_choice_id: chosen.id } : {}),
@@ -2466,6 +2761,13 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const nextInMs = afterScore?.next_in_ms ?? null;
       const scheduledIntervalMs = afterScore?.scheduled_interval_ms ?? null;
       const scheduleKind = afterScore?.schedule_kind;
+      const refreshedMcqUnit = store.state.units[uMcq.id] ?? uMcq;
+      const nextReviewMode: "relearn" | "production" | "any" =
+        outcome === "wrong" || outcome === "idk" || outcome === "revealed" || outcome === "assisted_correct"
+          ? "relearn"
+          : !mcq.role || scheduleKind === "relearn"
+            ? "production"
+            : "any";
 
       const payload = {
         ok: true,
@@ -2482,30 +2784,34 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         prev_schedule_kind: preScore?.schedule_kind ?? "first",
         scheduled_interval_ms: scheduledIntervalMs,
         ...(scheduleKind ? { schedule_kind: scheduleKind } : {}),
-        next_depth: pickDrillDepth(store.state.units[uMcq.id] ?? uMcq, store.state),
+        next_depth: pickDrillDepth(refreshedMcqUnit, store.state),
         scheduler,
         mcq_result: {
+          role: (mcq.role ?? "standalone") as McqRole,
           outcome,
           selected_choice_id: chosen?.id ?? null,
           correct_id: mcq.correct_id,
           explanation: mcq.explanation,
           why_wrong_selected: whyWrongSelected,
+          worked_step: mcq.worked_step ?? null,
+          can_continue_production: Boolean(mcq.role === "preliminary" && mcq.production),
+          next_review_mode: nextReviewMode,
         },
       };
 
       store.upsertAttempt({
         ...preAttempt,
-        first_attempt: chosen ? chosen.text : "I'm not sure · Show answer",
+        first_attempt: chosen ? chosen.text : isIdk ? "I don't know · Show answer" : "Show answer",
         turns: [
           ...preAttempt.turns,
-          { user: chosen ? chosen.text : "Show answer", coach: message },
+          { user: chosen ? chosen.text : isIdk ? "I don't know" : "Show answer", coach: message },
         ],
         status: "passed",
         active_ms: latencyMs,
         probe_id: ev.id,
         grade,
         result: payload,
-        mcq: { ...mcq, selected_choice_id: chosen?.id ?? null, outcome },
+        mcq: { ...mcq, phase: "settled", selected_choice_id: chosen?.id ?? null, outcome },
         updated_at: now,
       });
 
@@ -2529,11 +2835,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       body.modality && ["direct", "fix_bug", "faded_skeleton", "contrast", "synthesis"].includes(body.modality)
         ? body.modality
         : pickRepModality(u, state, depth, bundledUnits);
+    const stage2Prod = preAttempt?.mcq?.phase === "production" ? preAttempt.mcq.production : null;
     const cachedPromptEntry =
       judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds) ??
       judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures);
-    const prompt = body.prompt?.trim() || cachedPromptEntry?.prompt || (await judge.promptFor(u, restsOn, depth));
-    const expectedCrux = cachedPromptEntry?.crux;
+    const prompt = body.prompt?.trim() || stage2Prod?.prompt || cachedPromptEntry?.prompt || (await judge.promptFor(u, restsOn, depth));
+    const expectedCrux = stage2Prod?.expected_crux || cachedPromptEntry?.crux;
     const firstContact = u.told && preStats.passes === 0;
     const showPivot = Boolean(body.show_pivot);
 
@@ -2662,7 +2969,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const trend = latencyTrend(state, u);
     const habits = activeHabits(state);
     const latencyMs = typeof body.latency_ms === "number" && body.latency_ms >= 0 ? Math.round(body.latency_ms) : null;
-    const hintsUsed = Math.max(0, Math.round(body.hints_used ?? 0));
+    const hintsUsed = Math.max(
+      0,
+      Math.round(body.hints_used ?? 0),
+      preAttempt?.mcq?.phase === "production" ? preAttempt.assistance_count : 0,
+    );
 
     const history = Array.isArray(body.history)
       ? body.history
@@ -2937,8 +3248,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       return c.json(existingAttempt.result);
     }
 
-    // Active MCQ clarification: never grade as a generic open probe; persist substantive assistance first.
-    if (existingAttempt?.mcq) {
+    // Active MCQ clarification (Stage 1 gate or standalone only; Stage 2 production uses normal drill clarification).
+    if (existingAttempt?.mcq && existingAttempt.mcq.phase !== "production") {
       const mcq = existingAttempt.mcq;
       const questionTextMcq = (body.question ?? "").trim();
       const nowMcq = Date.now();
@@ -2975,6 +3286,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             scheduler: schedMcq,
             predicted_recall: preScoreMcq ? preScoreMcq.p_imm : null,
             modality: "mcq",
+            ...(mcq.role ? { mcq_role: mcq.role } : {}),
             mcq_item_id: mcq.item_id,
             mcq_outcome: "revealed",
           },
@@ -3001,11 +3313,15 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           next_depth: pickDrillDepth(store.state.units[u.id] ?? u, store.state),
           scheduler: schedMcq,
           mcq_result: {
+            role: (mcq.role ?? "standalone") as McqRole,
             outcome: "revealed" as const,
             selected_choice_id: null,
             correct_id: mcq.correct_id,
             explanation: mcq.explanation,
             why_wrong_selected: null,
+            worked_step: mcq.worked_step ?? null,
+            can_continue_production: Boolean(mcq.role === "preliminary" && mcq.production),
+            next_review_mode: "relearn" as const,
           },
         };
         store.upsertAttempt({
@@ -3016,7 +3332,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           probe_id: ev.id,
           grade: "again",
           result: revealPayload,
-          mcq: { ...updatedMcq, outcome: "revealed" },
+          mcq: { ...updatedMcq, phase: "settled", outcome: "revealed" },
           updated_at: nowMcq,
         });
         return c.json(revealPayload);

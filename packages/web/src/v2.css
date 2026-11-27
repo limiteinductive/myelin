@@ -3870,7 +3870,7 @@ button.v2-rail-row:focus-visible,
   .v2-drill-stage { padding: 20px 16px 40px; }
 }
 
-/* ---------- Bounded MCQ option card: select, then Check ---------- */
+/* ---------- Bounded MCQ option card: one tap answers (Fable 5.2 spec) ---------- */
 .v2-mcq-stage {
   display: flex;
   flex-direction: column;
@@ -3901,6 +3901,7 @@ button.v2-rail-row:focus-visible,
   cursor: pointer;
   outline: 0;
   box-shadow: inset 0 0 0 1px transparent;
+  touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
   transition: background-color 140ms ease, box-shadow 140ms ease, color 140ms ease;
 }
@@ -3909,6 +3910,10 @@ button.v2-rail-row:focus-visible,
     background: var(--v2-quiet-fill);
   }
 }
+.v2-mcq-option:not([aria-disabled="true"]):active {
+  background: color-mix(in srgb, var(--v2-fg) 9%, transparent);
+}
+/* The learner's pick: in flight, and after a miss. Never an error colour. */
 .v2-mcq-option.is-selected {
   background: var(--v2-quiet-fill);
   box-shadow: inset 0 0 0 1px var(--v2-border-strong);
@@ -3916,21 +3921,22 @@ button.v2-rail-row:focus-visible,
 .v2-mcq-option[aria-disabled="true"] {
   cursor: default;
 }
+/* While one row is in flight the others step back. */
+.v2-mcq.is-submitting .v2-mcq-option:not(.is-pending),
+.v2-mcq.is-submitting .v2-mcq-option:not(.is-pending) .katex {
+  color: var(--v2-ink-3);
+}
 .v2-mcq-option:focus-visible,
-.v2-mcq-reveal:focus-visible,
-.v2-mcq-foot .v2-btn-primary:focus-visible {
+.v2-mcq-reveal:focus-visible {
   outline: 2px solid var(--v2-accent);
   outline-offset: -2px;
 }
-.v2-mcq-foot .v2-btn-primary:focus-visible {
-  outline-offset: 2px;
-}
-/* Index keycap on fine pointers; it becomes a plain radio ring on touch (see below). */
+
+/* Index keycap on fine pointers (1-4 answer directly); a plain index on touch (see below). */
 .v2-mcq-mark {
   flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: inline-grid;
+  place-items: center;
   width: 20px;
   height: 20px;
   margin-top: 14px;
@@ -3943,10 +3949,29 @@ button.v2-rail-row:focus-visible,
   user-select: none;
   transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
+.v2-mcq-mark > * {
+  grid-area: 1 / 1;
+}
 .v2-mcq-option.is-selected .v2-mcq-mark {
   background: var(--v2-ink-1);
   color: var(--v2-bg);
   box-shadow: none;
+}
+/* The tap is acknowledged at once by the filled keycap; the spinner only appears if the server is slow. */
+.v2-mcq-spin {
+  width: 10px;
+  height: 10px;
+  opacity: 0;
+  animation: v2-spin 700ms linear infinite, v2-mcq-fade-in 120ms ease 180ms forwards;
+}
+.v2-mcq-option.is-pending .v2-mcq-num {
+  animation: v2-mcq-fade-out 120ms ease 180ms forwards;
+}
+@keyframes v2-mcq-fade-in {
+  to { opacity: 1; }
+}
+@keyframes v2-mcq-fade-out {
+  to { opacity: 0; }
 }
 .v2-mcq-text {
   flex: 1;
@@ -3988,44 +4013,65 @@ button.v2-rail-row:focus-visible,
   color: var(--v2-success);
 }
 
-.v2-pad-foot.v2-mcq-foot {
+/* "I don't know" is always one tap away, under a hairline, in the same quiet ink as any secondary. */
+.v2-mcq-foot {
+  display: flex;
+  align-items: center;
   margin: 6px 0 0;
-  padding: 8px 4px 2px 6px;
+  padding: 6px 2px 0;
   border-top: 0.5px solid var(--v2-hairline-soft);
 }
 .v2-mcq-reveal {
   appearance: none;
   box-sizing: border-box;
-  height: 28px;
-  margin-left: -3px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
   padding: 0 9px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 8px;
   background: transparent;
   color: color-mix(in srgb, var(--v2-fg) 66%, var(--v2-muted));
   font: var(--v2-type-label);
   white-space: nowrap;
   cursor: pointer;
-  transition: background-color 140ms ease, color 140ms ease, transform 120ms ease;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 140ms ease, color 140ms ease;
 }
-.v2-mcq-reveal:hover:not(:disabled) {
-  background: var(--v2-quiet-fill);
-  color: var(--v2-fg);
+.v2-mcq-reveal-sep {
+  color: var(--v2-ink-3);
+}
+@media (hover: hover) {
+  .v2-mcq-reveal:hover:not(:disabled) {
+    background: var(--v2-quiet-fill);
+    color: var(--v2-fg);
+  }
 }
 .v2-mcq-reveal:not(:disabled):active {
-  transform: scale(0.97);
+  background: color-mix(in srgb, var(--v2-fg) 9%, transparent);
 }
 .v2-mcq-reveal:disabled {
-  opacity: 0.45;
   cursor: default;
 }
+.v2-mcq-reveal:disabled:not(.is-pending) {
+  opacity: 0.45;
+}
+.v2-mcq-reveal .v2-spinner {
+  width: 10px;
+  height: 10px;
+}
 .v2-mcq-error {
-  padding: 10px 8px 0 12px;
+  padding: 10px 8px 4px 12px;
 }
 
 .v2-mcq-verdict {
   outline: 0;
   scroll-margin-bottom: 24px;
+}
+.v2-mcq-verdict.is-revealed {
+  border-color: var(--v2-hairline);
 }
 .v2-mcq-verdict:not(.is-pass) {
   animation: v2-in 220ms cubic-bezier(0.22, 1, 0.36, 1);
@@ -4046,11 +4092,223 @@ button.v2-rail-row:focus-visible,
   padding: 0 4px;
 }
 
+/* ---------- Preliminary gate: a quick check that opens a costly rep ---------- */
+.v2-gate {
+  transition: margin-bottom 280ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* Folded to its strip, the gate sits on the production prompt like an eyebrow. */
+.v2-gate.is-folded.is-collapsed {
+  margin-bottom: -16px;
+}
+.v2-gate-cue {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 16px;
+  margin: 0;
+  padding: 0 2px;
+  font: var(--v2-type-meta);
+  letter-spacing: var(--v2-track-meta);
+  color: var(--v2-ink-2);
+  user-select: none;
+}
+.v2-gate-cue-rest {
+  color: var(--v2-ink-3);
+  font-weight: 400;
+}
+.v2-gate-steps {
+  display: inline-flex;
+  gap: 3px;
+}
+.v2-gate-steps i {
+  width: 12px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: var(--v2-border-strong);
+}
+.v2-gate-steps i.is-on {
+  background: var(--v2-ink-2);
+}
+
+.v2-gate-body {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 280ms cubic-bezier(0.22, 1, 0.36, 1), opacity 200ms ease, visibility 0s;
+}
+.v2-gate-body-inner {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+.v2-gate-body-inner > :first-child {
+  margin-top: 4px;
+}
+.v2-gate.is-folded .v2-gate-body-inner {
+  overflow: hidden;
+  gap: 12px;
+}
+.v2-gate.is-collapsed .v2-gate-body {
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  transition: grid-template-rows 280ms cubic-bezier(0.22, 1, 0.36, 1), opacity 160ms ease, visibility 0s linear 280ms;
+}
+/* Peeking back: the gate question is reference material now, so it reads at body size. */
+.v2-gate.is-folded .v2-prompt {
+  font: var(--v2-type-body);
+  letter-spacing: 0;
+  color: var(--v2-ink-2);
+}
+
+.v2-gate-strip {
+  appearance: none;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  max-width: calc(100% + 10px);
+  min-width: 0;
+  height: 28px;
+  margin: -6px -5px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--v2-ink-3);
+  font: var(--v2-type-meta);
+  letter-spacing: var(--v2-track-meta);
+  text-align: left;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  animation: v2-in 220ms cubic-bezier(0.22, 1, 0.36, 1);
+  transition: background-color 140ms ease, color 140ms ease;
+}
+@media (hover: hover) {
+  .v2-gate-strip:hover {
+    background: var(--v2-quiet-fill);
+  }
+}
+.v2-gate-strip:focus-visible,
+.v2-gate-continue:focus-visible {
+  outline: 2px solid var(--v2-accent);
+  outline-offset: 1px;
+}
+.v2-gate-strip-mark {
+  flex: none;
+  display: inline-flex;
+  color: var(--v2-success);
+}
+.v2-gate-strip.is-neutral .v2-gate-strip-mark {
+  color: var(--v2-ink-3);
+}
+.v2-gate-strip-label {
+  flex: none;
+  color: var(--v2-ink-2);
+}
+.v2-gate-strip-snippet {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 400;
+}
+.v2-gate-strip-snippet::before {
+  content: "·";
+  margin-right: 7px;
+}
+.v2-gate-strip-caret {
+  flex: none;
+  transition: transform 160ms ease;
+}
+.v2-gate-strip[aria-expanded="true"] .v2-gate-strip-caret {
+  transform: rotate(180deg);
+}
+
+/* Short-circuit verdict: principle, why the lure fails, one worked step. */
+.v2-gate-principle {
+  color: var(--v2-ink-1);
+}
+.v2-gate-step {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 12px;
+  border-left: 1.5px solid var(--v2-border-strong);
+}
+.v2-gate-step-label {
+  font: var(--v2-type-meta);
+  letter-spacing: var(--v2-track-meta);
+  color: var(--v2-ink-3);
+}
+.v2-gate-foot .v2-pass-actions {
+  gap: 4px;
+}
+.v2-gate-continue {
+  appearance: none;
+  box-sizing: border-box;
+  height: 32px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--v2-fg) 66%, var(--v2-muted));
+  font: var(--v2-type-label);
+  white-space: nowrap;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+@media (hover: hover) {
+  .v2-gate-continue:hover {
+    background: var(--v2-quiet-fill);
+    color: var(--v2-fg);
+  }
+}
+
+/* The production prompt and pad arrive in the slot the gate just vacated. */
+.v2-gate-enter {
+  animation: v2-in 300ms cubic-bezier(0.22, 1, 0.36, 1) calc(140ms + var(--v2-enter-i, 0) * 60ms) both;
+}
+
+.v2-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 600px) {
+  .v2-gate-foot .v2-pass-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .v2-gate-continue {
+    margin-left: -11px;
+  }
+}
+
 @media (pointer: coarse) {
+  /* One tap commits, so each row is a discrete outlined target with air between neighbours. */
+  .v2-mcq-options {
+    gap: 6px;
+  }
   .v2-mcq-option {
     min-height: 52px;
     gap: 10px;
     padding-left: 12px;
+    box-shadow: inset 0 0 0 0.5px var(--v2-hairline);
+  }
+  .v2-mcq-option.is-locked:not(.is-correct):not(.is-selected) {
+    box-shadow: inset 0 0 0 0.5px var(--v2-hairline-soft);
   }
   .v2-mcq-text {
     padding-block: 13px;
@@ -4058,54 +4316,64 @@ button.v2-rail-row:focus-visible,
   .v2-mcq-badge {
     margin-top: 18px;
   }
-  /* No keyboard, so no keycap: the mark is a radio ring that fills when chosen. */
-  .v2-mcq-num {
-    display: none;
-  }
+  /* No keyboard, so no keycap: the mark is a plain index that hosts the spinner and the check. */
   .v2-mcq-mark,
   .v2-mcq-option.is-selected .v2-mcq-mark {
     margin-top: 16px;
-    border-radius: 999px;
     background: transparent;
-    box-shadow: inset 0 0 0 1.5px var(--v2-border-strong);
+    box-shadow: none;
+    font-size: 12px;
   }
   .v2-mcq-option.is-selected .v2-mcq-mark {
-    box-shadow: inset 0 0 0 1.5px var(--v2-ink-1);
+    color: var(--v2-ink-1);
   }
-  .v2-mcq-mark::after {
-    content: "";
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    background: var(--v2-ink-1);
-    transform: scale(0);
-    transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+  .v2-mcq-spin {
+    width: 12px;
+    height: 12px;
   }
-  .v2-mcq-option.is-selected .v2-mcq-mark::after {
-    transform: scale(1);
-  }
-  .v2-mcq-option.is-correct .v2-mcq-mark {
-    box-shadow: none;
-  }
-  .v2-mcq-option.is-correct .v2-mcq-mark::after {
-    content: none;
-  }
-  .v2-mcq-reveal,
-  .v2-mcq-foot .v2-pad-actions .v2-btn-primary {
-    height: 44px;
+  .v2-mcq-foot {
+    padding: 6px 0 0;
   }
   .v2-mcq-reveal {
+    width: 100%;
+    height: 48px;
     padding: 0 12px;
-    margin-left: -6px;
+    border-radius: 10px;
   }
-  .v2-mcq-foot .v2-pad-actions .v2-btn-primary {
+  .v2-gate-strip {
+    height: 44px;
+    margin-block: -14px;
+  }
+  .v2-gate-continue,
+  .v2-gate-foot .v2-btn-primary {
+    height: 44px;
+  }
+  .v2-gate-foot .v2-btn-primary {
     padding: 0 20px;
   }
 }
 @media (prefers-reduced-motion: reduce) {
   .v2-mcq-option,
   .v2-mcq-mark,
-  .v2-mcq-mark::after {
+  .v2-mcq-reveal,
+  .v2-gate,
+  .v2-gate-body,
+  .v2-gate.is-collapsed .v2-gate-body,
+  .v2-gate-strip,
+  .v2-gate-strip-caret,
+  .v2-gate-continue {
     transition: none;
+  }
+  .v2-gate-strip,
+  .v2-gate-enter {
+    animation: none;
+  }
+  .v2-mcq-spin {
+    opacity: 1;
+    animation: v2-spin 700ms linear infinite;
+  }
+  .v2-mcq-option.is-pending .v2-mcq-num {
+    animation: none;
+    opacity: 0;
   }
 }

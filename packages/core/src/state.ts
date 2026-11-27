@@ -7,7 +7,7 @@
 //   otherwise ignored; replay never fails on content, only on a malformed or out-of-order log.
 // - Everything a unit has learned (memory, ladders, rebuilt_once) is a fold over its probe evidence,
 //   so a later grade correction recomputes it exactly.
-import type { Depth, EventOf, EventType, Grade, MyelinEvent, Origin, Payload, SlotKind } from "./events.js";
+import type { Depth, EventOf, EventType, Grade, McqOutcome, McqRole, MyelinEvent, Origin, Payload, SlotKind } from "./events.js";
 import { isCorrection } from "./events.js";
 import { applyPageEdit, applyPageRun, newPage, PageEditError, type PageState } from "./page.js";
 import type { Scheduler, UnitMemory } from "./scheduler.js";
@@ -82,14 +82,31 @@ export interface Evidence {
   present: boolean | null;
   note: string | null;
   modality?: "mcq";
+  mcq_role?: McqRole;
   mcq_item_id?: string;
-  mcq_outcome?: "correct" | "assisted_correct" | "wrong" | "revealed";
+  mcq_outcome?: McqOutcome;
   mcq_choice_id?: string;
 }
 
-/** True when an evidence record is a recognition-only MCQ probe rather than a production probe. */
+/** True when an evidence record is an MCQ probe rather than a production probe. */
 export function isRecognitionProbe(ev: Evidence | undefined | null): boolean {
   return Boolean(ev && ev.source === "probe" && ev.modality === "mcq");
+}
+
+/**
+ * True when a v2 standalone MCQ probe should update conservative memory stability/reviews
+ * (clean correct -> hard, wrong/idk -> again; never assisted/revealed, never legacy v1 or preliminary gates).
+ */
+export function isStandaloneMcqCredit(ev: Evidence | undefined | null): boolean {
+  return Boolean(
+    ev &&
+      ev.source === "probe" &&
+      ev.modality === "mcq" &&
+      ev.mcq_role === "standalone" &&
+      ev.grade !== null &&
+      ev.mcq_outcome !== "assisted_correct" &&
+      ev.mcq_outcome !== "revealed",
+  );
 }
 
 export interface Goal {
@@ -250,9 +267,16 @@ function learn(u: Unit, ev: Evidence, s: Scheduler): void {
   const grade = ev.grade!;
   const depth = ev.depth!;
   u.last_probed_at = u.last_probed_at === null ? ev.at : Math.max(u.last_probed_at, ev.at);
-  // Recognition-only MCQ probes update exposure recency but never mutate production memory,
-  // review counts, first_success_at, rebuilt_once, or explain/use ladders.
-  if (isRecognitionProbe(ev)) return;
+  // Legacy v1 MCQs, preliminary gates, and assisted/revealed MCQs update exposure recency only.
+  // Clean v2 standalone discrimination MCQs feed conservative memory updates without promoting
+  // rebuilt_once or explain/use production ladders.
+  if (isRecognitionProbe(ev)) {
+    if (isStandaloneMcqCredit(ev)) {
+      u.memory = s.update(u.memory, { grade: grade === "again" ? "again" : "hard", at: ev.at });
+      u.memory_reviews++;
+    }
+    return;
+  }
   if (depth === "recall" || depth === "rebuild") {
     u.memory = s.update(u.memory, { grade, at: ev.at });
     u.memory_reviews++;
@@ -392,6 +416,7 @@ const reducers: { [T in EventType]?: Reducer<T> } = {
       present: null,
       note: null,
       ...(p.modality ? { modality: p.modality } : {}),
+      ...(p.mcq_role ? { mcq_role: p.mcq_role } : {}),
       ...(p.mcq_item_id ? { mcq_item_id: p.mcq_item_id } : {}),
       ...(p.mcq_outcome ? { mcq_outcome: p.mcq_outcome } : {}),
       ...(p.mcq_choice_id ? { mcq_choice_id: p.mcq_choice_id } : {}),

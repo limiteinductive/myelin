@@ -922,12 +922,125 @@ export function hasPendingMcqProductionCheck(u: Unit, state: State): boolean {
   return lastMcqAt > lastProdAt;
 }
 
+const STANDALONE_MCQ_KINDS = new Set([
+  "concept",
+  "knowledge",
+  "definition",
+  "distinction",
+  "pitfall",
+  "mechanism",
+  "result",
+]);
+const PRODUCTION_PRIMARY_KINDS = new Set(["move", "skill"]);
+
+export interface McqRoleDecision {
+  role: "standalone" | "preliminary" | "none";
+  reason: string;
+  budgetForRole: number;
+}
+
+export interface McqDecisionOptions {
+  sittingSize: number;
+  compact?: boolean;
+  standaloneUsed: number;
+  preliminaryUsed: number;
+  now?: number;
+}
+
 /**
- * Narrow v1 diagnostic MCQ eligibility:
- * - Active, non-observe-only `definition` or `distinction`
- * - `depth === "recall"` and base `modality === "contrast"`
- * - Exactly 1 direct terminal production probe at `recall` with effective grade `again`,
- *   0 successful production probes, 0 prior MCQ probes, and >=4h since that failed probe.
+ * v2 MCQ issuance policy:
+ * - Standalone competitive MCQs for discrimination/classification/boundary/diagnosis decisions
+ *   (`concept`, `knowledge`, `definition`, `distinction`, `pitfall`, `mechanism`, `result`),
+ *   plus bounded maintenance MCQs for `move`/`skill` after demonstrated production.
+ * - Never serves two MCQs back-to-back on the same unit (always alternates back to cold production).
+ * - Preliminary two-stage gates on costly `rebuild`/`use`/code/formula reps when a prerequisite or
+ *   structural check saves the learner from blind flailing (first contact, post-lapse, or >=5d gap).
+ * - Budgets: desktop up to 2 standalone + 1 preliminary per sitting; mobile (`compact`) up to 4 standalone + 1 preliminary.
+ */
+export function decideMcqRole(
+  u: Unit,
+  state: State,
+  depth: Depth,
+  productionModality: RepModality,
+  opts: McqDecisionOptions,
+): McqRoleDecision {
+  if (u.status !== "active" || u.observe_only) {
+    return { role: "none", reason: "inactive_or_observe_only", budgetForRole: 0 };
+  }
+  const now = opts.now ?? Date.now();
+  const kind = u.kind.trim().toLowerCase();
+  const sittingSize = Math.max(1, opts.sittingSize);
+  const standaloneBudget = opts.compact
+    ? Math.max(1, Math.min(4, Math.ceil(sittingSize / 2)))
+    : Math.max(1, Math.min(2, sittingSize >= 5 ? 2 : 1));
+  const preliminaryBudget = 1;
+
+  // Never serve two MCQs in a row on the same unit — always follow an MCQ with cold production.
+  if (hasPendingMcqProductionCheck(u, state)) {
+    return { role: "none", reason: "pending_cold_production", budgetForRole: 0 };
+  }
+
+  const prodProbes = u.evidence
+    .map((id) => state.evidence[id])
+    .filter(
+      (ev): ev is NonNullable<typeof ev> =>
+        Boolean(ev && ev.source === "probe" && ev.modality !== "mcq" && ev.grade !== null && ev.slot !== "imported" && ev.slot !== "in_context"),
+    )
+    .sort((a, b) => a.at - b.at || a.seq - b.seq);
+  const prodPasses = prodProbes.filter((ev) => ev.grade !== "again").length;
+  const lastProd = prodProbes.at(-1) ?? null;
+
+  const hasCodeOrFormula = CODE_CUE_RE.test(u.text) || FORMULA_CUE_RE.test(u.text);
+  const isDiscriminationKind = STANDALONE_MCQ_KINDS.has(kind);
+  const isProdPrimaryKind = PRODUCTION_PRIMARY_KINDS.has(kind);
+
+  const isCostlyProduction =
+    depth === "rebuild" ||
+    depth === "use" ||
+    productionModality === "faded_skeleton" ||
+    productionModality === "fix_bug" ||
+    (isProdPrimaryKind && hasCodeOrFormula);
+
+  const needsPreliminaryTriage =
+    prodPasses === 0 ||
+    lastProd?.grade === "again" ||
+    (lastProd !== null && now - lastProd.at >= 5 * DAY_MS);
+
+  // On desktop (or whenever it's a genuinely costly code/formula/move/skill production rep),
+  // prefer a 2-stage preliminary gate before committing to a heavy derivation/coding attempt.
+  const preferStandaloneOnCompact = Boolean(opts.compact && isDiscriminationKind && !hasCodeOrFormula);
+  if (
+    isCostlyProduction &&
+    needsPreliminaryTriage &&
+    !preferStandaloneOnCompact &&
+    opts.preliminaryUsed < preliminaryBudget
+  ) {
+    return { role: "preliminary", reason: "costly_production_triage", budgetForRole: preliminaryBudget };
+  }
+
+  // Standalone competitive MCQ for conceptual/discrimination objectives, or bounded maintenance on move/skill.
+  if (opts.standaloneUsed < standaloneBudget) {
+    if (isDiscriminationKind) {
+      const standaloneDepthOk = depth === "recall" || depth === "explain" || !hasCodeOrFormula || Boolean(opts.compact);
+      if (standaloneDepthOk) {
+        return { role: "standalone", reason: "discrimination_objective", budgetForRole: standaloneBudget };
+      }
+    }
+    if (isProdPrimaryKind && prodPasses >= 1 && lastProd?.grade !== "again") {
+      return { role: "standalone", reason: "bounded_maintenance", budgetForRole: standaloneBudget };
+    }
+  }
+
+  // Fallback: if standalone budget is full (or not applicable) and this is a costly rep needing triage, still allow a gate.
+  if (isCostlyProduction && needsPreliminaryTriage && opts.preliminaryUsed < preliminaryBudget) {
+    return { role: "preliminary", reason: "costly_production_triage", budgetForRole: preliminaryBudget };
+  }
+
+  return { role: "none", reason: "production_preferred", budgetForRole: 0 };
+}
+
+/**
+ * Legacy v1 narrow diagnostic MCQ eligibility helper (retained for compatibility with existing unit checks).
  */
 export function isMcqEligible(
   u: Unit,
@@ -1044,24 +1157,41 @@ export function computeCalibratedIntervals(
       .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null))
       .sort((a, b) => a.at - b.at || a.seq - b.seq);
 
-    const directProbes = allUnitProbes
-      .filter((ev) => ev.modality !== "mcq")
-      .map((ev) => ({ at: ev.at, seq: ev.seq, grade: ev.grade!, hints: ev.hints, implicit: false }));
+    // Clean v2 standalone MCQs advance FSRS conservatively (`hard` on clean correct, `again` on wrong/idk).
+    // Legacy v1 MCQs (no mcq_role), preliminary gate misses, and assisted/revealed MCQs stay out of FSRS
+    // and anchor a bounded pending check (4h clean v1 / 20m miss/assisted/preliminary).
+    const isFsrsStandaloneMcq = (ev: NonNullable<(typeof allUnitProbes)[number]>) =>
+      ev.modality === "mcq" &&
+      ev.mcq_role === "standalone" &&
+      ev.mcq_outcome !== "assisted_correct" &&
+      ev.mcq_outcome !== "revealed";
 
-    const mcqProbes = allUnitProbes.filter((ev) => ev.modality === "mcq");
-    const latestMcq = mcqProbes.at(-1) ?? null;
-    const lastDirectProdAt = directProbes.at(-1)?.at ?? -1;
-    const pendingMcq = latestMcq && latestMcq.at > lastDirectProdAt ? latestMcq : null;
+    const fsrsProbes = allUnitProbes
+      .filter((ev) => ev.modality !== "mcq" || isFsrsStandaloneMcq(ev))
+      .map((ev) => ({
+        at: ev.at,
+        seq: ev.seq,
+        grade: (ev.modality === "mcq" && ev.grade !== "again" ? "hard" : ev.grade!) as Grade,
+        hints: ev.hints,
+        implicit: false,
+        isStandaloneMcq: ev.modality === "mcq",
+      }));
+
+    const nonFsrsMcqProbes = allUnitProbes.filter((ev) => ev.modality === "mcq" && !isFsrsStandaloneMcq(ev));
+    const latestNonFsrsMcq = nonFsrsMcqProbes.at(-1) ?? null;
+    const lastFsrsAt = fsrsProbes.at(-1)?.at ?? -1;
+    const pendingMcq = latestNonFsrsMcq && latestNonFsrsMcq.at > lastFsrsAt ? latestNonFsrsMcq : null;
+    const latestAnyMcq = allUnitProbes.filter((ev) => ev.modality === "mcq").at(-1) ?? null;
 
     // Implicit DAG credit must never clear or postpone a pending post-MCQ production check.
     const implicitRaw = (downwardCredits.get(u.id) ?? []).sort((a, b) => a.at - b.at || a.seq - b.seq);
-    const merged: { at: number; seq: number; grade: Grade; hints: number; implicit: boolean }[] = [...directProbes];
+    const merged: { at: number; seq: number; grade: Grade; hints: number; implicit: boolean; isStandaloneMcq: boolean }[] = [...fsrsProbes];
     for (const imp of implicitRaw) {
       if (pendingMcq && imp.at >= pendingMcq.at) continue;
       // Avoid double-counting an implicit credit within 4h of an existing direct or implicit event.
       const nearExisting = merged.some((e) => Math.abs(e.at - imp.at) < IMPLICIT_CREDIT_DEDUP_MS);
       if (!nearExisting) {
-        merged.push({ at: imp.at, seq: imp.seq, grade: "good", hints: 0, implicit: true });
+        merged.push({ at: imp.at, seq: imp.seq, grade: "good", hints: 0, implicit: true, isStandaloneMcq: false });
       }
     }
     merged.sort((a, b) => a.at - b.at || a.seq - b.seq);
@@ -1070,7 +1200,11 @@ export function computeCalibratedIntervals(
       if (pendingMcq) {
         const override = dueOverrides?.get(u.id);
         const mcqClean =
-          pendingMcq.grade !== "again" && pendingMcq.mcq_outcome !== "assisted_correct";
+          pendingMcq.mcq_role !== "preliminary" &&
+          pendingMcq.grade !== "again" &&
+          pendingMcq.mcq_outcome !== "assisted_correct" &&
+          pendingMcq.mcq_outcome !== "revealed" &&
+          pendingMcq.mcq_outcome !== "idk";
         const delayMs = mcqClean ? MCQ_CLEAN_DELAY_MS : MCQ_SHORT_DELAY_MS;
         const effectiveDue =
           override && override.created_at >= pendingMcq.at ? override.due_at : pendingMcq.at + delayMs;
@@ -1105,6 +1239,9 @@ export function computeCalibratedIntervals(
     let priorPasses = 0;
     let lastAgainAt: number | null = null;
     let sameDayRelearn = false;
+    let lastProdPassAt: number | null = null;
+    let lastProdIntervalMs: number | null = null;
+    let lastWasStandaloneMcq = false;
 
     for (let i = 0; i < merged.length; i++) {
       const ev = merged[i]!;
@@ -1126,14 +1263,25 @@ export function computeCalibratedIntervals(
           // True lapse relearned same-day: keep post-lapse stability/difficulty, advance last_review.
           mem = { ...mem, last_review: ev.at };
         }
+        if (!ev.isStandaloneMcq) {
+          lastProdPassAt = ev.at;
+          const overnightHours = ev.grade === "hard" ? 14 : ev.grade === "good" ? 20 : 48;
+          lastProdIntervalMs = overnightHours * 3600_000;
+        }
       } else {
         mem = sched.update(mem, { grade: ev.grade, at: ev.at });
         priorPasses++;
         lastAgainAt = null;
         sameDayRelearn = false;
+        if (!ev.isStandaloneMcq) {
+          lastProdPassAt = ev.at;
+          const dueMs = typeof mem.due === "number" ? mem.due : ev.at + 12 * 3600_000;
+          lastProdIntervalMs = Math.max(12 * 3600_000, dueMs - ev.at);
+        }
       }
       lastAt = ev.at;
       lastGrade = ev.grade;
+      lastWasStandaloneMcq = ev.isStandaloneMcq;
     }
 
     const rawDue = typeof mem.due === "number" ? mem.due : lastAt + 12 * 3600_000;
@@ -1148,9 +1296,13 @@ export function computeCalibratedIntervals(
       scheduleKind = "override";
       schedulingEventAt = override.created_at;
     } else if (pendingMcq) {
-      // Pending production check anchored to the committed recognition event (never alters stability/reviews).
+      // Pending production check anchored to the committed non-FSRS MCQ event (never alters stability/reviews).
       const mcqClean =
-        pendingMcq.grade !== "again" && pendingMcq.mcq_outcome !== "assisted_correct";
+        pendingMcq.mcq_role !== "preliminary" &&
+        pendingMcq.grade !== "again" &&
+        pendingMcq.mcq_outcome !== "assisted_correct" &&
+        pendingMcq.mcq_outcome !== "revealed" &&
+        pendingMcq.mcq_outcome !== "idk";
       const delayMs = mcqClean ? MCQ_CLEAN_DELAY_MS : MCQ_SHORT_DELAY_MS;
       effectiveDue = pendingMcq.at + delayMs;
       scheduleKind = pendingMcq.grade === "again" ? "lapse" : "relearn";
@@ -1171,10 +1323,24 @@ export function computeCalibratedIntervals(
       scheduleKind = "normal";
     }
 
+    // Bounded recognition maintenance cap: when a standalone MCQ maintains a unit that already has
+    // production history, cap its due date at 2x the last clean production interval from that pass.
+    if (
+      !pendingMcq &&
+      scheduleKind !== "override" &&
+      lastWasStandaloneMcq &&
+      lastGrade !== "again" &&
+      lastProdPassAt !== null &&
+      lastProdIntervalMs !== null
+    ) {
+      const maintenanceCapDue = lastProdPassAt + 2 * lastProdIntervalMs;
+      effectiveDue = Math.max(lastAt + 12 * 3600_000, Math.min(effectiveDue, maintenanceCapDue));
+    }
+
     // If a direct production pass immediately reconstructed an MCQ miss/reveal within 12h,
     // cap its automatic overnight interval at 14h (overnight hard relearn cap).
-    if (!pendingMcq && scheduleKind !== "override" && lastGrade !== "again" && latestMcq && latestMcq.grade === "again") {
-      const sinceMcqMiss = lastAt - latestMcq.at;
+    if (!pendingMcq && !lastWasStandaloneMcq && scheduleKind !== "override" && lastGrade !== "again" && latestAnyMcq && latestAnyMcq.grade === "again") {
+      const sinceMcqMiss = lastAt - latestAnyMcq.at;
       if (sinceMcqMiss >= 0 && sinceMcqMiss < SAME_DAY_RELEARN_WINDOW_MS) {
         effectiveDue = Math.min(effectiveDue, lastAt + MCQ_RETRY_OVERNIGHT_CAP_MS);
         scheduleKind = "relearn";

@@ -186,7 +186,8 @@ export function sessionHasWork(s: UnitSession | undefined): boolean {
     s.draft.trim().length > 0 ||
     s.citations.length > 0 ||
     Boolean(s.passedVerdict) ||
-    Boolean(s.rep?.modality === "mcq" && s.attemptId)
+    Boolean(s.rep?.modality === "mcq" && s.attemptId) ||
+    Boolean(s.rep?.gate_summary && s.attemptId)
   );
 }
 
@@ -1609,10 +1610,11 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
           }
         }
 
-        // Cross-device resume: hydrate unfinished server attempts (including untouched issued MCQs) into empty local unit sessions.
+        // Cross-device resume: hydrate unfinished server attempts (including untouched issued MCQs & Stage 2 gates) into empty local unit sessions.
         for (const a of res.active_attempts ?? []) {
           const isActiveMcq = a.modality === "mcq" && Boolean(a.mcq?.choices?.length);
-          if (!isActiveMcq && (!a.turns || a.turns.length === 0)) continue;
+          const isActiveStage2 = Boolean(a.gate_summary);
+          if (!isActiveMcq && !isActiveStage2 && (!a.turns || a.turns.length === 0)) continue;
           if (!sessionHasWork(s.sessions[a.unit_id])) {
             const q = itemsById.get(a.unit_id);
             const restored = emptyUnitSession(
@@ -1624,8 +1626,10 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
                 depth: a.depth,
                 prompt: a.prompt,
                 ...(a.modality ? { modality: a.modality } : {}),
+                ...(a.starter ? { starter: a.starter } : {}),
                 attempt_id: a.attempt_id,
                 ...(a.mcq ? { mcq: a.mcq } : {}),
+                ...(a.gate_summary ? { gate_summary: a.gate_summary } : {}),
                 rests_on: [],
                 p_imm: q?.p_imm ?? 0,
                 reviews: q?.reviews ?? 0,

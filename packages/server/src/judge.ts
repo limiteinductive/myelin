@@ -33,10 +33,11 @@ export interface McqChoice {
 export interface McqSpec {
   version: 1;
   item_id: string;
-  choices: [McqChoice, McqChoice, McqChoice, McqChoice];
+  choices: McqChoice[];
   correct_id: string;
   explanation: string;
   why_wrong: Record<string, string>;
+  worked_step?: string | undefined;
 }
 
 export interface PromptCacheEntry {
@@ -82,9 +83,9 @@ function normChoiceText(s: string): string {
 
 /**
  * Strictly validates a server-private MCQ spec before caching or serving:
- * - Exactly 4 unique choices with normalized distinct non-empty text
- * - `correct_id` matches one of the 4 choice IDs
- * - `why_wrong` covers EVERY distractor and NO extra/correct keys
+ * - 3 or 4 unique choices with normalized distinct non-empty text (allow 3 when a 4th would be filler)
+ * - `correct_id` matches one of the choice IDs
+ * - `why_wrong` covers EVERY distractor
  * - No banned meta-options ("all/none of the above", option-position references)
  * - Balanced length (key is not conspicuously >2.5x longer than median distractor)
  * - Balanced `$` math delimiters so KaTeX renders cleanly
@@ -92,7 +93,7 @@ function normChoiceText(s: string): string {
 export function validateMcqSpec(raw: unknown): McqSpec | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as Record<string, unknown>;
-  if (!Array.isArray(o.choices) || o.choices.length !== 4) return null;
+  if (!Array.isArray(o.choices) || (o.choices.length !== 3 && o.choices.length !== 4)) return null;
   const choices: McqChoice[] = [];
   const ids = new Set<string>();
   const norms = new Set<string>();
@@ -146,13 +147,19 @@ export function validateMcqSpec(raw: unknown): McqSpec | null {
           .digest("hex")
           .slice(0, 16);
 
+  const workedStep =
+    typeof o.worked_step === "string" && o.worked_step.trim().length >= 8
+      ? o.worked_step.trim().slice(0, 420)
+      : undefined;
+
   return {
     version: 1,
     item_id: itemId,
-    choices: choices as [McqChoice, McqChoice, McqChoice, McqChoice],
+    choices,
     correct_id: correctId,
     explanation,
     why_wrong: whyWrong,
+    ...(workedStep ? { worked_step: workedStep } : {}),
   };
 }
 
@@ -3343,37 +3350,114 @@ Rules:
     return p;
   }
 
+  private mcqCacheKey(
+    unit: { id: string; text: string },
+    restsOn: string[],
+    variant: number,
+    role: "standalone" | "preliminary",
+    pairedPrompt?: string,
+  ): string {
+    const pairHash = pairedPrompt ? createHash("sha256").update(pairedPrompt).digest("hex").slice(0, 10) : "";
+    return `${this.promptKey(unit, "recall", restsOn, variant, "mcq", [])}:r=${role}${pairHash ? `:p=${pairHash}` : ""}`;
+  }
+
+  /** Prefetches verified MCQs in the background so one-tap MCQs don't stall on serial LLM calls. */
+  warmMcqs(
+    items: {
+      unit: { id: string; text: string; kind: string; topic?: string | null };
+      restsOn: string[];
+      variant?: number;
+      priorPrompts?: string[];
+      role: "standalone" | "preliminary";
+      pairedProduction?: { prompt: string; depth: Depth; expectedCrux?: string };
+    }[],
+  ): void {
+    if (!this.enabled || items.length === 0) return;
+    const queue = items.filter((item) => {
+      const key = this.mcqCacheKey(item.unit, item.restsOn, item.variant ?? 0, item.role, item.pairedProduction?.prompt);
+      return !this.promptCache.has(key) && !this.inflightPrompts.has(key);
+    });
+    if (queue.length === 0) return;
+    const run = async () => {
+      for (const item of queue.slice(0, 3)) {
+        if (this.activeForegroundPrompts > 0) break;
+        try {
+          await this.generateMcqEntry(item.unit, item.restsOn, {
+            variant: item.variant,
+            priorPrompts: item.priorPrompts,
+            role: item.role,
+            pairedProduction: item.pairedProduction,
+          });
+        } catch {
+          /* ignore background MCQ prefetch errors */
+        }
+      }
+    };
+    void run();
+  }
+
   /**
-   * Generates and blind-verifies a strict server-private 4-choice diagnostic MCQ entry.
-   * Never falls back to raw model output (which could leak the private key); returns null on
-   * any validation, ambiguity, or verifier disagreement so callers serve ordinary open contrast.
+   * Generates and blind-verifies a strict server-private 3- or 4-choice competitive MCQ entry.
+   * Supports both `standalone` discrimination reviews and `preliminary` non-spoiling triage gates.
+   * Never falls back to raw model output; returns null on any validation, ambiguity, or spoiler leak.
    */
   async generateMcqEntry(
     unit: { id: string; text: string; kind: string; topic?: string | null },
     restsOn: string[],
-    opts: PromptContextOptions = {},
+    opts: PromptContextOptions & {
+      role?: "standalone" | "preliminary";
+      pairedProduction?: { prompt: string; depth: Depth; expectedCrux?: string | undefined };
+    } = {},
   ): Promise<PromptCacheEntry | null> {
     const variant = opts.variant ?? 0;
-    const key = this.promptKey(unit, "recall", restsOn, variant, "mcq", []);
+    const role = opts.role ?? "standalone";
+    const key = this.mcqCacheKey(unit, restsOn, variant, role, opts.pairedProduction?.prompt);
     const cached = this.promptCache.get(key);
     if (cached?.modality === "mcq" && cached.mcq) return cached;
     if (!this.enabled) return null;
 
-    const genSys = `Write ONE sharp diagnostic 4-choice MCQ testing a single boundary condition or distinction for the target unit.
+    const kind = unit.kind.trim().toLowerCase();
+    const objectiveHint =
+      role === "preliminary"
+        ? "Test ONE foundational prerequisite, structural setup, reduction axis, or invariant needed BEFORE the learner attempts the paired production problem—WITHOUT giving away any scored derivation step, formula, or code line of that problem."
+        : kind === "pitfall" || kind === "mechanism" || kind === "result"
+          ? "Ask the learner to diagnose a concrete failure mode, predict the direction of a change, or pick the exact assumption required."
+          : kind === "move" || kind === "skill"
+            ? "Ask the learner to select which method applies or identify which invariant a proposed approach violates (do not ask them to recognize raw boilerplate)."
+            : "Present a fresh concrete case and ask the learner to classify it, distinguish nearby concepts, or identify a boundary/counterexample.";
+
+    const genSys =
+      role === "preliminary"
+        ? `Write ONE fast, competitive 3- or 4-choice PRELIMINARY CHECK (triage gate) that runs right before a harder production problem.
 Strict rules:
-- Frame ONE concrete scenario where all assumptions (dimensions, scalar vs per-coordinate parameters, operations) are stated explicitly so ONLY ONE option is uniquely defensible.
-- Write 4 parallel options ("a","b","c","d") with comparable length, notation, and specificity—never make the correct answer conspicuously longer or more hedged.
-- Three distractors must represent distinct, plausible mistakes. BAN "all of the above", "none of the above", position references ("Option A"), or joke answers.
+- Objective: ${objectiveHint}
+- ANTI-SPOILER RULE: Neither the stem, nor ANY choice, nor expected_crux may reveal or supply the target formula, implementation, or scored derivation steps of the paired production problem!
+- Frame ONE concrete scenario with explicit premises so ONLY ONE option is uniquely defensible.
+- Write 3 or 4 parallel options ("a","b","c"[,"d"]) with comparable length, notation, and specificity. Use 3 strong options rather than padding a weak 4th filler.
+- Every distractor must be a genuine competitive misconception (correct under one identifiable change of premise). BAN "all of the above", "none of the above", position references ("Option A"), or joke answers.
+- Also provide "worked_step": 1-2 crisp lines giving a small concrete worked step shown ONLY if the learner misses or taps I don't know.
 - Put math variables/formulas in $...$ with balanced delimiters (double-escape LaTeX backslashes in JSON).
 - Return ONLY valid JSON:
-  {"prompt": string, "expected_crux": string, "choices": [{"id":"a","text":string},{"id":"b","text":string},{"id":"c","text":string},{"id":"d","text":string}], "correct_id": "a"|"b"|"c"|"d", "explanation": string, "why_wrong": { [distractorId]: string }}`;
+  {"prompt": string, "expected_crux": string, "choices": [{"id":"a","text":string},{"id":"b","text":string},{"id":"c","text":string},...], "correct_id": "a"|"b"|"c"|"d", "explanation": string, "why_wrong": { [distractorId]: string }, "worked_step": string}`
+        : `Write ONE sharp, competitive 3- or 4-choice MCQ testing active discrimination for the target unit.
+Strict rules:
+- Objective: ${objectiveHint}
+- Frame ONE fresh concrete scenario where all assumptions (dimensions, scalar vs per-coordinate parameters, operations) are stated explicitly so ONLY ONE option is uniquely defensible.
+- Write 3 or 4 parallel options ("a","b","c"[,"d"]) with comparable length, notation, and specificity—never make the correct answer conspicuously longer or more hedged. Use 3 strong options rather than padding a weak 4th filler.
+- Every distractor must be a competitive alternative that would be right under one identifiable change of premise. BAN "all of the above", "none of the above", position references ("Option A"), or joke answers.
+- Put math variables/formulas in $...$ with balanced delimiters (double-escape LaTeX backslashes in JSON).
+- Return ONLY valid JSON:
+  {"prompt": string, "expected_crux": string, "choices": [{"id":"a","text":string},{"id":"b","text":string},{"id":"c","text":string},...], "correct_id": "a"|"b"|"c"|"d", "explanation": string, "why_wrong": { [distractorId]: string }}`;
 
     const genUser = [
       `Target unit (${unit.kind}): ${unit.text}`,
       unit.topic ? `Topic: ${unit.topic}` : null,
       restsOn.length ? `Rests on: ${restsOn.join("; ")}` : null,
+      role === "preliminary" && opts.pairedProduction
+        ? `Paired production problem (DO NOT SPOIL its scored steps/formula/code in the MCQ):\n${opts.pairedProduction.prompt}${opts.pairedProduction.expectedCrux ? `\nScored crux (keep hidden): ${opts.pairedProduction.expectedCrux}` : ""}`
+        : null,
       opts.priorPrompts?.length
-        ? `Previously asked prompts (use a fresh boundary scenario):\n${opts.priorPrompts.map((x) => `- ${x}`).join("\n")}`
+        ? `Previously asked prompts (use a fresh scenario):\n${opts.priorPrompts.map((x) => `- ${x}`).join("\n")}`
         : null,
     ]
       .filter(Boolean)
@@ -3424,6 +3508,7 @@ Strict rules:
         correct_id?: string;
         explanation?: string;
         why_wrong?: Record<string, string>;
+        worked_step?: string;
       }>(raw);
       if (!parsed || typeof parsed.prompt !== "string" || parsed.prompt.trim().length < 12) return null;
       const promptText = parsed.prompt.trim();
@@ -3431,23 +3516,36 @@ Strict rules:
       if (!spec) return null;
 
       // Blind verifier: solve stem + shuffled choices + source premise WITHOUT knowing proposed correct_id.
+      // For preliminary gates, also audit for any spoiler leak into the paired production prompt.
       const shuffled = [...spec.choices];
       for (let i = shuffled.length - 1; i > 0; i--) {
         const j = randomInt(i + 1);
         [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
       }
-      const verifySys = `You are a strict blind verifier auditing a 4-choice diagnostic MCQ for ambiguity.
-Given the source concept, question stem, and 4 choices, determine whether EXACTLY ONE choice is uniquely defensible under the stated premises.
+      const verifySys =
+        role === "preliminary" && opts.pairedProduction
+          ? `You are a strict blind verifier auditing a preliminary MCQ gate before a production problem.
+1. Determine whether EXACTLY ONE choice is uniquely defensible under the stated premises.
+2. Check whether ANY visible choice or the MCQ stem leaks/supplies a scored derivation step, formula, or code answer required by the paired production problem.
+Return ONLY valid JSON: {"chosen_id": string | "AMBIGUOUS", "leaks_production": boolean, "reason": string}`
+          : `You are a strict blind verifier auditing a competitive MCQ for ambiguity.
+Given the source concept, question stem, and choices, determine whether EXACTLY ONE choice is uniquely defensible under the stated premises.
 Return ONLY valid JSON: {"chosen_id": string | "AMBIGUOUS", "reason": string}`;
       const verifyUser = [
         `Source concept: ${unit.text}`,
         `Question: ${promptText}`,
         `Choices:\n${shuffled.map((c) => `- [${c.id}] ${c.text}`).join("\n")}`,
-      ].join("\n\n");
+        role === "preliminary" && opts.pairedProduction
+          ? `Paired production problem:\n${opts.pairedProduction.prompt}${opts.pairedProduction.expectedCrux ? `\nScored crux: ${opts.pairedProduction.expectedCrux}` : ""}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       const vRaw = await callModel(verifySys, verifyUser);
       if (!vRaw) return null;
-      const vParsed = parseJudgeJson<{ chosen_id?: string; reason?: string }>(vRaw);
+      const vParsed = parseJudgeJson<{ chosen_id?: string; leaks_production?: boolean; reason?: string }>(vRaw);
       if (!vParsed || vParsed.chosen_id?.trim() !== spec.correct_id) return null;
+      if (role === "preliminary" && vParsed.leaks_production === true) return null;
 
       const crux =
         typeof parsed.expected_crux === "string" && parsed.expected_crux.trim().length >= 4

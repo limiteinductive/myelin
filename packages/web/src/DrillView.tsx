@@ -363,8 +363,15 @@ export function DrillView() {
   const [blankNote, setBlankNote] = createSignal("");
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
-  const [mcqSubmitting, setMcqSubmitting] = createSignal<"check" | "reveal" | null>(null);
+  const [mcqSubmitting, setMcqSubmitting] = createSignal<string | null>(null);
   const [mcqError, setMcqError] = createSignal<string | null>(null);
+  const [gateHoldingChoiceId, setGateHoldingChoiceId] = createSignal<string | null>(null);
+  const [gatePeekOpen, setGatePeekOpen] = createSignal(false);
+  const [gateContinuing, setGateContinuing] = createSignal(false);
+  const [gateJustOpened, setGateJustOpened] = createSignal(false);
+  const [gateAnnouncement, setGateAnnouncement] = createSignal("");
+  let gateHoldTimer: ReturnType<typeof setTimeout> | null = null;
+  let mcqPointerDown: { x: number; y: number; hadSelection: boolean } | null = null;
 
   // Selection-based citations & quiet "+ Map" pin (T3 Code-style floating pill on text selection)
   const [citePill, setCitePill] = createSignal<CitePillState | null>(null);
@@ -394,12 +401,18 @@ export function DrillView() {
   const passedVerdict = () => (isNonUnit() ? null : (unitSession()?.passedVerdict ?? null));
   const overridden = () => (isNonUnit() ? false : Boolean(unitSession()?.overridden));
 
-  // Bounded multiple-choice rep: four frozen options, select then Check, ungraded clarifying line.
+  // Bounded multiple-choice rep (standalone or Stage 1 preliminary gate): one-tap submit + explicit IDK.
   const mcqChoices = () => (rep()?.modality === "mcq" ? (rep()?.mcq?.choices ?? []) : []);
   const isMcq = () => mcqChoices().length > 0;
-  const mcqOpen = () => isMcq() && !passedVerdict()?.ok;
+  const isPreliminaryGate = () => isMcq() && rep()?.mcq?.role === "preliminary";
+  const foldedGate = () => (!isMcq() ? (rep()?.gate_summary ?? null) : null);
+  const mcqOpen = () => isMcq() && !passedVerdict()?.ok && gateHoldingChoiceId() === null;
   const mcqResult = () => (isMcq() ? (passedVerdict()?.mcq_result ?? null) : null);
-  const mcqSelectedId = () => mcqResult()?.selected_choice_id ?? (mcqOpen() ? (unitSession()?.mcqSelectedChoiceId ?? null) : null);
+  const mcqSelectedId = () =>
+    gateHoldingChoiceId() ??
+    mcqResult()?.selected_choice_id ??
+    (mcqSubmitting() && mcqSubmitting() !== "__idk__" ? mcqSubmitting() : null) ??
+    (mcqOpen() ? (unitSession()?.mcqSelectedChoiceId ?? null) : null);
   const exploreAddedIds = createMemo(() => {
     const ids = new Set<string>();
     if (!isExploreMode() && !activeFrontier()) return ids;
@@ -639,6 +652,16 @@ export function DrillView() {
     setError(null);
     setMcqSubmitting(null);
     setMcqError(null);
+    if (gateHoldTimer) {
+      clearTimeout(gateHoldTimer);
+      gateHoldTimer = null;
+    }
+    setGateHoldingChoiceId(null);
+    setGatePeekOpen(false);
+    setGateContinuing(false);
+    setGateJustOpened(false);
+    setGateAnnouncement("");
+    mcqPointerDown = null;
     mcqOptionEls = [];
     clearSketch();
   };
@@ -698,12 +721,14 @@ export function DrillView() {
         .filter((u) => u.unit_id !== unitId)
         .slice(0, 4)
         .map((u) => u.unit_id);
+      const isCompactViewport = typeof matchMedia === "function" && matchMedia("(max-width: 900px)").matches;
       const res = await fetchNextDrill(
         {
           unitId,
           sittingId: practice.state.sittingId,
           sittingSize: practice.state.sittingIds.length,
           directDone: practice.sittingDirectDoneCount(),
+          compact: isCompactViewport,
           manual: practice.isManualPractice(unitId),
           retry: practice.isRetryUnit(unitId),
           nextIds: upcomingIds,
@@ -1027,6 +1052,10 @@ export function DrillView() {
       activeAbort?.abort();
       postAbort?.abort();
       clearAdvanceTimer();
+      if (gateHoldTimer) {
+        clearTimeout(gateHoldTimer);
+        gateHoldTimer = null;
+      }
       canvasResizeObs?.disconnect();
       window.removeEventListener("resize", onResize);
       window.removeEventListener("scroll", onScroll, true);
@@ -1165,39 +1194,109 @@ export function DrillView() {
     target instanceof Element &&
     Boolean(target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]'));
 
-  const selectMcqChoice = (choiceId: string, focus = false) => {
-    if (!mcqOpen() || busy()) return;
-    if (unitSession()?.mcqSelectedChoiceId !== choiceId) {
-      practice.updateUnitSession(sessionKey(), (d) => {
-        d.mcqSelectedChoiceId = choiceId;
-      });
-    }
-    setMcqError(null);
-    if (focus) mcqOptionEls[mcqChoices().findIndex((c) => c.id === choiceId)]?.focus();
+  const onMcqOptionPointerDown = (e: PointerEvent) => {
+    const sel = window.getSelection();
+    const hadSelection = Boolean(sel && !sel.isCollapsed && sel.toString().trim().length > 0);
+    mcqPointerDown = { x: e.clientX, y: e.clientY, hadSelection };
   };
 
   const onMcqOptionClick = (e: MouseEvent, choiceId: string) => {
-    // Dragging across an option to cite it must not also change the answer.
+    if (!mcqOpen() || busy()) return;
+    // Pointer guard: dragging >6px to select text, or clicking to dismiss an existing selection, never submits.
+    if (mcqPointerDown) {
+      const dx = e.clientX - mcqPointerDown.x;
+      const dy = e.clientY - mcqPointerDown.y;
+      const hadSelection = mcqPointerDown.hadSelection;
+      mcqPointerDown = null;
+      if (hadSelection || Math.hypot(dx, dy) > 6) return;
+    }
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed && sel.toString().trim() && e.currentTarget instanceof Node && sel.containsNode(e.currentTarget, true)) {
       return;
     }
-    selectMcqChoice(choiceId);
+    void submitMcq("choice", choiceId);
   };
 
   const onMcqOptionKey = (e: KeyboardEvent, index: number) => {
     if (!mcqOpen() || busy() || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
     const list = mcqChoices();
+    if (e.key === "Enter" || e.key === " ") {
+      const cur = list[index];
+      if (!cur) return;
+      e.preventDefault();
+      void submitMcq("choice", cur.id);
+      return;
+    }
     let next = -1;
     if (e.key === "ArrowDown" || e.key === "ArrowRight") next = (index + 1) % list.length;
     else if (e.key === "ArrowUp" || e.key === "ArrowLeft") next = (index - 1 + list.length) % list.length;
     else if (e.key === "Home") next = 0;
     else if (e.key === "End") next = list.length - 1;
-    else if (e.key === " " || e.key === "Enter") next = index;
-    const target = list[next];
-    if (!target) return;
+    if (next < 0 || !list[next]) return;
     e.preventDefault();
-    selectMcqChoice(target.id, true);
+    mcqOptionEls[next]?.focus();
+  };
+
+  /** Transition a preliminary gate into its paired Stage 2 production prompt inside the same slot. */
+  const applyGateToProduction = (
+    ownerKey: string,
+    nextStage: NonNullable<CheckDrillResponse["next_stage"]>,
+    localGateMeta: {
+      choices: { id: string; text: string }[];
+      correct_id?: string | null;
+      selected_choice_id?: string | null;
+      explanation?: string | null;
+      why_wrong_selected?: string | null;
+      worked_step?: string | null;
+    },
+  ) => {
+    practice.updateUnitSession(ownerKey, (d) => {
+      const prevRep = d.rep;
+      if (!prevRep) return;
+      d.attemptId = nextStage.attempt_id;
+      d.passedVerdict = null;
+      d.overridden = false;
+      d.mcqSelectedChoiceId = null;
+      d.beats = [];
+      d.postBeats = [];
+      d.draft =
+        nextStage.starter && !shouldPinStarterAbovePad(nextStage.starter)
+          ? nextStage.starter
+          : "";
+      d.rep = {
+        ...prevRep,
+        attempt_id: nextStage.attempt_id,
+        depth: nextStage.depth,
+        prompt: nextStage.prompt,
+        modality: nextStage.modality,
+        starter: nextStage.starter ?? null,
+        mcq: undefined,
+        gate_summary: {
+          ...nextStage.gate_summary,
+          choices: localGateMeta.choices,
+          correct_id: localGateMeta.correct_id ?? null,
+          selected_choice_id: localGateMeta.selected_choice_id ?? null,
+          explanation: localGateMeta.explanation ?? null,
+          why_wrong_selected: localGateMeta.why_wrong_selected ?? null,
+          worked_step: localGateMeta.worked_step ?? null,
+        },
+      };
+    });
+    activeMs = 0;
+    lastActivityAt = 0;
+    setGateHoldingChoiceId(null);
+    setGatePeekOpen(false);
+    setGateJustOpened(true);
+    setGateAnnouncement("Quick check passed. Full problem below.");
+    if (practice.stageKey() !== ownerKey) return;
+    requestAnimationFrame(() => {
+      autoGrow();
+      if (!isTouchDevice()) {
+        const target = activeBlanks() ? blankEls[0] : textarea;
+        target?.focus({ preventScroll: true });
+        target?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    });
   };
 
   /** Settle an issued MCQ from the server's verdict. The option card carries the verdict, so no beat is added. */
@@ -1224,25 +1323,33 @@ export function DrillView() {
     });
   };
 
-  const submitMcq = async (mode: "check" | "reveal") => {
+  const submitMcq = async (mode: "choice" | "idk", explicitChoiceId?: string) => {
     const r = rep();
     const ownerKey = sessionKey();
     if (!r || !mcqOpen() || busy()) return;
-    const choiceId = mode === "check" ? (unitSession()?.mcqSelectedChoiceId ?? null) : null;
-    if (mode === "check" && !choiceId) return;
+    const choiceId = mode === "choice" ? (explicitChoiceId ?? null) : null;
+    if (mode === "choice" && !choiceId) return;
     const attemptId = mcqAttemptId();
     if (!attemptId) {
       setMcqError("This question didn't load fully. Reload and try again.");
       return;
     }
     const latencyMs = mcqLatencyMs();
+    const frozenChoices = mcqChoices().map((c) => ({ id: c.id, text: c.text }));
+
+    // Acknowledge tap immediately on the chosen option row.
+    if (choiceId) {
+      practice.updateUnitSession(ownerKey, (d) => {
+        d.mcqSelectedChoiceId = choiceId;
+      });
+    }
 
     const ctrl = new AbortController();
     activeAbort = ctrl;
     setCitePill(null);
     setCiteEditor(null);
     setBusy(true);
-    setMcqSubmitting(mode);
+    setMcqSubmitting(choiceId ?? "__idk__");
     setMcqError(null);
     setError(null);
     try {
@@ -1250,17 +1357,39 @@ export function DrillView() {
         {
           attempt_id: attemptId,
           unit_id: r.unit_id,
-          ...(choiceId ? { choice_id: choiceId } : { reveal: true }),
+          ...(choiceId ? { choice_id: choiceId } : { idk: true }),
           latency_ms: latencyMs,
         },
         ctrl.signal,
       );
       if (disposed || ctrl.signal.aborted) return;
+
+      // Preliminary gate PASSED: hold confirmation beat 450ms (0ms reduced motion), then fold into Stage 2!
+      if (res.gate_passed && res.next_stage && choiceId) {
+        const nextStage = res.next_stage;
+        const reduced = typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
+        setGateHoldingChoiceId(choiceId);
+        const complete = () => {
+          gateHoldTimer = null;
+          if (disposed) return;
+          applyGateToProduction(ownerKey, nextStage, {
+            choices: frozenChoices,
+            correct_id: choiceId,
+            selected_choice_id: choiceId,
+          });
+        };
+        if (reduced) {
+          complete();
+        } else {
+          gateHoldTimer = setTimeout(complete, 450);
+        }
+        return;
+      }
+
       settleMcq(ownerKey, res);
     } catch (e) {
-      // The selected choice and the attempt id stay exactly as they were, so a retry re-sends the same answer.
       if (disposed || ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
-      setMcqError(mcqFailureMessage(e));
+      setMcqError("Couldn't check that just now. Tap an option to try again.");
     } finally {
       if (activeAbort === ctrl) {
         activeAbort = null;
@@ -1269,6 +1398,38 @@ export function DrillView() {
           setMcqSubmitting(null);
         }
       }
+    }
+  };
+
+  const continueGateToProduction = async () => {
+    const r = rep();
+    const ownerKey = sessionKey();
+    const attemptId = mcqAttemptId();
+    const prevResult = mcqResult();
+    if (!r || !attemptId || gateContinuing() || busy()) return;
+    const frozenChoices = mcqChoices().map((c) => ({ id: c.id, text: c.text }));
+    setGateContinuing(true);
+    setMcqError(null);
+    try {
+      const res = await submitMcqChoice({
+        attempt_id: attemptId,
+        unit_id: r.unit_id,
+        continue_to_production: true,
+        latency_ms: null,
+      });
+      if (disposed || !res.next_stage) return;
+      applyGateToProduction(ownerKey, res.next_stage, {
+        choices: frozenChoices,
+        correct_id: prevResult?.correct_id ?? null,
+        selected_choice_id: prevResult?.selected_choice_id ?? null,
+        explanation: prevResult?.explanation ?? null,
+        why_wrong_selected: prevResult?.why_wrong_selected ?? null,
+        worked_step: prevResult?.worked_step ?? null,
+      });
+    } catch (e) {
+      if (!disposed) setMcqError(mcqFailureMessage(e));
+    } finally {
+      if (!disposed) setGateContinuing(false);
     }
   };
 
@@ -1422,11 +1583,7 @@ export function DrillView() {
           e.preventDefault();
           void sendMcqClarify();
         }
-        return;
       }
-      e.preventDefault();
-      if (draft().trim().length > 0 || citations().length > 0) return;
-      if (unitSession()?.mcqSelectedChoiceId) void submitMcq("check");
       return;
     }
     if (editable || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
@@ -1435,7 +1592,7 @@ export function DrillView() {
     const choice = digit > 0 ? mcqChoices()[digit - 1] : undefined;
     if (!choice) return;
     e.preventDefault();
-    selectMcqChoice(choice.id, true);
+    void submitMcq("choice", choice.id);
   };
 
   const executeBeatRequest = async (opts: {
@@ -2639,19 +2796,29 @@ export function DrillView() {
     return soon(next);
   };
 
-  // MCQ verdicts state the next assignment, never a win: the next rep always removes the choices.
+  // Honest dynamic schedule label matching the server's next assignment (standalone review vs cold recall vs gate miss).
   const mcqScheduleLabel = () => {
     const v = passedVerdict();
-    const outcome = v?.mcq_result?.outcome;
+    const res = v?.mcq_result;
+    const outcome = res?.outcome;
     if (!v || !v.ok) return "";
-    const inTime = (ms: number) => `Next: answer without choices in ${fmtDur(ms)}`;
+    const isGate = res?.role === "preliminary";
+    const mode = res?.next_review_mode;
+    const missed = outcome === "wrong" || outcome === "idk" || outcome === "revealed" || (!outcome && v.grade === "again");
+    const formatDelay = (ms: number) => {
+      if (isGate) return `Full problem returns in ${fmtDur(ms)}`;
+      if (mode === "any" && !missed) return `Next review in ${fmtDur(ms)}`;
+      return `Recall without choices in ${fmtDur(ms)}`;
+    };
     const preview = previewDelayMs();
-    if (preview !== null) return inTime(preview);
+    if (preview !== null) return formatDelay(preview);
     const next = v.next_in_ms !== null && v.next_in_ms > 0 ? v.next_in_ms : null;
-    if (overridden() && next !== null) return inTime(next);
-    const missed = outcome === "wrong" || outcome === "revealed" || (!outcome && v.grade === "again");
-    if (missed && practice.isRetryUnit(sessionKey())) return "Answer without choices at end of sitting";
-    return inTime(next ?? (outcome === "correct" ? 4 * 3_600_000 : 20 * 60_000));
+    if (overridden() && next !== null) return formatDelay(next);
+    if (missed && practice.isRetryUnit(sessionKey())) {
+      return isGate ? "Full problem at end of sitting" : "Recall without choices at end of sitting";
+    }
+    if (next !== null) return formatDelay(next);
+    return "Scheduled";
   };
 
   /** The frozen options and what the learner did with them, for the post-verdict explore context. */
@@ -2671,6 +2838,7 @@ export function DrillView() {
       correct: `The learner chose option ${picked ?? "?"}, which is correct.`,
       assisted_correct: `The learner chose option ${picked ?? "?"}, which is correct, after asking for clarifying help.`,
       wrong: `The learner chose option ${picked ?? "?"}, which is wrong.${answer}`,
+      idk: `The learner selected "I don't know"; the answer was shown to them.${answer}`,
       revealed: `The learner did not choose an option; the answer was shown to them.${answer}`,
     };
     return `\n\nIt was asked as multiple choice with these options:\n${lines.join("\n")}${res ? `\n${outcomes[res.outcome]}` : ""}`;
@@ -2705,12 +2873,18 @@ export function DrillView() {
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   };
 
-  /** Schedule line with the Bring back slider, plus Next. Shared by the written and the MCQ verdict. */
-  const VerdictFoot = (props: { label: () => string; note?: () => string; clean: () => boolean }) => {
+  /** Schedule line with the Bring back slider, plus Next (and optional secondary action). Shared by written & MCQ verdicts. */
+  const VerdictFoot = (props: {
+    label: () => string;
+    note?: () => string;
+    clean: () => boolean;
+    extraClass?: string;
+    secondary?: () => any;
+  }) => {
     const note = () => props.note?.() ?? "";
     return (
       <>
-        <div class="v2-verdict-foot">
+        <div class={`v2-verdict-foot${props.extraClass ? ` ${props.extraClass}` : ""}`}>
           <span class="v2-verdict-trace">
             <Show when={props.label()}>
               <Show
@@ -2747,6 +2921,7 @@ export function DrillView() {
             </Show>
           </span>
           <div class="v2-pass-actions">
+            {props.secondary?.()}
             <button
               type="button"
               class={{ "v2-btn-primary": true, "is-passed": props.clean() }}
@@ -2934,222 +3109,445 @@ export function DrillView() {
         <Show when={inSittingLine()}>
           <SittingHairline slots={practice.sittingSlots()} />
         </Show>
-        <div class="v2-prompt-wrap">
-          <Switch fallback={<h1 class="v2-prompt v2-prompt--open">What do you want to work through?</h1>}>
-            <Match when={activeExploration()}>
-              {(e) => (
-                <h1 class="v2-prompt" data-citable="true">
-                  {inline(e().title)}
-                </h1>
-              )}
-            </Match>
-            <Match when={activeFrontier()}>
-              {(f) => (
-                <div class="v2-briefing-head">
-                  <h1 class="v2-prompt" data-citable="true">
-                    {inline(f().title)}
-                  </h1>
-                  <Show when={f().skipped_known.length > 0}>
-                    <div class="v2-briefing-skipped">
-                      Skipping known: {f().skipped_known.join(" · ")}
+        <span class="v2-sr-only" role="status" aria-live="polite">
+          {gateAnnouncement()}
+        </span>
+
+        {/* Stage 2 folded preliminary gate strip (sits above the paired production prompt like an eyebrow) */}
+        <Show when={foldedGate()}>
+          {(fg) => (
+            <section
+              class={{
+                "v2-gate": true,
+                "is-folded": true,
+                "is-collapsed": !gatePeekOpen(),
+              }}
+              aria-label="Quick check"
+            >
+              <button
+                type="button"
+                class={{ "v2-gate-strip": true, "is-neutral": Boolean(fg().continued_after_miss) }}
+                aria-expanded={gatePeekOpen() ? "true" : "false"}
+                aria-controls="v2-gate-body"
+                onClick={() => setGatePeekOpen((v) => !v)}
+              >
+                <span class="v2-gate-strip-mark" aria-hidden="true">
+                  <Show
+                    when={!fg().continued_after_miss}
+                    fallback={
+                      <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8">
+                        <circle cx="8" cy="8" r="5" />
+                      </svg>
+                    }
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                    </svg>
+                  </Show>
+                </span>
+                <span class="v2-gate-strip-label">Quick check</span>
+                <Show when={fg().chosen_text}>
+                  <span class="v2-gate-strip-snippet">{fg().chosen_text}</span>
+                </Show>
+                <svg class="v2-gate-strip-caret" width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 4.5 6 7.5l3-3" />
+                </svg>
+              </button>
+              <div class="v2-gate-body" id="v2-gate-body">
+                <div class="v2-gate-body-inner">
+                  <Show when={fg().prompt}>
+                    <div class="v2-prompt-wrap">
+                      <p class="v2-prompt" data-citable="true">
+                        {inline(fg().prompt)}
+                      </p>
                     </div>
                   </Show>
-                  <div class="v2-briefing-body" data-citable="true">
-                    <Body text={f().body} />
-                  </div>
-                  <div class="v2-briefing-bar">
-                    <span class="v2-briefing-hint">Highlight any phrase or formula to cite &amp; unpack</span>
-                    <Show when={f().cruxes.length > 0}>
-                      <button
-                        type="button"
-                        class="v2-pill-btn"
-                        disabled={busy()}
-                        onClick={() => void startTestMe()}
-                      >
-                        Test me
-                        <Show when={(f().demonstrated_cruxes?.length ?? 0) > 0}>
-                          {" · "}
-                          {f().demonstrated_cruxes!.length}/{f().cruxes.length}
-                        </Show>
-                      </button>
-                    </Show>
-                  </div>
-                </div>
-              )}
-            </Match>
-            <Match when={rep()}>
-              {(r) => {
-                const anchor = () => starterAnchorLine(r().starter);
-                const pinnedAbove = () => shouldPinStarterAbovePad(r().starter);
-                const rendered = () => isRenderedStarter(r().starter);
-                const hasStarterBeat = () =>
-                  beats().some((b) => b.kind === "starter" || (Boolean(anchor()) && b.user.includes(anchor())));
-                const showStarterRef = () =>
-                  Boolean(r().starter) &&
-                  !activeBlanks() &&
-                  !hasStarterBeat() &&
-                  (pinnedAbove() || beats().length > 0);
-                return (
-                  <>
-                    <h1 class="v2-prompt" data-citable="true">
-                      {inline(r().prompt)}
-                    </h1>
-                    <Show when={showStarterRef()}>
-                      <Show
-                        when={rendered()}
-                        fallback={
-                          <pre class="v2-prompt-starter" data-citable="true">
-                            {mathOnly(r().starter!)}
-                          </pre>
-                        }
-                      >
-                        <div class="v2-prompt-starter is-prose" data-citable="true">
-                          <Body text={r().starter!} />
+                  <Show when={(fg().choices?.length ?? 0) > 0}>
+                    <div class="v2-mcq-stage">
+                      <div class="v2-pad v2-textured v2-mcq is-settled">
+                        <div class="v2-mcq-options" role="group" aria-label="Quick check choices">
+                          <For each={fg().choices ?? []}>
+                            {(ch, idx) => {
+                              const isCorrect = () => fg().correct_id === ch.id;
+                              const isPicked = () => fg().selected_choice_id === ch.id;
+                              const isWrongPick = () => Boolean(fg().continued_after_miss) && isPicked() && !isCorrect();
+                              return (
+                                <div
+                                  class={{
+                                    "v2-mcq-option": true,
+                                    "is-selected": isPicked(),
+                                    "is-correct": isCorrect(),
+                                    "is-wrong-pick": isWrongPick(),
+                                    "is-locked": true,
+                                  }}
+                                  aria-disabled="true"
+                                >
+                                  <span class="v2-mcq-mark" aria-hidden="true">
+                                    <Show when={isCorrect()} fallback={<span class="v2-mcq-num">{idx() + 1}</span>}>
+                                      <svg class="v2-check-svg" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                                      </svg>
+                                    </Show>
+                                  </span>
+                                  <span class="v2-mcq-text" data-citable="true">
+                                    {inline(ch.text)}
+                                  </span>
+                                  <Show when={isCorrect() || isWrongPick()}>
+                                    <span class="v2-mcq-badge">
+                                      {isCorrect()
+                                        ? fg().outcome === "idk" || fg().outcome === "revealed"
+                                          ? "Answer"
+                                          : "Correct"
+                                        : "Your choice"}
+                                    </span>
+                                  </Show>
+                                </div>
+                              );
+                            }}
+                          </For>
+                        </div>
+                      </div>
+                      {/* Only show explanation inside peek when continued after a miss (never spoil a passed gate before production settles). */}
+                      <Show when={fg().continued_after_miss && (fg().explanation || fg().why_wrong_selected)}>
+                        <div class="v2-beat-coach v2-mcq-verdict is-revealed">
+                          <div class="v2-verdict-body" data-citable="true">
+                            <Show when={fg().explanation}>
+                              <p class="v2-gate-principle">{inline(fg().explanation ?? "")}</p>
+                            </Show>
+                            <Show when={fg().why_wrong_selected}>
+                              <p>{inline(fg().why_wrong_selected ?? "")}</p>
+                            </Show>
+                            <Show when={fg().worked_step}>
+                              <div class="v2-gate-step">
+                                <span class="v2-gate-step-label">One step</span>
+                                <p>{inline(fg().worked_step ?? "")}</p>
+                              </div>
+                            </Show>
+                          </div>
                         </div>
                       </Show>
-                    </Show>
-                  </>
-                );
-              }}
-            </Match>
-          </Switch>
-        </div>
+                    </div>
+                  </Show>
+                </div>
+              </div>
+            </section>
+          )}
+        </Show>
 
-        {/* Bounded MCQ: four frozen options. Select, then Check; the verdict settles right under them. */}
+        {/* Prompt wrap (hidden when Stage 1 preliminary gate renders its own prompt inside .v2-gate) */}
+        <Show when={!isPreliminaryGate()}>
+          <div
+            class={{ "v2-prompt-wrap": true, "v2-gate-enter": gateJustOpened() }}
+            style={gateJustOpened() ? { "--v2-enter-i": "0" } : undefined}
+          >
+            <Switch fallback={<h1 class="v2-prompt v2-prompt--open">What do you want to work through?</h1>}>
+              <Match when={activeExploration()}>
+                {(e) => (
+                  <h1 class="v2-prompt" data-citable="true">
+                    {inline(e().title)}
+                  </h1>
+                )}
+              </Match>
+              <Match when={activeFrontier()}>
+                {(f) => (
+                  <div class="v2-briefing-head">
+                    <h1 class="v2-prompt" data-citable="true">
+                      {inline(f().title)}
+                    </h1>
+                    <Show when={f().skipped_known.length > 0}>
+                      <div class="v2-briefing-skipped">
+                        Skipping known: {f().skipped_known.join(" · ")}
+                      </div>
+                    </Show>
+                    <div class="v2-briefing-body" data-citable="true">
+                      <Body text={f().body} />
+                    </div>
+                    <div class="v2-briefing-bar">
+                      <span class="v2-briefing-hint">Highlight any phrase or formula to cite &amp; unpack</span>
+                      <Show when={f().cruxes.length > 0}>
+                        <button
+                          type="button"
+                          class="v2-pill-btn"
+                          disabled={busy()}
+                          onClick={() => void startTestMe()}
+                        >
+                          Test me
+                          <Show when={(f().demonstrated_cruxes?.length ?? 0) > 0}>
+                            {" · "}
+                            {f().demonstrated_cruxes!.length}/{f().cruxes.length}
+                          </Show>
+                        </button>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </Match>
+              <Match when={rep()}>
+                {(r) => {
+                  const anchor = () => starterAnchorLine(r().starter);
+                  const pinnedAbove = () => shouldPinStarterAbovePad(r().starter);
+                  const rendered = () => isRenderedStarter(r().starter);
+                  const hasStarterBeat = () =>
+                    beats().some((b) => b.kind === "starter" || (Boolean(anchor()) && b.user.includes(anchor())));
+                  const showStarterRef = () =>
+                    Boolean(r().starter) &&
+                    !activeBlanks() &&
+                    !hasStarterBeat() &&
+                    (pinnedAbove() || beats().length > 0);
+                  return (
+                    <>
+                      <h1 class="v2-prompt" data-citable="true">
+                        {inline(r().prompt)}
+                      </h1>
+                      <Show when={showStarterRef()}>
+                        <Show
+                          when={rendered()}
+                          fallback={
+                            <pre class="v2-prompt-starter" data-citable="true">
+                              {mathOnly(r().starter!)}
+                            </pre>
+                          }
+                        >
+                          <div class="v2-prompt-starter is-prose" data-citable="true">
+                            <Body text={r().starter!} />
+                          </div>
+                        </Show>
+                      </Show>
+                    </>
+                  );
+                }}
+              </Match>
+            </Switch>
+          </div>
+        </Show>
+
+        {/* Bounded one-tap MCQ (standalone or Stage 1 preliminary gate) */}
         <Show when={isMcq()}>
-          <div ref={mcqStageEl} class="v2-mcq-stage">
-            <div
-              class={{
-                "v2-pad": true,
-                "v2-textured": true,
-                "v2-mcq": true,
-                "is-checking": mcqSubmitting() !== null,
-                "is-settled": !mcqOpen(),
-              }}
-            >
-              <div class="v2-mcq-options" role="radiogroup" aria-label="Answer choices">
-                <For each={mcqChoices()} keyed={(c) => c.id}>
-                  {(choice, i) => {
-                    const selected = () => mcqSelectedId() === choice().id;
-                    const isCorrect = () => mcqResult()?.correct_id === choice().id;
-                    const isWrongPick = () => mcqResult()?.outcome === "wrong" && selected() && !isCorrect();
-                    const tabbable = () => mcqOpen() && (selected() || (!mcqSelectedId() && i() === 0));
+          {(() => {
+            const renderMcqStage = () => (
+              <div ref={mcqStageEl} class="v2-mcq-stage">
+                <div
+                  class={{
+                    "v2-pad": true,
+                    "v2-textured": true,
+                    "v2-mcq": true,
+                    "is-submitting": mcqSubmitting() !== null && mcqSubmitting() !== "__idk__",
+                    "is-settled": !mcqOpen(),
+                  }}
+                >
+                  <div class="v2-mcq-options" role="group" aria-label="Answer choices">
+                    <For each={mcqChoices()} keyed={(c) => c.id}>
+                      {(choice, i) => {
+                        const selected = () => mcqSelectedId() === choice().id;
+                        const isPending = () => mcqSubmitting() === choice().id;
+                        const isCorrect = () =>
+                          gateHoldingChoiceId() === choice().id || mcqResult()?.correct_id === choice().id;
+                        const isWrongPick = () => mcqResult()?.outcome === "wrong" && selected() && !isCorrect();
+                        const isIdkOrRevealed = () =>
+                          mcqResult()?.outcome === "idk" || mcqResult()?.outcome === "revealed";
+                        return (
+                          <div
+                            ref={(el) => {
+                              mcqOptionEls[i()] = el;
+                            }}
+                            class={{
+                              "v2-mcq-option": true,
+                              "is-selected": selected(),
+                              "is-pending": isPending(),
+                              "is-correct": isCorrect(),
+                              "is-wrong-pick": isWrongPick(),
+                              "is-locked": !mcqOpen(),
+                            }}
+                            role="button"
+                            aria-keyshortcuts={String(i() + 1)}
+                            aria-disabled={!mcqOpen() || busy() ? "true" : undefined}
+                            tabindex={mcqOpen() && !busy() ? 0 : -1}
+                            onPointerDown={onMcqOptionPointerDown}
+                            onClick={(e) => onMcqOptionClick(e, choice().id)}
+                            onKeyDown={(e) => onMcqOptionKey(e, i())}
+                          >
+                            <span class="v2-mcq-mark" aria-hidden="true">
+                              <Show
+                                when={isCorrect()}
+                                fallback={
+                                  <>
+                                    <span class="v2-mcq-num">{i() + 1}</span>
+                                    <Show when={isPending()}>
+                                      <span class="v2-spinner v2-mcq-spin" />
+                                    </Show>
+                                  </>
+                                }
+                              >
+                                <svg class="v2-check-svg" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                                  <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                                </svg>
+                              </Show>
+                            </span>
+                            <span class="v2-mcq-text" data-citable="true">
+                              {inline(choice().text)}
+                            </span>
+                            <Show when={isCorrect() || isWrongPick()}>
+                              <span class="v2-mcq-badge">
+                                {isCorrect() ? (isIdkOrRevealed() ? "Answer" : "Correct") : "Your choice"}
+                              </span>
+                            </Show>
+                          </div>
+                        );
+                      }}
+                    </For>
+                  </div>
+                  <Show when={mcqOpen()}>
+                    <Show when={mcqError()}>
+                      {(msg) => (
+                        <p class="v2-error-line v2-mcq-error" role="alert">
+                          {msg()}
+                        </p>
+                      )}
+                    </Show>
+                    <div class="v2-mcq-foot">
+                      <button
+                        type="button"
+                        class={{ "v2-mcq-reveal": true, "is-pending": mcqSubmitting() === "__idk__" }}
+                        disabled={busy()}
+                        onClick={() => void submitMcq("idk")}
+                      >
+                        <Show
+                          when={mcqSubmitting() === "__idk__"}
+                          fallback={
+                            <>
+                              I don&apos;t know{" "}
+                              <span class="v2-mcq-reveal-sep" aria-hidden="true">
+                                ·
+                              </span>{" "}
+                              Show answer
+                            </>
+                          }
+                        >
+                          <span class="v2-spinner" aria-hidden="true" />
+                          <span>Showing answer</span>
+                        </Show>
+                      </button>
+                    </div>
+                  </Show>
+                </div>
+
+                <Show when={passedVerdict()?.ok ? passedVerdict() : null}>
+                  {(v) => {
+                    const m = () => v()?.mcq_result ?? null;
+                    const outcome = () => m()?.outcome ?? null;
+                    const isGateVerdict = () => m()?.role === "preliminary";
+                    const isPass = () => outcome() === "correct";
+                    const isRevealedStyle = () => outcome() === "idk" || outcome() === "revealed";
+                    const verdictTitle = () => {
+                      const o = outcome();
+                      if (o === "correct") return "Correct";
+                      if (o === "assisted_correct") return "Correct with help";
+                      if (o === "idk" || o === "revealed") return "Answer shown";
+                      return "Not quite";
+                    };
                     return (
                       <div
-                        ref={(el) => {
-                          mcqOptionEls[i()] = el;
-                        }}
+                        ref={mcqVerdictEl}
                         class={{
-                          "v2-mcq-option": true,
-                          "is-selected": selected(),
-                          "is-correct": isCorrect(),
-                          "is-wrong-pick": isWrongPick(),
-                          "is-locked": !mcqOpen(),
+                          "v2-beat-coach": true,
+                          "v2-mcq-verdict": true,
+                          "v2-gate-verdict": isGateVerdict(),
+                          "is-pass": isPass(),
+                          "is-missed": !isPass() && !isRevealedStyle(),
+                          "is-revealed": isRevealedStyle(),
                         }}
-                        role="radio"
-                        aria-checked={selected() ? "true" : "false"}
-                        aria-disabled={!mcqOpen() || busy() ? "true" : undefined}
-                        tabindex={tabbable() ? 0 : -1}
-                        onClick={(e) => onMcqOptionClick(e, choice().id)}
-                        onKeyDown={(e) => onMcqOptionKey(e, i())}
+                        role="status"
+                        tabindex={-1}
                       >
-                        <span class="v2-mcq-mark" aria-hidden="true">
-                          <Show when={isCorrect()} fallback={<span class="v2-mcq-num">{i() + 1}</span>}>
-                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                              <path d="M3.2 8.4l3.2 3.2 6.4-7" />
-                            </svg>
-                          </Show>
-                        </span>
-                        <span class="v2-mcq-text" data-citable="true">
-                          {inline(choice().text)}
-                        </span>
-                        <Show when={isCorrect() || isWrongPick()}>
-                          <span class="v2-mcq-badge">{isCorrect() ? "Correct" : "Your choice"}</span>
+                        <p class="v2-mcq-verdict-title">{verdictTitle()}</p>
+                        <Show when={m()}>
+                          {(mr) => (
+                            <div class="v2-verdict-body" data-citable="true">
+                              <Show
+                                when={isGateVerdict()}
+                                fallback={
+                                  <>
+                                    <Show when={mr()?.outcome === "wrong" && mr()?.why_wrong_selected}>
+                                      {(why) => <p>{inline(why() ?? "")}</p>}
+                                    </Show>
+                                    <p>{inline(mr()?.explanation ?? "")}</p>
+                                  </>
+                                }
+                              >
+                                <p class="v2-gate-principle">{inline(mr()?.explanation ?? "")}</p>
+                                <Show when={mr()?.outcome === "wrong" && mr()?.why_wrong_selected}>
+                                  {(why) => <p>{inline(why() ?? "")}</p>}
+                                </Show>
+                                <Show when={mr()?.worked_step}>
+                                  {(step) => (
+                                    <div class="v2-gate-step">
+                                      <span class="v2-gate-step-label">One step</span>
+                                      <p>{inline(step() ?? "")}</p>
+                                    </div>
+                                  )}
+                                </Show>
+                              </Show>
+                            </div>
+                          )}
                         </Show>
+                        <VerdictFoot
+                          label={mcqScheduleLabel}
+                          clean={isPass}
+                          extraClass={isGateVerdict() ? "v2-gate-foot" : undefined}
+                          secondary={
+                            isGateVerdict() && m()?.can_continue_production
+                              ? () => (
+                                  <button
+                                    type="button"
+                                    class="v2-gate-continue"
+                                    disabled={gateContinuing()}
+                                    onClick={() => void continueGateToProduction()}
+                                  >
+                                    {gateContinuing() ? "Opening…" : "Try the full problem anyway"}
+                                  </button>
+                                )
+                              : undefined
+                          }
+                        />
                       </div>
                     );
                   }}
-                </For>
-              </div>
-              <Show when={mcqOpen()}>
-                <Show when={mcqError()}>
-                  {(msg) => (
-                    <p class="v2-error-line v2-mcq-error" role="alert">
-                      {msg()}
-                    </p>
-                  )}
                 </Show>
-                <div class="v2-pad-foot v2-mcq-foot">
-                  <button
-                    type="button"
-                    class="v2-mcq-reveal"
-                    disabled={busy()}
-                    onClick={() => void submitMcq("reveal")}
-                  >
-                    I'm not sure · Show answer
-                  </button>
-                  <div class="v2-pad-actions">
-                    <button
-                      type="button"
-                      class={{ "v2-btn-primary": true, "is-busy": mcqSubmitting() === "check" }}
-                      disabled={mcqSubmitting() === "check" ? false : busy() || !mcqSelectedId()}
-                      onClick={() => {
-                        if (mcqSubmitting() === "check") cancelPending();
-                        else void submitMcq("check");
-                      }}
-                    >
-                      <Show
-                        when={mcqSubmitting() === "check"}
-                        fallback={
-                          <>
-                            Check <span class="v2-kbd">⌘↵</span>
-                          </>
-                        }
-                      >
-                        <span class="v2-spinner" aria-hidden="true" />
-                        <span class="v2-busy-label">Checking</span>
-                        <span class="v2-busy-stop">Cancel</span>
-                      </Show>
-                    </button>
-                  </div>
-                </div>
-              </Show>
-            </div>
+              </div>
+            );
 
-            <Show when={passedVerdict()?.ok ? passedVerdict() : null}>
-              {(v) => {
-                const outcome = () => v()?.mcq_result?.outcome ?? null;
-                return (
-                  <div
-                    ref={mcqVerdictEl}
-                    class={{
-                      "v2-beat-coach": true,
-                      "v2-mcq-verdict": true,
-                      "is-pass": outcome() === "correct",
-                      "is-missed": outcome() !== "correct",
-                    }}
-                    role="status"
-                    tabindex={-1}
-                  >
-                    <Show when={outcome() === "correct" || outcome() === "assisted_correct"}>
-                      <p class="v2-mcq-verdict-title">{outcome() === "correct" ? "Correct" : "Correct with help"}</p>
+            return (
+              <Show when={isPreliminaryGate()} fallback={renderMcqStage()}>
+                <section class="v2-gate" aria-label="Quick check">
+                  <p class="v2-gate-cue">
+                    <span class="v2-gate-steps" aria-hidden="true">
+                      <i class="is-on" />
+                      <i />
+                    </span>
+                    Quick check
+                    <Show when={mcqOpen()}>
+                      {" "}
+                      <span class="v2-gate-cue-rest">· before the full problem</span>
                     </Show>
-                    <Show when={v()?.mcq_result}>
-                      {(m) => (
-                        <div class="v2-verdict-body" data-citable="true">
-                          <Show when={m()?.outcome === "wrong" && m()?.why_wrong_selected}>
-                            {(why) => <p>{inline(why() ?? "")}</p>}
-                          </Show>
-                          <p>{inline(m()?.explanation ?? "")}</p>
-                        </div>
-                      )}
-                    </Show>
-                    <VerdictFoot label={mcqScheduleLabel} clean={() => outcome() === "correct"} />
+                  </p>
+                  <div class="v2-gate-body" id="v2-gate-body">
+                    <div class="v2-gate-body-inner">
+                      <Show when={rep()}>
+                        {(r) => (
+                          <div class="v2-prompt-wrap">
+                            <h1 class="v2-prompt" data-citable="true">
+                              {inline(r().prompt)}
+                            </h1>
+                          </div>
+                        )}
+                      </Show>
+                      {renderMcqStage()}
+                    </div>
                   </div>
-                );
-              }}
-            </Show>
-          </div>
+                </section>
+              </Show>
+            );
+          })()}
         </Show>
 
         {/* Progressive Solveit-style committed beats */}
@@ -3641,7 +4039,9 @@ export function DrillView() {
                   "is-compact": beats().length > 0,
                   "is-explore": isExploreMode() || Boolean(activeFrontier()),
                   "is-checking": busy(),
+                  "v2-gate-enter": gateJustOpened(),
                 }}
+                style={gateJustOpened() ? { "--v2-enter-i": "1" } : undefined}
               >
                 <ComposerCitationChips />
                 <div class={{ "v2-pad-body": true, "with-sketch": sketchOpen() }}>

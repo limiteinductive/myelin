@@ -64,8 +64,11 @@ const Timing = z.object({
   sent_at: Ms.nullable().default(null),
 });
 
-export const McqOutcome = z.enum(["correct", "assisted_correct", "wrong", "revealed"]);
+export const McqOutcome = z.enum(["correct", "assisted_correct", "wrong", "idk", "revealed"]);
 export type McqOutcome = z.infer<typeof McqOutcome>;
+
+export const McqRole = z.enum(["standalone", "preliminary"]);
+export type McqRole = z.infer<typeof McqRole>;
 
 const ProbeRecord = z.object({
   unit_id: Id,
@@ -82,8 +85,9 @@ const ProbeRecord = z.object({
   latency_ms: Ms.nullable().default(null),
   scheduler: z.string(),
   predicted_recall: z.number().min(0).max(1).nullable().default(null),
-  /** Optional recognition discriminator: MCQ probes stay separate from production mastery folds. */
+  /** Optional MCQ discriminator: v1 probes (no mcq_role) & preliminary gates stay separate from production mastery folds; standalone discrimination MCQs feed conservative memory updates. */
   modality: z.literal("mcq").optional(),
+  mcq_role: McqRole.optional(),
   mcq_item_id: z.string().optional(),
   mcq_outcome: McqOutcome.optional(),
   mcq_choice_id: z.string().optional(),
