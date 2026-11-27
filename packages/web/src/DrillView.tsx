@@ -3953,11 +3953,15 @@ export function DrillView() {
             <textarea
               ref={citeTextarea}
               class="v2-cite-pop-input"
-              rows={2}
+              rows={1}
               placeholder="Add a comment or question… (optional)"
               spellcheck="false"
               value={citeComment()}
-              onInput={(e) => setCiteComment(e.currentTarget.value)}
+              onInput={(e) => {
+                setCiteComment(e.currentTarget.value);
+                e.currentTarget.style.height = "auto";
+                e.currentTarget.style.height = `${Math.min(120, e.currentTarget.scrollHeight)}px`;
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Escape") {
                   e.preventDefault();
