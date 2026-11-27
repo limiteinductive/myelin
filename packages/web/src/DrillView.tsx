@@ -361,6 +361,7 @@ export function DrillView() {
   const [editDraft, setEditDraft] = createSignal("");
   const [blankValues, setBlankValues] = createSignal<string[]>([]);
   const [blankNote, setBlankNote] = createSignal("");
+  const [blanksFreeform, setBlanksFreeform] = createSignal(false);
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [mcqSubmitting, setMcqSubmitting] = createSignal<string | null>(null);
@@ -640,6 +641,7 @@ export function DrillView() {
     setEditDraft("");
     setBlankValues([]);
     setBlankNote("");
+    setBlanksFreeform(false);
     blankEls = [];
     setCitePill(null);
     setCiteEditor(null);
@@ -1088,16 +1090,36 @@ export function DrillView() {
     });
   });
 
-  const activeBlanks = createMemo(() => {
-    if (isNonUnit() || passedVerdict()?.ok || editingBeatIdx() !== null || hasSubmittedBlanks()) return null;
+  const hasAvailableBlanks = createMemo(() => {
+    if (isNonUnit() || passedVerdict()?.ok || editingBeatIdx() !== null || hasSubmittedBlanks()) return false;
     const starter = rep()?.starter;
-    if (!starter || countStarterBlanks(starter) === 0) return null;
+    return Boolean(starter && countStarterBlanks(starter) > 0);
+  });
+
+  const activeBlanks = createMemo(() => {
+    if (!hasAvailableBlanks() || blanksFreeform()) return null;
+    const starter = rep()!.starter!;
     return {
       starter,
       parsed: parseStarterBlanks(starter),
       isProse: isRenderedStarter(starter),
     };
   });
+
+  const enterBlanksFreeform = () => {
+    setBlanksFreeform(true);
+    requestAnimationFrame(() => {
+      autoGrow();
+      if (!isTouchDevice()) textarea?.focus();
+    });
+  };
+
+  const exitBlanksFreeform = () => {
+    setBlanksFreeform(false);
+    requestAnimationFrame(() => {
+      if (!isTouchDevice()) blankEls[0]?.focus();
+    });
+  };
 
   const setBlankValue = (index: number, value: string) => {
     setBlankValues((prev) => {
@@ -3293,7 +3315,7 @@ export function DrillView() {
                     Boolean(r().starter) &&
                     !activeBlanks() &&
                     !hasStarterBeat() &&
-                    (pinnedAbove() || beats().length > 0);
+                    (pinnedAbove() || blanksFreeform() || beats().length > 0);
                   return (
                     <>
                       <h1 class="v2-prompt" data-citable="true">
@@ -4055,9 +4077,11 @@ export function DrillView() {
                           ? "Drop a question, derivation, paper, file path, or topic to work through…"
                           : activeFrontier()
                             ? "Cite a line above, ask a question, or explain it back…"
-                            : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
-                              ? "Write your answer for the points above…"
-                              : "Write your attempt or ask anything…"
+                            : blanksFreeform()
+                              ? "Work out the derivation step by step, or write your answer…"
+                              : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
+                                ? "Write your answer for the points above…"
+                                : "Write your attempt or ask anything…"
                     }
                     spellcheck="false"
                     autocorrect="off"
@@ -4145,6 +4169,16 @@ export function DrillView() {
                   <div class="v2-pad-tools">
                     <Show when={(isExploreMode() || activeFrontier()) && dueFromExplore().length > 0}>
                       <span class="v2-pad-map-count">{dueFromExplore().length} to practice</span>
+                    </Show>
+                    <Show when={blanksFreeform() && hasAvailableBlanks() && !busy()}>
+                      <button
+                        type="button"
+                        class="v2-blank-mode-btn"
+                        data-tip="Return to fill-in-the-blank view"
+                        onClick={exitBlanksFreeform}
+                      >
+                        Back to blanks
+                      </button>
                     </Show>
                   </div>
 
@@ -4332,6 +4366,16 @@ export function DrillView() {
                       <span class="v2-blank-count">
                         {filledBlankCount()}/{blanks()?.parsed.blankCount ?? 0} filled
                       </span>
+                      <Show when={!busy()}>
+                        <button
+                          type="button"
+                          class="v2-blank-mode-btn"
+                          data-tip="Open the full pad to derive step by step before answering"
+                          onClick={enterBlanksFreeform}
+                        >
+                          Work it out
+                        </button>
+                      </Show>
                     </div>
 
                     <div class="v2-pad-actions">

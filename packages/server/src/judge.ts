@@ -3174,7 +3174,8 @@ Return ONLY valid JSON:
       contrast: `Modality: SHARP CONTRAST (1-line high-signal boundary check). Ask ONE crisp contrast or edge-case question answerable in 1-2 sentences (e.g. "What breaks if X is swapped for Y?"). Set "starter" to null.`,
       faded_skeleton: `Modality: FADED CODE SKELETON (skip boilerplate, test the exact pivot in ~30s).
 - "prompt": 1 crisp sentence naming the goal and telling the learner to complete the code/expression below.
-- "starter": ONLY for code or pure symbolic assignments (e.g. PyTorch/NumPy/Python): a clean 2-5 line plain-ASCII code snippet with 1-2 short pivot holes marked \`___\` (no markdown fences, NO English prose mad-libs like "grows with ___ and ___", NO numbered prose sentences). If the unit is conceptual prose rather than code, set "starter" to null.`,
+- "starter": ONLY for code or pure symbolic assignments (e.g. PyTorch/NumPy/Python): a clean 2-5 line plain-ASCII code snippet with 1-2 short pivot holes marked \`___\` (no markdown fences, NO English prose mad-libs like "grows with ___ and ___", NO numbered prose sentences).
+- NEVER compress a multi-step mathematical derivation (like a VJP, backward pass, Jacobian, or proof) into a single \`return ___\` blank that forces rote memorization; either scaffold the intermediate derivation steps as 2-3 separate lines with blanks OR set "starter" to null so the learner can derive it step-by-step. If the unit is conceptual prose rather than code, set "starter" to null.`,
       fix_bug: `Modality: FIX THE BUG (spot & repair ONE planted flaw in ~25s).
 - "prompt": 1 crisp sentence saying the snippet/claim has one subtle bug and asking them to fix it.
 - "starter": ONLY for code tasks: a realistic 3-6 line plain-ASCII code snippet containing ONE subtle bug right at this unit's core pivot (no hint comments, no markdown fences, NO raw LaTeX/TeX). For non-code conceptual/math units, put the flawed claim directly in "prompt" and set "starter" to null.`,

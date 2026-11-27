@@ -1490,6 +1490,26 @@ button.v2-rail-row:focus-visible,
   color: var(--v2-ink-3);
   user-select: none;
 }
+.v2-blank-mode-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font: var(--v2-type-meta);
+  font-weight: 450;
+  color: var(--v2-ink-3);
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+.v2-blank-mode-btn:hover {
+  background: var(--v2-quiet-fill);
+  color: var(--v2-ink-1);
+}
+.v2-blank-mode-btn:focus-visible {
+  outline: 1.5px solid var(--v2-accent);
+  outline-offset: 1px;
+}
 .v2-blank-note-wrap {
   padding: 0 4px;
 }
