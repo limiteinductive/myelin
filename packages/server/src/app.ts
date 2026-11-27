@@ -1470,7 +1470,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         } else {
           const priorPost = Array.isArray(body?.prior_post_turns)
             ? body.prior_post_turns
-                .filter((t) => typeof t?.user === "string" && typeof t?.coach === "string")
+                .filter(
+                  (t) =>
+                    typeof t?.user === "string" &&
+                    typeof t?.coach === "string" &&
+                    (t.user.trim().length > 0 || t.coach.trim().length > 0),
+                )
                 .map((t) => ({
                   user: t.user,
                   coach: t.coach,
@@ -1488,7 +1493,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
               ...(added_units.length > 0 ? { added: added_units } : {}),
             },
           ];
-          if (origin && rawTurns[0] && !rawTurns[0].user.startsWith("> ")) {
+          if (priorPost.length === 0 && origin && rawTurns[0] && !rawTurns[0].user.startsWith("> ")) {
             rawTurns[0] = { ...rawTurns[0], user: `> ${origin.replace(/\n+/g, " ")}\n${rawTurns[0].user}` };
           }
           nextTurns = rawTurns.slice(-60);

@@ -599,4 +599,75 @@ describe("v2 drill and map API", () => {
     };
     expect(qAfterPass2.items.find((u) => u.unit_id === unit_id)?.depth).toBe("use");
   });
+
+  it("preserves full drill history when promoting a post-verdict follow-up into a saved Exploration", async () => {
+    dir = mkdtempSync(join(tmpdir(), "myelin-promote-history-"));
+    registry = new Registry(dir);
+    stores = new Stores(dir);
+    const user = registry.createUser("ben");
+    const link = registry.issueLink(user.id);
+
+    const mockFetch: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  title: "RoPE & RMSNorm Commutation",
+                  message: "Expanding $R_m^\\top \\Gamma^2 R_n$ on a 2D block produces a $(m+n)\\theta$ term.",
+                  suggested_units: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+
+    const app = createApp({ registry, stores, judge: new FastJudge({ apiKey: "test-key", fetchFn: mockFetch }), dataDir: dir });
+    const loginRes = await app.request("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link }),
+    });
+    const cookie = loginRes.headers.get("set-cookie")!.split(";")[0]!;
+    const authed = (headers: Record<string, string> = {}) => ({ cookie, ...headers });
+
+    const res = await app.request("/api/drill/explore", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        initial: "Completed practice on: Why does post-RoPE RMSNorm leak position?",
+        turns: [
+          { role: "user", text: "Show answer." },
+          { role: "assistant", text: "Orthogonal RoPE preserves RMS(x) but per-feature gamma fails to commute." },
+        ],
+        reply: "show me the computation exactly",
+        promote_on_unit: true,
+        origin_prompt: "Why does post-RoPE RMSNorm leak position?",
+        prior_post_turns: [
+          { user: "", coach: "Why does post-RoPE RMSNorm leak position?" },
+          { user: "Show answer.", coach: "Orthogonal RoPE preserves RMS(x) but per-feature gamma fails to commute." },
+        ],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { exploration?: { id: string; title: string } };
+    expect(body.exploration?.id).toBeTruthy();
+
+    const listRes = await app.request("/api/explorations", { headers: authed() });
+    const listData = (await listRes.json()) as {
+      explorations: { id: string; turns: { user: string; coach: string }[] }[];
+    };
+    const saved = listData.explorations.find((e) => e.id === body.exploration!.id)!;
+    expect(saved.turns).toHaveLength(3);
+    expect(saved.turns[0]).toEqual({ user: "", coach: "Why does post-RoPE RMSNorm leak position?" });
+    expect(saved.turns[1]).toEqual({
+      user: "Show answer.",
+      coach: "Orthogonal RoPE preserves RMS(x) but per-feature gamma fails to commute.",
+    });
+    expect(saved.turns[2]?.user).toBe("show me the computation exactly");
+    expect(saved.turns[2]?.coach).toContain("(m+n)");
+  });
 });

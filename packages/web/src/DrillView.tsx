@@ -1432,7 +1432,11 @@ export function DrillView() {
         const coachFull = b.question ? `${b.coach}\n\n${b.question}` : b.coach;
         if (coachFull) turns.push({ role: "assistant", text: coachFull });
       }
-      const initial = cleanPrior.length === 0 ? opts.payloadText : beatUserPayload(cleanPrior[0]!);
+      const firstUser = cleanPrior.length > 0 ? beatUserPayload(cleanPrior[0]!) : "";
+      const initial =
+        cleanPrior.length === 0
+          ? opts.payloadText
+          : firstUser || cleanPrior[0]!.coach || opts.payloadText;
       const priorAfterFirst = cleanPrior.length === 0 ? [] : turns.slice(1);
       const res = await exploreDrill(
         {
@@ -2225,9 +2229,46 @@ export function DrillView() {
     if (!payloadText) return;
 
     const priorPost = typeof retryIdx === "number" ? allPost.slice(0, retryIdx) : allPost;
+    const cleanDrillBeats = snapshot(beats())
+      .filter((b) => !b.pending && !isFailedBeat(b))
+      .map((b): Beat => ({
+        user: b.user,
+        ...(b.citations && b.citations.length > 0 ? { citations: b.citations } : {}),
+        ...(b.sketch ? { sketch: b.sketch } : {}),
+        coach: b.coach,
+        ...(b.question ? { question: b.question } : {}),
+        ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
+      }));
+    const vNow = passedVerdict();
+    const mcqVerdictBeat: Beat | null = (() => {
+      const m = vNow?.mcq_result;
+      if (!isMcq() || !m) return null;
+      const choices = mcqChoices();
+      const pickedIdx = m.selected_choice_id ? choices.findIndex((c) => c.id === m.selected_choice_id) : -1;
+      const pickedText = pickedIdx >= 0 ? `${pickedIdx + 1}. ${choices[pickedIdx]!.text}` : "I'm not sure · Show answer";
+      const coachParts = [
+        m.outcome === "wrong" && m.why_wrong_selected ? m.why_wrong_selected : "",
+        m.explanation,
+      ].filter(Boolean);
+      return { user: pickedText, coach: coachParts.join("\n\n") };
+    })();
+    const originCoach = (() => {
+      const choices = mcqChoices();
+      if (choices.length > 0) {
+        return `${r.prompt}\n\n${choices.map((c, i) => `${i + 1}. ${c.text}`).join("\n")}`;
+      }
+      return r.prompt;
+    })();
+    const cleanPriorPost = priorPost.filter((b) => !b.pending && !isFailedBeat(b));
+    const promotedHistoryBeats: Beat[] = [
+      { user: "", coach: originCoach },
+      ...cleanDrillBeats,
+      ...(mcqVerdictBeat ? [mcqVerdictBeat] : []),
+      ...cleanPriorPost,
+    ];
+
     const priorTurns: { role: "user" | "assistant"; text: string }[] = [];
-    for (const b of [...snapshot(beats()), ...priorPost]) {
-      if (b.pending || isFailedBeat(b)) continue;
+    for (const b of [...cleanDrillBeats, ...(mcqVerdictBeat ? [mcqVerdictBeat] : []), ...cleanPriorPost]) {
       const u = beatUserPayload(b);
       if (u) priorTurns.push({ role: "user", text: u });
       const coachFull = b.question ? `${b.coach}\n\n${b.question}` : b.coach;
@@ -2260,9 +2301,6 @@ export function DrillView() {
     });
     requestAnimationFrame(() => postInputEl?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
 
-    const cleanPriorPost = priorPost.filter((b) => !b.pending && !isFailedBeat(b));
-
-    const vNow = passedVerdict();
     try {
       const res = await exploreDrill(
         {
@@ -2271,7 +2309,7 @@ export function DrillView() {
           reply: payloadText,
           promote_on_unit: true,
           origin_prompt: r.prompt,
-          prior_post_turns: cleanPriorPost.map((b) => ({
+          prior_post_turns: promotedHistoryBeats.map((b) => ({
             user: beatUserPayload(b),
             coach: b.coach,
             ...(b.question ? { question: b.question } : {}),
@@ -2322,16 +2360,8 @@ export function DrillView() {
         });
       }
       if (res.exploration && !res.failed && !(fix && fix.changes.length > 0)) {
-        // Auto-promote every conceptual post-pass follow-up into a saved Exploration anchored to this prompt.
-        const promotedBeats: Beat[] = [...cleanPriorPost, resolved];
-        if (promotedBeats[0]) {
-          const first = promotedBeats[0];
-          const originCite: Citation = { id: `origin:${r.unit_id}`, text: r.prompt, comment: "" };
-          const hasOrigin = (first.citations ?? []).some((c) => c.text.trim() === r.prompt.trim());
-          if (!hasOrigin) {
-            promotedBeats[0] = { ...first, citations: [originCite, ...(first.citations ?? [])] };
-          }
-        }
+        // Auto-promote conceptual post-pass follow-ups into a saved Exploration carrying the full drill history.
+        const promotedBeats: Beat[] = [...promotedHistoryBeats, resolved];
         practice.promotePostFollowUpToExploration(ownerKey, res.exploration, promotedBeats);
         void practice.refreshQueue({ preserveOrder: true });
         requestAnimationFrame(() => {
