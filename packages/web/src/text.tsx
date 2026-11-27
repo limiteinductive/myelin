@@ -66,7 +66,16 @@ export function splitLead(text: string): [string, string] | null {
   return rest ? [lead, rest] : null;
 }
 
-export const INLINE = /(`[^`\n]+`|\$\$[^$\n]+?\$\$|\\\$|(?<!\\)\$(?=[^\s$])(?:\\\$|[^$\n])*?(?:\\\$|[^\s$\\])\$(?!\d)|\*\*[^*\n]+\*\*|(?<![\w*])\*[^*\s][^*\n]*?\*(?![\w*])|(?<![\w_])_[^_\s][^_\n]*?_(?![\w_]))/g;
+const INLINE_CODE_PAT = "`[^`\\n]+`";
+const INLINE_MATH_PAT = String.raw`(?<!\\)\$(?=[^\s$])(?:\\\$|[^$\n])*?(?:\\\$|[^\s$\\])\$(?!\d)`;
+const BOLD_PAT = String.raw`\*\*(?:${INLINE_MATH_PAT}|${INLINE_CODE_PAT}|[^*\n])+?\*\*`;
+const EMPH_STAR_PAT = String.raw`(?<![\w*])\*(?:${INLINE_MATH_PAT}|${INLINE_CODE_PAT}|[^*\s\n])(?:${INLINE_MATH_PAT}|${INLINE_CODE_PAT}|[^*\n])*?\*(?![\w*])`;
+const EMPH_UNDER_PAT = String.raw`(?<![\w_])_(?:${INLINE_MATH_PAT}|${INLINE_CODE_PAT}|[^_\s\n])(?:${INLINE_MATH_PAT}|${INLINE_CODE_PAT}|[^_\n])*?_(?![\w_])`;
+
+export const INLINE = new RegExp(
+  `(${INLINE_CODE_PAT}|\\$\\$[^$\\n]+?\\$\\$|\\\\\\$|${INLINE_MATH_PAT}|${BOLD_PAT}|${EMPH_STAR_PAT}|${EMPH_UNDER_PAT})`,
+  "g",
+);
 
 const MATH_ONLY = /(\$\$[^$\n]+?\$\$|(?<!\\)\$(?=[^\s$])(?:\\\$|[^$\n])*?(?:\\\$|[^\s$\\])\$(?!\d))/g;
 
@@ -96,7 +105,7 @@ export function inlineCodeClass(code: string): string {
   return "app-code";
 }
 
-export function inline(text: string): JSX.Element[] {
+export function inline(text: string, depth = 0): JSX.Element[] {
   const out: JSX.Element[] = [];
   text.split("\n").forEach((line, li) => {
     if (li > 0) out.push(<br />);
@@ -113,8 +122,13 @@ export function inline(text: string): JSX.Element[] {
       } else if (piece.startsWith("$")) {
         const tex = piece.slice(1, -1);
         out.push(<span class="myl-math" data-tex={tex} innerHTML={mathHtml(tex, false)} />);
-      } else if (piece.startsWith("**")) out.push(<strong>{piece.slice(2, -2)}</strong>);
-      else out.push(<em>{piece.slice(1, -1)}</em>);
+      } else if (piece.startsWith("**")) {
+        const inner = piece.slice(2, -2);
+        out.push(<strong>{depth < 3 ? inline(inner, depth + 1) : inner}</strong>);
+      } else {
+        const inner = piece.slice(1, -1);
+        out.push(<em>{depth < 3 ? inline(inner, depth + 1) : inner}</em>);
+      }
     }
   });
   return out;

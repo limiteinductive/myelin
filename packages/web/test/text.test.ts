@@ -24,6 +24,32 @@ describe("inline math regex", () => {
   it("does not swallow plain currency pairs like $10 and $20", () => {
     expect(splitPieces("Costs $10 and $20 today.")).toEqual(["Costs $10 and $20 today."]);
   });
+
+  it("keeps inline math and code intact inside bold and italic spans for recursive rendering", () => {
+    const line = "**Quotient rule for $\\frac{\\partial \\hat{x}_j}{\\partial x_i}$:** and **The $1/d$ factor in $\\text{rms}'$:**";
+    const outer = splitPieces(line);
+    expect(outer).toEqual([
+      "**Quotient rule for $\\frac{\\partial \\hat{x}_j}{\\partial x_i}$:**",
+      " and ",
+      "**The $1/d$ factor in $\\text{rms}'$:**",
+    ]);
+    // Recursively splitting the inner bold content extracts the math spans cleanly
+    expect(splitPieces(outer[0]!.slice(2, -2))).toEqual([
+      "Quotient rule for ",
+      "$\\frac{\\partial \\hat{x}_j}{\\partial x_i}$",
+      ":",
+    ]);
+    expect(splitPieces(outer[2]!.slice(2, -2))).toEqual([
+      "The ",
+      "$1/d$",
+      " factor in ",
+      "$\\text{rms}'$",
+      ":",
+    ]);
+    // Also handles * inside math inside bold, and _ inside math inside _italic_
+    expect(splitPieces("**Optimal $x^*$ in `a*b`:**")).toEqual(["**Optimal $x^*$ in `a*b`:**"]);
+    expect(splitPieces("_look at $x_i$ here_")).toEqual(["_look at $x_i$ here_"]);
+  });
 });
 
 describe("inlineCodeClass", () => {
