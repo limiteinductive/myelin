@@ -89,11 +89,42 @@ function fmtInterval(ms: number): string {
   return `${Math.round(d / 30)}mo`;
 }
 
+export interface MobileProgressReadout {
+  time?: string;
+  due?: string;
+  label: string;
+}
+
+export function formatMobileProgressReadout(args: {
+  data: ProgressResponse | null;
+  hasTimedRun: boolean;
+  fallbackDueCount: number;
+}): MobileProgressReadout {
+  const { data, hasTimedRun, fallbackDueCount } = args;
+  if (!data) {
+    if (fallbackDueCount > 0) {
+      return { due: `${fallbackDueCount} due`, label: `${fallbackDueCount} due, toggle progress` };
+    }
+    return { due: "Progress", label: "Toggle progress" };
+  }
+  const todayMs = Math.max(data.session.today_active_ms, data.session.active_ms);
+  const time = !hasTimedRun && todayMs >= 60_000 ? fmtMinutes(todayMs) : undefined;
+  const dueTotal = data.backlog.due.total;
+  const due = dueTotal > 0 ? `${dueTotal} due` : data.mastery.total > 0 ? "Caught up" : undefined;
+  if (!time && !due) {
+    return { due: "Progress", label: "Toggle progress" };
+  }
+  const parts = [time ? `${time} today` : null, due].filter(Boolean);
+  return { time, due, label: `${parts.join(", ")}, toggle progress` };
+}
+
 export function ProgressRail(props: {
   userId: string;
   open: boolean;
   overlay: boolean;
   revision: number;
+  keepFresh?: boolean;
+  onData?: (data: ProgressResponse | null) => void;
   onCloseOverlay: () => void;
 }) {
   const practice = useContext(PracticeContext)!;
@@ -117,6 +148,8 @@ export function ProgressRail(props: {
     return { unit: null as string | null, exploration: null as string | null };
   });
 
+  const shouldFetch = () => props.open || Boolean(props.keepFresh);
+
   // Reactive signature of changes that should refresh /api/progress cleanly.
   const refreshKey = createMemo(() => {
     const f = focusParams();
@@ -125,14 +158,14 @@ export function ProgressRail(props: {
     const exp = f.exploration ? practice.state.explorations.find((e) => e.id === f.exploration) : null;
     const expSig = exp ? `${exp.turns.length}:${exp.crystallized_turn_count ?? 0}:${exp.crystallized_units?.length ?? 0}` : "";
     const sessBeats = f.exploration ? (practice.state.sessions[`explore:${f.exploration}`]?.beats.length ?? 0) : 0;
-    return `${props.open ? 1 : 0}|${props.revision}|${f.unit ?? ""}|${f.exploration ?? ""}|${qLen}|${completed}|${expSig}|${sessBeats}`;
+    return `${shouldFetch() ? 1 : 0}|${props.open ? 1 : 0}|${props.revision}|${f.unit ?? ""}|${f.exploration ?? ""}|${qLen}|${completed}|${expSig}|${sessBeats}`;
   });
 
-  // Live debounced fetch whenever open and relevant state changes, plus 60s background refresh.
+  // Live debounced fetch whenever open (or keepFresh on mobile) and relevant state changes, plus 60s background refresh.
   createEffect(
     () => refreshKey(),
     () => {
-      if (!props.open) return;
+      if (!shouldFetch()) return;
       const f = focusParams();
       let ctrl: AbortController | null = null;
       const load = async () => {
@@ -141,6 +174,7 @@ export function ProgressRail(props: {
         try {
           const res = await fetchProgress({ tz, unit: f.unit, exploration: f.exploration }, ctrl.signal);
           setData(res);
+          props.onData?.(res);
           setNow(Date.now());
         } catch {
           /* ignore transient or aborted fetch */
@@ -182,7 +216,7 @@ export function ProgressRail(props: {
         props.onCloseOverlay();
       }
     };
-    const onPointerDown = (e: MouseEvent) => {
+    const onPointerDown = (e: Event) => {
       if (!props.open || !props.overlay) return;
       const el = e.target as HTMLElement | null;
       if (!el) return;
@@ -191,10 +225,10 @@ export function ProgressRail(props: {
       props.onCloseOverlay();
     };
     window.addEventListener("keydown", onKey);
-    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("pointerdown", onPointerDown);
     return () => {
       window.removeEventListener("keydown", onKey);
-      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("pointerdown", onPointerDown);
     };
   });
 

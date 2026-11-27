@@ -4,13 +4,13 @@ import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, Sw
 import { watchActivity } from "./activity.js";
 import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
-import { ProgressRail } from "./ProgressRail.js";
+import { formatMobileProgressReadout, ProgressRail } from "./ProgressRail.js";
 import { createPracticeStore, PracticeContext, sessionHasWork, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
 import { formatSidebarDrillLabel, plainSidebarText, sidebarLayout } from "./sidebar.js";
 import { installSidebarRoll, trackSidebarOverflow } from "./sidebarRoll.js";
 import { installStyledTooltips } from "./tooltip.js";
-import type { QueueUnit } from "./drillApi.js";
+import type { ProgressResponse, QueueUnit } from "./drillApi.js";
 
 export type Screen = { kind: "loading" } | { kind: "signin"; error?: string } | { kind: "thread"; session: Me };
 
@@ -212,9 +212,20 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   const [mainWidth, setMainWidth] = createSignal(typeof window !== "undefined" ? window.innerWidth : 1440);
   const railOverlay = () => mainWidth() < 940;
   const railOpen = () => (railOverlay() ? railOverlayOpen() : railPrefOpen());
+  const toggleSidebar = () => {
+    setSidebarOpen((v) => {
+      const next = !v;
+      if (next && railOverlay()) setRailOverlayOpen(false);
+      return next;
+    });
+  };
   const toggleRail = () => {
     if (railOverlay()) {
-      setRailOverlayOpen((v) => !v);
+      setRailOverlayOpen((v) => {
+        const next = !v;
+        if (next && narrow()) setSidebarOpen(false);
+        return next;
+      });
     } else {
       setRailPrefOpen((v) => {
         const next = !v;
@@ -229,6 +240,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   };
   let mainEl: HTMLDivElement | undefined;
   const [progressRev, setProgressRev] = createSignal(0);
+  const [progressData, setProgressData] = createSignal<ProgressResponse | null>(null);
 
   onSettled(() => {
     if (!mainEl || typeof ResizeObserver === "undefined") return;
@@ -418,7 +430,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
         aria-pressed={sidebarOpen() ? "true" : "false"}
         data-tip="Toggle sidebar (⌘\)"
         data-tip-side="bottom"
-        onClick={() => setSidebarOpen((v) => !v)}
+        onClick={toggleSidebar}
       >
         <SidebarToggleIcon />
       </button>
@@ -558,6 +570,14 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
       closeSidebarOnNarrow();
     }
   };
+
+  const mobileReadout = createMemo(() =>
+    formatMobileProgressReadout({
+      data: progressData(),
+      hasTimedRun: run() !== null && !railOpen(),
+      fallbackDueCount: practice.remainingCount() + practice.backlogDueCount(),
+    }),
+  );
 
   // A quiet sub-fold that closes its parent section: Done under Practice, Archived under Explorations.
   const subFold = (title: string, listId: string, count: () => number, open: () => boolean, toggle: () => void) => (
@@ -791,18 +811,40 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
 
             <div class="v2-topbar-right">
               <Show when={!railOpen() ? run() : null}>{(r) => <RunClock run={r()} now={clockNow()} />}</Show>
-              <button
-                type="button"
-                class="v2-icon-toggle"
-                data-rail-toggle="true"
-                aria-label={railOpen() ? "Hide progress" : "Show progress"}
-                aria-pressed={railOpen() ? "true" : "false"}
-                data-tip={railOpen() ? "Hide progress" : "Show progress"}
-                data-tip-side="bottom"
-                onClick={toggleRail}
+              <Show
+                when={narrow()}
+                fallback={
+                  <button
+                    type="button"
+                    class="v2-icon-toggle"
+                    data-rail-toggle="true"
+                    aria-label={railOpen() ? "Hide progress" : "Show progress"}
+                    aria-pressed={railOpen() ? "true" : "false"}
+                    data-tip={railOpen() ? "Hide progress" : "Show progress"}
+                    data-tip-side="bottom"
+                    onClick={toggleRail}
+                  >
+                    <RailToggleIcon />
+                  </button>
+                }
               >
-                <RailToggleIcon />
-              </button>
+                <button
+                  type="button"
+                  class={{ "v2-rail-pill": true, "is-open": railOpen() }}
+                  data-rail-toggle="true"
+                  aria-label={mobileReadout().label}
+                  aria-expanded={railOpen() ? "true" : "false"}
+                  onClick={toggleRail}
+                >
+                  <Show when={mobileReadout().time}>{(t) => <span class="v2-rail-pill-val">{t()}</span>}</Show>
+                  <Show when={mobileReadout().time && mobileReadout().due}>
+                    <span class="v2-rail-pill-sep" aria-hidden="true">
+                      ·
+                    </span>
+                  </Show>
+                  <Show when={mobileReadout().due}>{(d) => <span class="v2-rail-pill-val">{d()}</span>}</Show>
+                </button>
+              </Show>
             </div>
           </header>
 
@@ -815,6 +857,8 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
             open={railOpen()}
             overlay={railOverlay()}
             revision={progressRev()}
+            keepFresh={narrow()}
+            onData={setProgressData}
             onCloseOverlay={() => setRailOverlayOpen(false)}
           />
         </div>
