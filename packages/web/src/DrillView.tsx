@@ -360,8 +360,6 @@ export function DrillView() {
   const [editingBeatIdx, setEditingBeatIdx] = createSignal<number | null>(null);
   const [editDraft, setEditDraft] = createSignal("");
   const [blankValues, setBlankValues] = createSignal<string[]>([]);
-  const [blankNote, setBlankNote] = createSignal("");
-  const [blanksFreeform, setBlanksFreeform] = createSignal(false);
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [mcqSubmitting, setMcqSubmitting] = createSignal<string | null>(null);
@@ -510,7 +508,6 @@ export function DrillView() {
   let textarea!: HTMLTextAreaElement;
   let editTextarea!: HTMLTextAreaElement;
   let postInputEl!: HTMLInputElement;
-  let blankNoteEl: HTMLInputElement | undefined;
   let mcqClarifyEl: HTMLInputElement | undefined;
   let mcqStageEl: HTMLDivElement | undefined;
   let mcqVerdictEl: HTMLDivElement | undefined;
@@ -613,14 +610,13 @@ export function DrillView() {
   const focusComposer = () => {
     if (passedVerdict()?.ok) postInputEl?.focus();
     else if (isMcq()) mcqClarifyEl?.focus();
-    else if (activeBlanks()) blankNoteEl?.focus();
     else textarea?.focus();
   };
 
   const cancelPending = () => {
     // Only abort — let `submitBeat`'s `finally` release `busy` cleanly when identity matches.
     activeAbort?.abort();
-    if (!isMcq()) requestAnimationFrame(() => (activeBlanks() ? blankNoteEl : textarea)?.focus());
+    if (!isMcq()) requestAnimationFrame(() => textarea?.focus());
   };
 
   const cancelPostPending = () => {
@@ -640,8 +636,6 @@ export function DrillView() {
     setEditingBeatIdx(null);
     setEditDraft("");
     setBlankValues([]);
-    setBlankNote("");
-    setBlanksFreeform(false);
     blankEls = [];
     setCitePill(null);
     setCiteEditor(null);
@@ -1090,36 +1084,16 @@ export function DrillView() {
     });
   });
 
-  const hasAvailableBlanks = createMemo(() => {
-    if (isNonUnit() || passedVerdict()?.ok || editingBeatIdx() !== null || hasSubmittedBlanks()) return false;
-    const starter = rep()?.starter;
-    return Boolean(starter && countStarterBlanks(starter) > 0);
-  });
-
   const activeBlanks = createMemo(() => {
-    if (!hasAvailableBlanks() || blanksFreeform()) return null;
-    const starter = rep()!.starter!;
+    if (isNonUnit() || passedVerdict()?.ok || editingBeatIdx() !== null || hasSubmittedBlanks()) return null;
+    const starter = rep()?.starter;
+    if (!starter || countStarterBlanks(starter) === 0) return null;
     return {
       starter,
       parsed: parseStarterBlanks(starter),
       isProse: isRenderedStarter(starter),
     };
   });
-
-  const enterBlanksFreeform = () => {
-    setBlanksFreeform(true);
-    requestAnimationFrame(() => {
-      autoGrow();
-      if (!isTouchDevice()) textarea?.focus();
-    });
-  };
-
-  const exitBlanksFreeform = () => {
-    setBlanksFreeform(false);
-    requestAnimationFrame(() => {
-      if (!isTouchDevice()) blankEls[0]?.focus();
-    });
-  };
 
   const setBlankValue = (index: number, value: string) => {
     setBlankValues((prev) => {
@@ -1133,25 +1107,21 @@ export function DrillView() {
 
   const canSubmitBlanks = () => {
     if (busy() || !activeBlanks()) return false;
-    return filledBlankCount() > 0;
+    return filledBlankCount() > 0 || draft().trim().length > 0 || citations().length > 0;
   };
 
   const submitFillableBlanks = async () => {
     const b = activeBlanks();
     if (!b || !canSubmitBlanks()) return;
-    const note = blankNote();
-    const text = assembleFilledStarter(b.starter, blankValues(), note);
-    if (note) setBlankNote("");
-    await submitBeat(text, { submittedStarter: true });
-  };
-
-  /** Sends only the clarifying question below the blanks card, keeping the fillable holes open and ungraded. */
-  const submitBlankQuestion = async () => {
-    if (busy() || !activeBlanks()) return;
-    const q = blankNote().trim();
-    if (!q && citations().length === 0) return;
-    setBlankNote("");
-    await submitBeat(q || undefined, { clarify: true });
+    if (filledBlankCount() > 0) {
+      const note = draft().trim();
+      const text = assembleFilledStarter(b.starter, blankValues(), note);
+      if (note) setDraftFor(sessionKey(), "");
+      await submitBeat(text, { submittedStarter: true });
+      return;
+    }
+    // No blanks filled yet: send the learner's derivation/notes while keeping the blanks card open.
+    await submitBeat();
   };
 
   const triggerComplete = (
@@ -1870,11 +1840,7 @@ export function DrillView() {
           if (idx >= 0) list.splice(idx, 1);
         });
         if (!disposed) {
-          if (clarify) {
-            setBlankNote(text);
-          } else {
-            setDraftFor(ownerKey, hasOverride ? prevDraft : text);
-          }
+          setDraftFor(ownerKey, hasOverride ? prevDraft : text);
           if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
               if (list.length === 0) list.push(...rawCitations);
@@ -1953,11 +1919,7 @@ export function DrillView() {
           if (idx >= 0) list.splice(idx, 1);
         });
         if (!disposed) {
-          if (clarify) {
-            setBlankNote(text);
-          } else {
-            setDraftFor(ownerKey, hasOverride ? prevDraft : text);
-          }
+          setDraftFor(ownerKey, hasOverride ? prevDraft : text);
           if (rawCitations.length > 0) {
             updateCitationsFor(ownerKey, (list) => {
               if (list.length === 0) list.push(...rawCitations);
@@ -3315,7 +3277,7 @@ export function DrillView() {
                     Boolean(r().starter) &&
                     !activeBlanks() &&
                     !hasStarterBeat() &&
-                    (pinnedAbove() || blanksFreeform() || beats().length > 0);
+                    (pinnedAbove() || beats().length > 0);
                   return (
                     <>
                       <h1 class="v2-prompt" data-citable="true">
@@ -4077,11 +4039,9 @@ export function DrillView() {
                           ? "Drop a question, derivation, paper, file path, or topic to work through…"
                           : activeFrontier()
                             ? "Cite a line above, ask a question, or explain it back…"
-                            : blanksFreeform()
-                              ? "Work out the derivation step by step, or write your answer…"
-                              : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
-                                ? "Write your answer for the points above…"
-                                : "Write your attempt or ask anything…"
+                            : rep()?.starter && shouldPinStarterAbovePad(rep()?.starter)
+                              ? "Write your answer for the points above…"
+                              : "Write your attempt or ask anything…"
                     }
                     spellcheck="false"
                     autocorrect="off"
@@ -4169,16 +4129,6 @@ export function DrillView() {
                   <div class="v2-pad-tools">
                     <Show when={(isExploreMode() || activeFrontier()) && dueFromExplore().length > 0}>
                       <span class="v2-pad-map-count">{dueFromExplore().length} to practice</span>
-                    </Show>
-                    <Show when={blanksFreeform() && hasAvailableBlanks() && !busy()}>
-                      <button
-                        type="button"
-                        class="v2-blank-mode-btn"
-                        data-tip="Return to fill-in-the-blank view"
-                        onClick={exitBlanksFreeform}
-                      >
-                        Back to blanks
-                      </button>
                     </Show>
                   </div>
 
@@ -4347,7 +4297,7 @@ export function DrillView() {
                                         if (targetIdx >= 0 && targetIdx < count) {
                                           blankEls[targetIdx]?.focus();
                                         } else if (!e.shiftKey) {
-                                          blankNoteEl?.focus();
+                                          textarea?.focus();
                                         }
                                       }
                                     }}
@@ -4361,21 +4311,46 @@ export function DrillView() {
                     </For>
                   </div>
 
+                  <div class="v2-blank-work-wrap">
+                    <ComposerCitationChips />
+                    <div class="v2-pad-body">
+                      <textarea
+                        ref={textarea}
+                        class="v2-pad-input"
+                        placeholder="Work out the derivation, add notes, or ask…"
+                        spellcheck="false"
+                        autocorrect="off"
+                        autocapitalize="off"
+                        value={draft()}
+                        onInput={(e) => {
+                          recordActivity();
+                          setDraftFor(sessionKey(), e.currentTarget.value);
+                          autoGrow();
+                        }}
+                        onKeyDown={(e) => {
+                          if (
+                            handlePadIndentKey(e, (next) => {
+                              recordActivity();
+                              setDraftFor(sessionKey(), next);
+                              autoGrow();
+                            })
+                          ) {
+                            return;
+                          }
+                          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                            e.preventDefault();
+                            void submitFillableBlanks();
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+
                   <div class="v2-pad-foot">
                     <div class="v2-pad-tools">
                       <span class="v2-blank-count">
                         {filledBlankCount()}/{blanks()?.parsed.blankCount ?? 0} filled
                       </span>
-                      <Show when={!busy()}>
-                        <button
-                          type="button"
-                          class="v2-blank-mode-btn"
-                          data-tip="Open the full pad to derive step by step before answering"
-                          onClick={enterBlanksFreeform}
-                        >
-                          Work it out
-                        </button>
-                      </Show>
                     </div>
 
                     <div class="v2-pad-actions">
@@ -4388,7 +4363,7 @@ export function DrillView() {
                             const cur = blanks();
                             void submitBeat(
                               cur && filledBlankCount() > 0
-                                ? assembleFilledStarter(cur.starter, blankValues(), blankNote())
+                                ? assembleFilledStarter(cur.starter, blankValues(), draft().trim())
                                 : undefined,
                               { showPivot: true },
                             );
@@ -4396,6 +4371,16 @@ export function DrillView() {
                         >
                           Show answer
                         </button>
+                        <Show when={draft().trim().length > 0 || citations().length > 0}>
+                          <button
+                            type="button"
+                            class="v2-btn-secondary"
+                            data-tip="Ask a clarifying question without grading or closing this rep"
+                            onClick={() => void submitBeat(undefined, { clarify: true })}
+                          >
+                            Ask
+                          </button>
+                        </Show>
                       </Show>
                       <button
                         type="button"
@@ -4408,7 +4393,7 @@ export function DrillView() {
                           when={busy()}
                           fallback={
                             <>
-                              Check <span class="v2-kbd">⌘↵</span>
+                              {filledBlankCount() > 0 ? "Check" : "Send"} <span class="v2-kbd">⌘↵</span>
                             </>
                           }
                         >
@@ -4419,44 +4404,6 @@ export function DrillView() {
                       </button>
                     </div>
                   </div>
-                </div>
-
-                <div class="v2-post-follow-wrap v2-blank-note-wrap">
-                  <ComposerCitationChips />
-                  <form
-                    class={{
-                      "v2-post-follow": true,
-                      "v2-blank-note-form": true,
-                      "has-text": blankNote().trim().length > 0 || citations().length > 0,
-                    }}
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      void submitBlankQuestion();
-                    }}
-                  >
-                    <input
-                      ref={blankNoteEl}
-                      type="text"
-                      class="v2-post-input"
-                      placeholder="Or ask a clarifying question…"
-                      aria-label="Ask a clarifying question"
-                      enterkeyhint="send"
-                      spellcheck="false"
-                      value={blankNote()}
-                      disabled={busy()}
-                      onInput={(e) => {
-                        recordActivity();
-                        setBlankNote(e.currentTarget.value);
-                      }}
-                    />
-                    <Show when={!busy() && (blankNote().trim().length > 0 || citations().length > 0)}>
-                      <button type="submit" class="v2-post-send" aria-label="Ask question">
-                        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                          <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
-                        </svg>
-                      </button>
-                    </Show>
-                  </form>
                 </div>
               </div>
             )}
