@@ -645,4 +645,130 @@ describe("PracticeStore (Solid 2.0)", () => {
       dispose2();
     }
   });
+
+  it("mints sittingId, preserves untouched active MCQ attempts, and drops MCQ tail retries if 2-card separation is lost", async () => {
+    const mk = (i: number) => ({
+      unit_id: `u${i}`,
+      text: `Concept ${i}`,
+      prompt: `Q${i}?`,
+      kind: "distinction",
+      topic: null,
+      depth: "recall" as const,
+      p_imm: 0.4,
+      reviews: 1,
+      next_in_ms: 0,
+      due: true,
+    });
+    const items = [mk(1), mk(2), mk(3), mk(4), mk(5)];
+    let activeAttempts: unknown[] = [
+      {
+        attempt_id: "att-mcq-1",
+        unit_id: "u3",
+        depth: "recall",
+        prompt: "Which statement holds when Cov(X,Y)=0?",
+        modality: "mcq",
+        mcq: {
+          choices: [
+            { id: "c1", text: "Choice 1" },
+            { id: "c2", text: "Choice 2" },
+            { id: "c3", text: "Choice 3" },
+            { id: "c4", text: "Choice 4" },
+          ],
+        },
+        turns: [],
+        assistance_count: 0,
+        active_ms: null,
+        updated_at: Date.now(),
+      },
+    ];
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith("/api/frontiers") || url.startsWith("/api/explorations")) {
+        return new Response(JSON.stringify({ frontiers: [], explorations: [] }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(
+        JSON.stringify({
+          scheduler: "rwkv+fsrs85",
+          total_units: items.length,
+          total_due: items.length,
+          active_ids: items.map((x) => x.unit_id),
+          active_attempts: activeAttempts,
+          items,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    let store!: PracticeStore;
+    const dispose = createRoot((d) => {
+      store = createPracticeStore("user_mcq_store", { autoLoad: false });
+      return d;
+    });
+
+    try {
+      await store.refreshQueue({ selectInitial: true });
+      flush();
+      const firstSittingId = store.state.sittingId;
+      expect(firstSittingId).toBeTruthy();
+
+      // Untouched active MCQ attempt hydrated with 0 turns and frozen choice order!
+      expect(store.state.sessions["u3"]?.attemptId).toBe("att-mcq-1");
+      expect(store.state.sessions["u3"]?.rep?.modality).toBe("mcq");
+      expect(store.state.sessions["u3"]?.rep?.mcq?.choices).toHaveLength(4);
+
+      // Complete 2 direct production cards -> directDone becomes 2
+      store.markUnitCompleted("u1");
+      store.advanceFromUnit("u1");
+      store.markUnitCompleted("u2");
+      store.advanceFromUnit("u2");
+      flush();
+      expect(store.sittingDirectDoneCount()).toBe(2);
+      expect(store.state.stage).toEqual({ kind: "unit", unitId: "u3" });
+
+      // Miss the MCQ on u3 while u4 and u5 remain (2 other cards left -> tail retry queued with minCompletions=4)
+      activeAttempts = [];
+      store.updateUnitSession("u3", (d) => {
+        d.passedVerdict = {
+          ok: true,
+          grade: "again",
+          message: "Not quite.",
+          tier: "system1",
+          probe_id: "p-mcq",
+          latency_ms: 5000,
+          prev_latency_ms: null,
+          next_in_ms: 20 * 60_000,
+          scheduler: "rwkv+fsrs85",
+          mcq_result: {
+            outcome: "wrong",
+            selected_choice_id: "c2",
+            correct_id: "c1",
+            explanation: "Zero covariance does not imply independence.",
+            why_wrong_selected: "Nonlinear dependence can have zero covariance.",
+          },
+        };
+      });
+      store.markUnitCompleted("u3");
+      flush();
+      expect(store.state.sittingRetryIds["u3"]).toBe(true);
+      expect(store.state.sittingRetryMinCompletions["u3"]).toBe(4);
+      // MCQ completion itself does NOT increment direct production count
+      expect(store.sittingDirectDoneCount()).toBe(2);
+
+      // Advance to u4; suppose u4 also indirectly reschedules u5 -> separation is LOST (only 1 intervening card)!
+      store.advanceFromUnit("u3");
+      flush();
+      expect(store.state.stage).toEqual({ kind: "unit", unitId: "u4" });
+      store.markUnitCompleted("u4", ["u5"]);
+      flush();
+      // u3's tail retry is dropped cleanly to fall back to the 20m timed retry!
+      expect(store.state.sittingRetryIds["u3"]).toBeUndefined();
+      expect(store.state.sittingCompletedIds["u3"]).toBe(true);
+      expect(store.state.sittingOutcomes["u3"]).toBe("missed");
+      store.advanceFromUnit("u4");
+      flush();
+      expect(store.state.stage).toEqual({ kind: "sitting-done" });
+    } finally {
+      dispose();
+    }
+  });
 });

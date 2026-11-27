@@ -21,14 +21,17 @@ import {
   fetchNextDrill,
   rescheduleDrillUnit,
   respondFrontier,
+  submitMcqChoice,
   tidyDraft,
   waitExplorationSidecar,
   type AddedUnit,
   type CheckDrillResponse,
   type Frontier,
+  type McqOutcome,
 } from "./drillApi.js";
 import { PracticeContext, sessionHasWork, type Beat, type SittingSlot, type SittingSlotStatus } from "./practiceStore.js";
 import { handlePadIndentKey } from "./padKeys.js";
+import { SendError } from "./sync.js";
 import { Body, inline, mathOnly } from "./text.js";
 
 type CitePillState = { text: string; top: number; left: number };
@@ -359,6 +362,8 @@ export function DrillView() {
   const [blankNote, setBlankNote] = createSignal("");
   const [tidying, setTidying] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
+  const [mcqSubmitting, setMcqSubmitting] = createSignal<"check" | "reveal" | null>(null);
+  const [mcqError, setMcqError] = createSignal<string | null>(null);
 
   // Selection-based citations & quiet "+ Map" pin (T3 Code-style floating pill on text selection)
   const [citePill, setCitePill] = createSignal<CitePillState | null>(null);
@@ -387,6 +392,13 @@ export function DrillView() {
   const citations = () => (isExplore() ? practice.state.explore.citations : (unitSession()?.citations ?? []));
   const passedVerdict = () => (isNonUnit() ? null : (unitSession()?.passedVerdict ?? null));
   const overridden = () => (isNonUnit() ? false : Boolean(unitSession()?.overridden));
+
+  // Bounded multiple-choice rep: four frozen options, select then Check, ungraded clarifying line.
+  const mcqChoices = () => (rep()?.modality === "mcq" ? (rep()?.mcq?.choices ?? []) : []);
+  const isMcq = () => mcqChoices().length > 0;
+  const mcqOpen = () => isMcq() && !passedVerdict()?.ok;
+  const mcqResult = () => (isMcq() ? (passedVerdict()?.mcq_result ?? null) : null);
+  const mcqSelectedId = () => mcqResult()?.selected_choice_id ?? (mcqOpen() ? (unitSession()?.mcqSelectedChoiceId ?? null) : null);
   const exploreAddedIds = createMemo(() => {
     const ids = new Set<string>();
     if (!isExploreMode() && !activeFrontier()) return ids;
@@ -433,6 +445,9 @@ export function DrillView() {
   let postAbort: AbortController | null = null;
   let advanceTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
+  // Choosing an option involves no typing, so an MCQ rep is timed from when its card was shown.
+  const MCQ_LATENCY_CAP_MS = 10 * 60_000;
+  let mcqShownAt = 0;
 
   const recordActivity = () => {
     if (busy() || passedVerdict()?.ok) return;
@@ -472,6 +487,10 @@ export function DrillView() {
   let editTextarea!: HTMLTextAreaElement;
   let postInputEl!: HTMLInputElement;
   let blankNoteEl: HTMLInputElement | undefined;
+  let mcqClarifyEl: HTMLInputElement | undefined;
+  let mcqStageEl: HTMLDivElement | undefined;
+  let mcqVerdictEl: HTMLDivElement | undefined;
+  let mcqOptionEls: (HTMLDivElement | undefined)[] = [];
   let blankEls: (HTMLSpanElement | undefined)[] = [];
   let citeTextarea!: HTMLTextAreaElement;
   let padEl!: HTMLDivElement;
@@ -567,10 +586,16 @@ export function DrillView() {
     setExiting(false);
   };
 
+  const focusComposer = () => {
+    if (passedVerdict()?.ok) postInputEl?.focus();
+    else if (isMcq()) mcqClarifyEl?.focus();
+    else textarea?.focus();
+  };
+
   const cancelPending = () => {
     // Only abort — let `submitBeat`'s `finally` release `busy` cleanly when identity matches.
     activeAbort?.abort();
-    requestAnimationFrame(() => textarea?.focus());
+    if (!isMcq()) requestAnimationFrame(() => textarea?.focus());
   };
 
   const cancelPostPending = () => {
@@ -601,6 +626,9 @@ export function DrillView() {
     setPreviewDelayMs(null);
     setManualAddedIds([]);
     setError(null);
+    setMcqSubmitting(null);
+    setMcqError(null);
+    mcqOptionEls = [];
     clearSketch();
   };
 
@@ -639,7 +667,9 @@ export function DrillView() {
         });
       }
       setLoading(false);
-      if (!existing.passedVerdict?.ok) {
+      mcqShownAt = Date.now();
+      // A choice card has no text field to land in: leave focus alone so 1-4 work straight away.
+      if (!existing.passedVerdict?.ok && existing.rep.modality !== "mcq") {
         requestAnimationFrame(() => {
           autoGrow();
           if (!isTouchDevice()) textarea?.focus();
@@ -652,14 +682,30 @@ export function DrillView() {
     loadAbort = ctrl;
     setLoading(true);
     try {
-      const res = await fetchNextDrill({ unitId }, ctrl.signal);
+      const res = await fetchNextDrill(
+        {
+          unitId,
+          sittingId: practice.state.sittingId,
+          sittingSize: practice.state.sittingIds.length,
+          directDone: practice.sittingDirectDoneCount(),
+          manual: practice.isManualPractice(unitId),
+          retry: practice.isRetryUnit(unitId),
+        },
+        ctrl.signal,
+      );
       if (disposed || seq !== loadSeq || ctrl.signal.aborted || practice.stageKey() !== unitId) return;
+      const issuedMcq = res.rep?.modality === "mcq";
       if (res.rep) {
         practice.rememberPrompt(unitId, res.rep.prompt);
         practice.updateUnitSession(unitId, (d) => {
           d.scheduler = res.scheduler;
           d.rep = res.rep;
+          if (res.rep?.attempt_id) d.attemptId = res.rep.attempt_id;
+          if (issuedMcq && !res.rep?.mcq?.choices.some((c) => c.id === d.mcqSelectedChoiceId)) {
+            d.mcqSelectedChoiceId = null;
+          }
           if (
+            !issuedMcq &&
             res.rep?.starter &&
             !shouldPinStarterAbovePad(res.rep.starter) &&
             !d.draft.trim() &&
@@ -672,10 +718,13 @@ export function DrillView() {
       }
       activeMs = practice.state.sessions[unitId]?.activeMs ?? 0;
       lastActivityAt = 0;
-      requestAnimationFrame(() => {
-        autoGrow();
-        if (!isTouchDevice()) textarea?.focus();
-      });
+      mcqShownAt = Date.now();
+      if (!issuedMcq) {
+        requestAnimationFrame(() => {
+          autoGrow();
+          if (!isTouchDevice()) textarea?.focus();
+        });
+      }
     } catch (e) {
       if (disposed || seq !== loadSeq || ctrl.signal.aborted) return;
       setError(e instanceof Error ? e.message : "Could not load prompt.");
@@ -799,10 +848,7 @@ export function DrillView() {
     setCiteEditor(null);
     clearSelectedMath();
     window.getSelection()?.removeAllRanges();
-    requestAnimationFrame(() => {
-      if (passedVerdict()?.ok) postInputEl?.focus();
-      else textarea?.focus();
-    });
+    requestAnimationFrame(focusComposer);
   };
 
   const pinSelectionToMap = async () => {
@@ -878,10 +924,7 @@ export function DrillView() {
     setCiteComment("");
     clearSelectedMath();
     window.getSelection()?.removeAllRanges();
-    requestAnimationFrame(() => {
-      if (passedVerdict()?.ok) postInputEl?.focus();
-      else textarea?.focus();
-    });
+    requestAnimationFrame(focusComposer);
   };
 
   const cancelCitation = () => {
@@ -950,6 +993,8 @@ export function DrillView() {
         e.preventDefault();
         if (postInput().trim().length > 0 || citations().length > 0) void sendPostFollowUp();
         else transitionToNext();
+      } else if (mcqOpen()) {
+        handleMcqKey(e);
       }
     };
     window.addEventListener("resize", onResize);
@@ -1051,6 +1096,301 @@ export function DrillView() {
   const updateBeatsFor = (key: string, fn: (list: Beat[]) => void) => {
     if (key === "__explore__") practice.updateExplore((d) => fn(d.beats));
     else practice.updateUnitSession(key, (d) => fn(d.beats));
+  };
+
+  // ---- Bounded MCQ: select, then Check. A tap never submits. ----
+  const mcqAttemptId = () => unitSession()?.attemptId ?? rep()?.attempt_id ?? null;
+
+  const mcqLatencyMs = (): number | null => {
+    if (mcqShownAt <= 0) return null;
+    const total = Math.round(activeMs + (Date.now() - mcqShownAt));
+    if (total > MCQ_LATENCY_CAP_MS) return null;
+    return Math.max(500, total);
+  };
+
+  const mcqFailureMessage = (e: unknown): string => {
+    if (e instanceof SendError) {
+      if (e.status === 409) return "This question was already answered with a different choice.";
+      if (e.status >= 400 && e.status < 500 && e.message) return e.message;
+    }
+    return "Couldn't check that just now. Your choice is kept. Try again.";
+  };
+
+  const isEditableTarget = (target: EventTarget | null): boolean =>
+    target instanceof Element &&
+    Boolean(target.closest('input, textarea, select, [contenteditable="true"], [contenteditable=""]'));
+
+  const selectMcqChoice = (choiceId: string, focus = false) => {
+    if (!mcqOpen() || busy()) return;
+    if (unitSession()?.mcqSelectedChoiceId !== choiceId) {
+      practice.updateUnitSession(sessionKey(), (d) => {
+        d.mcqSelectedChoiceId = choiceId;
+      });
+    }
+    setMcqError(null);
+    if (focus) mcqOptionEls[mcqChoices().findIndex((c) => c.id === choiceId)]?.focus();
+  };
+
+  const onMcqOptionClick = (e: MouseEvent, choiceId: string) => {
+    // Dragging across an option to cite it must not also change the answer.
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().trim() && e.currentTarget instanceof Node && sel.containsNode(e.currentTarget, true)) {
+      return;
+    }
+    selectMcqChoice(choiceId);
+  };
+
+  const onMcqOptionKey = (e: KeyboardEvent, index: number) => {
+    if (!mcqOpen() || busy() || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    const list = mcqChoices();
+    let next = -1;
+    if (e.key === "ArrowDown" || e.key === "ArrowRight") next = (index + 1) % list.length;
+    else if (e.key === "ArrowUp" || e.key === "ArrowLeft") next = (index - 1 + list.length) % list.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = list.length - 1;
+    else if (e.key === " " || e.key === "Enter") next = index;
+    const target = list[next];
+    if (!target) return;
+    e.preventDefault();
+    selectMcqChoice(target.id, true);
+  };
+
+  /** Settle an issued MCQ from the server's verdict. The option card carries the verdict, so no beat is added. */
+  const settleMcq = (ownerKey: string, res: CheckDrillResponse) => {
+    practice.updateUnitSession(ownerKey, (d) => {
+      d.passedVerdict = res;
+      d.overridden = false;
+      d.mcqSelectedChoiceId = res.mcq_result?.selected_choice_id ?? null;
+      // An unsent clarifying question carries over to the follow-up line instead of being dropped.
+      if (d.draft.trim() && !d.postInput.trim()) d.postInput = d.draft;
+      d.draft = "";
+    });
+    setMcqError(null);
+    setBumpOpen(false);
+    setPreviewDelayMs(null);
+    practice.markUnitCompleted(ownerKey, res.credited_unit_ids);
+    if (practice.stageKey() !== ownerKey) return;
+    requestAnimationFrame(() => {
+      mcqVerdictEl?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      const active = document.activeElement;
+      if (!isTouchDevice() && (!active || active === document.body || stageEl.contains(active))) {
+        mcqVerdictEl?.focus({ preventScroll: true });
+      }
+    });
+  };
+
+  const submitMcq = async (mode: "check" | "reveal") => {
+    const r = rep();
+    const ownerKey = sessionKey();
+    if (!r || !mcqOpen() || busy()) return;
+    const choiceId = mode === "check" ? (unitSession()?.mcqSelectedChoiceId ?? null) : null;
+    if (mode === "check" && !choiceId) return;
+    const attemptId = mcqAttemptId();
+    if (!attemptId) {
+      setMcqError("This question didn't load fully. Reload and try again.");
+      return;
+    }
+    const latencyMs = mcqLatencyMs();
+
+    const ctrl = new AbortController();
+    activeAbort = ctrl;
+    setCitePill(null);
+    setCiteEditor(null);
+    setBusy(true);
+    setMcqSubmitting(mode);
+    setMcqError(null);
+    setError(null);
+    try {
+      const res = await submitMcqChoice(
+        {
+          attempt_id: attemptId,
+          unit_id: r.unit_id,
+          ...(choiceId ? { choice_id: choiceId } : { reveal: true }),
+          latency_ms: latencyMs,
+        },
+        ctrl.signal,
+      );
+      if (disposed || ctrl.signal.aborted) return;
+      settleMcq(ownerKey, res);
+    } catch (e) {
+      // The selected choice and the attempt id stay exactly as they were, so a retry re-sends the same answer.
+      if (disposed || ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) return;
+      setMcqError(mcqFailureMessage(e));
+    } finally {
+      if (activeAbort === ctrl) {
+        activeAbort = null;
+        if (!disposed) {
+          setBusy(false);
+          setMcqSubmitting(null);
+        }
+      }
+    }
+  };
+
+  /** Ungraded clarifying question on an open MCQ. Passing `retryIdx` re-sends a parked failed question. */
+  const sendMcqClarify = async (retryIdx?: number) => {
+    const r = rep();
+    const ownerKey = sessionKey();
+    if (!r || !mcqOpen() || busy()) return;
+    const attemptId = mcqAttemptId();
+    if (!attemptId) {
+      setMcqError("This question didn't load fully. Reload and try again.");
+      return;
+    }
+    const isRetry = typeof retryIdx === "number";
+    const all = snapshot(beats());
+    const retryTarget = isRetry ? all[retryIdx] : undefined;
+    if (isRetry && !retryTarget) return;
+    const question = retryTarget ? retryTarget.user : draft().trim();
+    const pendingCitations: Citation[] = retryTarget ? (retryTarget.citations ?? []) : snapshot(citations());
+    const payloadText = formatCitedMessage(pendingCitations, question);
+    if (!payloadText) return;
+
+    const turns: { role: "user" | "assistant"; text: string }[] = [];
+    for (const b of isRetry ? all.slice(0, retryIdx) : all) {
+      if (b.pending || isFailedBeat(b)) continue;
+      const u = beatUserPayload(b);
+      if (u) turns.push({ role: "user", text: u });
+      if (b.coach) turns.push({ role: "assistant", text: b.coach });
+    }
+    const latencyMs = mcqLatencyMs();
+
+    const ctrl = new AbortController();
+    activeAbort = ctrl;
+    setCitePill(null);
+    setCiteEditor(null);
+    setBusy(true);
+    setMcqError(null);
+    setError(null);
+
+    const pendingId = uuidv7();
+    const asBeat = (coach: string, extra?: Partial<Beat>): Beat => ({
+      user: question,
+      ...(pendingCitations.length > 0 ? { citations: pendingCitations } : {}),
+      sketch: null,
+      coach,
+      ...extra,
+    });
+    const replacePending = (next: Beat | null) => {
+      practice.updateUnitSession(ownerKey, (d) => {
+        const idx = d.beats.findIndex((b) => b.pending && b.pendingId === pendingId);
+        if (idx < 0) {
+          if (next) d.beats.push(next);
+        } else if (next) d.beats[idx] = next;
+        else d.beats.splice(idx, 1);
+      });
+    };
+    practice.updateUnitSession(ownerKey, (d) => {
+      if (latencyMs !== null) d.activeMs = latencyMs;
+      const pendingBeat = asBeat("", { pending: true, pendingId });
+      if (isRetry && retryIdx < d.beats.length) {
+        d.beats[retryIdx] = pendingBeat;
+      } else {
+        d.beats.push(pendingBeat);
+        d.draft = "";
+        d.citations = [];
+      }
+    });
+    const settleFocus = () => {
+      if (disposed || practice.stageKey() !== ownerKey) return;
+      requestAnimationFrame(() => {
+        mcqClarifyEl?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+        if (!isTouchDevice()) mcqClarifyEl?.focus({ preventScroll: true });
+      });
+    };
+    requestAnimationFrame(() => mcqClarifyEl?.scrollIntoView({ block: "nearest", behavior: "smooth" }));
+
+    const restoreUnsent = () => {
+      if (isRetry && retryTarget) {
+        replacePending(retryTarget);
+        return;
+      }
+      replacePending(null);
+      practice.updateUnitSession(ownerKey, (d) => {
+        if (!d.draft) d.draft = question;
+        if (d.citations.length === 0 && pendingCitations.length > 0) d.citations.push(...pendingCitations);
+      });
+    };
+
+    try {
+      const res = await askDrillFollowUp(
+        {
+          attempt_id: attemptId,
+          unit_id: r.unit_id,
+          depth: "recall",
+          prompt: r.prompt,
+          attempt: "",
+          feedback: "",
+          turns,
+          question: payloadText,
+          latency_ms: latencyMs,
+          hints_used: 0,
+        },
+        ctrl.signal,
+        (partial) => {
+          if (disposed || ctrl.signal.aborted) return;
+          practice.updateUnitSession(ownerKey, (d) => {
+            const target = d.beats.find((b) => b.pending && b.pendingId === pendingId);
+            if (target) target.coach = partial;
+          });
+        },
+      );
+      if (disposed) return;
+      if (ctrl.signal.aborted) {
+        restoreUnsent();
+        return;
+      }
+      replacePending(
+        asBeat(res.message, {
+          ...(res.added_units && res.added_units.length > 0 ? { added: res.added_units } : {}),
+          ...(res.failed && !res.ok ? { failed: true } : {}),
+        }),
+      );
+      if (res.added_units && res.added_units.length > 0) void practice.refreshQueue({ preserveOrder: true });
+      // The server closes the attempt as revealed when the clarification gave the answer away.
+      if (res.ok) settleMcq(ownerKey, res);
+      else settleFocus();
+    } catch (e) {
+      if (disposed) return;
+      if (ctrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
+        restoreUnsent();
+        settleFocus();
+        return;
+      }
+      // Park the question as a retryable failed beat. The card stays open and selectable.
+      replacePending(asBeat(e instanceof Error && e.message ? e.message : "Could not reach the tutor just now.", { failed: true }));
+    } finally {
+      if (activeAbort === ctrl) {
+        activeAbort = null;
+        if (!disposed) setBusy(false);
+      }
+    }
+  };
+
+  const handleMcqKey = (e: KeyboardEvent) => {
+    if (busy() || e.isComposing || e.repeat) return;
+    const editable = isEditableTarget(e.target);
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+      if (editable) {
+        // Inside the clarifying line the chord sends the question; it never submits a choice from a field.
+        if (e.target === mcqClarifyEl && (draft().trim().length > 0 || citations().length > 0)) {
+          e.preventDefault();
+          void sendMcqClarify();
+        }
+        return;
+      }
+      e.preventDefault();
+      if (draft().trim().length > 0 || citations().length > 0) return;
+      if (unitSession()?.mcqSelectedChoiceId) void submitMcq("check");
+      return;
+    }
+    if (editable || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+    // Match the physical digit row too, so layouts that need Shift for digits (AZERTY) still work unshifted.
+    const digit = /^[1-4]$/.test(e.key) ? Number(e.key) : Number(/^Digit([1-4])$/.exec(e.code)?.[1] ?? 0);
+    const choice = digit > 0 ? mcqChoices()[digit - 1] : undefined;
+    if (!choice) return;
+    e.preventDefault();
+    selectMcqChoice(choice.id, true);
   };
 
   const executeBeatRequest = async (opts: {
@@ -1926,7 +2266,7 @@ export function DrillView() {
     try {
       const res = await exploreDrill(
         {
-          initial: `Completed practice on: ${r.prompt} (Unit: ${r.text})`,
+          initial: `Completed practice on: ${r.prompt} (Unit: ${r.text})${mcqExploreContext()}`,
           turns: priorTurns,
           reply: payloadText,
           promote_on_unit: true,
@@ -2125,6 +2465,43 @@ export function DrillView() {
     return soon(next);
   };
 
+  // MCQ verdicts state the next assignment, never a win: the next rep always removes the choices.
+  const mcqScheduleLabel = () => {
+    const v = passedVerdict();
+    const outcome = v?.mcq_result?.outcome;
+    if (!v || !v.ok) return "";
+    const inTime = (ms: number) => `Next: answer without choices in ${fmtDur(ms)}`;
+    const preview = previewDelayMs();
+    if (preview !== null) return inTime(preview);
+    const next = v.next_in_ms !== null && v.next_in_ms > 0 ? v.next_in_ms : null;
+    if (overridden() && next !== null) return inTime(next);
+    const missed = outcome === "wrong" || outcome === "revealed" || (!outcome && v.grade === "again");
+    if (missed && practice.isRetryUnit(sessionKey())) return "Answer without choices at end of sitting";
+    return inTime(next ?? (outcome === "correct" ? 4 * 3_600_000 : 20 * 60_000));
+  };
+
+  /** The frozen options and what the learner did with them, for the post-verdict explore context. */
+  const mcqExploreContext = (): string => {
+    const choices = mcqChoices();
+    if (choices.length === 0) return "";
+    const res = mcqResult();
+    const numberOf = (id: string | null | undefined) => {
+      const i = id ? choices.findIndex((c) => c.id === id) : -1;
+      return i >= 0 ? String(i + 1) : null;
+    };
+    const lines = choices.map((c, i) => `${i + 1}. ${c.text}`);
+    const picked = numberOf(res?.selected_choice_id);
+    const correct = numberOf(res?.correct_id);
+    const answer = correct ? ` The correct answer is option ${correct}.` : "";
+    const outcomes: Record<McqOutcome, string> = {
+      correct: `The learner chose option ${picked ?? "?"}, which is correct.`,
+      assisted_correct: `The learner chose option ${picked ?? "?"}, which is correct, after asking for clarifying help.`,
+      wrong: `The learner chose option ${picked ?? "?"}, which is wrong.${answer}`,
+      revealed: `The learner did not choose an option; the answer was shown to them.${answer}`,
+    };
+    return `\n\nIt was asked as multiple choice with these options:\n${lines.join("\n")}${res ? `\n${outcomes[res.outcome]}` : ""}`;
+  };
+
   // What the next rep will ask for, when it differs from this one. Stated as an assignment, not an award.
   const nextDepthNote = () => {
     const v = passedVerdict();
@@ -2165,6 +2542,136 @@ export function DrillView() {
   const tellMeDirectly = () => {
     if (busy()) return;
     void submitBeat(undefined, { tellMe: true });
+  };
+
+  /** Schedule line with the Bring back slider, plus Next. Shared by the written and the MCQ verdict. */
+  const VerdictFoot = (props: { label: () => string; note?: () => string; clean: () => boolean }) => {
+    const note = () => props.note?.() ?? "";
+    return (
+      <>
+        <div class="v2-verdict-foot">
+          <span class="v2-verdict-trace">
+            <Show when={props.label()}>
+              <Show
+                when={rep()?.unit_id}
+                fallback={<span>{props.label()}</span>}
+              >
+                <button
+                  type="button"
+                  class={{ "v2-interval-btn": true, "is-open": bumpOpen() }}
+                  disabled={overriding()}
+                  data-tip="Adjust when this comes back"
+                  aria-expanded={bumpOpen() ? "true" : "false"}
+                  onClick={() => {
+                    setBumpOpen((open) => {
+                      if (open) setPreviewDelayMs(null);
+                      return !open;
+                    });
+                  }}
+                >
+                  <span>{overriding() ? "updating…" : props.label()}</span>
+                  <svg class="v2-interval-caret" width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2.5 3.75 5 6.25l2.5-2.5" />
+                  </svg>
+                </button>
+              </Show>
+            </Show>
+            <Show when={note()}>
+              <span class="v2-verdict-note">
+                <Show when={props.label()}>
+                  <span aria-hidden="true"> · </span>
+                </Show>
+                {note()}
+              </span>
+            </Show>
+          </span>
+          <div class="v2-pass-actions">
+            <button
+              type="button"
+              class={{ "v2-btn-primary": true, "is-passed": props.clean() }}
+              onClick={transitionToNext}
+            >
+              <Show when={props.clean()}>
+                <svg class="v2-check-svg" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                </svg>
+              </Show>
+              Next <span class="v2-kbd">⌘↵</span>
+            </button>
+          </div>
+        </div>
+        <Show when={bumpOpen() && rep()?.unit_id}>
+          {(() => {
+            const effectiveMs = () =>
+              previewDelayMs() ??
+              (passedVerdict()?.next_in_ms && passedVerdict()!.next_in_ms! > 0
+                ? passedVerdict()!.next_in_ms!
+                : 20 * 60_000);
+            const recommendedMs = () => {
+              const v = passedVerdict();
+              if (typeof v?.scheduled_interval_ms === "number" && v.scheduled_interval_ms > 0) {
+                return v.scheduled_interval_ms;
+              }
+              if (typeof v?.next_in_ms === "number" && v.next_in_ms > 0) {
+                return v.next_in_ms;
+              }
+              return 20 * 60_000;
+            };
+            const recIdx = () => nearestStopIdx(recommendedMs());
+            const recFrac = () => recIdx() / (RELEARN_STOPS_MS.length - 1);
+            const curIdx = () => nearestStopIdx(effectiveMs());
+            const atRecommended = () => curIdx() === recIdx();
+            return (
+              <div class="v2-bump-row" role="group" aria-label="Adjust next review time">
+                <span class="v2-bump-label">Bring back</span>
+                <div class="v2-bump-track-wrap">
+                  <span
+                    class={{ "v2-bump-rec-tick": true, "is-active": atRecommended() }}
+                    style={{ left: `calc(5.5px + (100% - 11px) * ${recFrac()})` }}
+                    aria-hidden="true"
+                  />
+                  <input
+                    type="range"
+                    class="v2-bump-range"
+                    min={0}
+                    max={RELEARN_STOPS_MS.length - 1}
+                    step={1}
+                    value={curIdx()}
+                    disabled={overriding()}
+                    aria-label="Bring back interval"
+                    aria-valuetext={fmtDur(effectiveMs())}
+                    onInput={(e) => {
+                      const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
+                      if (ms !== undefined) setPreviewDelayMs(ms);
+                    }}
+                    onChange={(e) => {
+                      const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
+                      if (ms !== undefined) void commitDelayOverride(ms);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    class={{
+                      "v2-bump-rec-label": true,
+                      "is-start": recIdx() === 0,
+                      "is-end": recIdx() === RELEARN_STOPS_MS.length - 1,
+                      "is-active": atRecommended(),
+                    }}
+                    style={{ left: `calc(5.5px + (100% - 11px) * ${recFrac()})` }}
+                    disabled={overriding() || atRecommended()}
+                    data-tip={`Recommended (~${fmtDur(recommendedMs())})`}
+                    onClick={() => void commitDelayOverride(recommendedMs())}
+                  >
+                    {fmtDur(recommendedMs())}
+                  </button>
+                </div>
+                <span class="v2-bump-val">{fmtDur(effectiveMs())}</span>
+              </div>
+            );
+          })()}
+        </Show>
+      </>
+    );
   };
 
   const ComposerCitationChips = () => (
@@ -2338,18 +2845,157 @@ export function DrillView() {
           </Switch>
         </div>
 
+        {/* Bounded MCQ: four frozen options. Select, then Check; the verdict settles right under them. */}
+        <Show when={isMcq()}>
+          <div ref={mcqStageEl} class="v2-mcq-stage">
+            <div
+              class={{
+                "v2-pad": true,
+                "v2-textured": true,
+                "v2-mcq": true,
+                "is-checking": mcqSubmitting() !== null,
+                "is-settled": !mcqOpen(),
+              }}
+            >
+              <div class="v2-mcq-options" role="radiogroup" aria-label="Answer choices">
+                <For each={mcqChoices()} keyed={(c) => c.id}>
+                  {(choice, i) => {
+                    const selected = () => mcqSelectedId() === choice().id;
+                    const isCorrect = () => mcqResult()?.correct_id === choice().id;
+                    const isWrongPick = () => mcqResult()?.outcome === "wrong" && selected() && !isCorrect();
+                    const tabbable = () => mcqOpen() && (selected() || (!mcqSelectedId() && i() === 0));
+                    return (
+                      <div
+                        ref={(el) => {
+                          mcqOptionEls[i()] = el;
+                        }}
+                        class={{
+                          "v2-mcq-option": true,
+                          "is-selected": selected(),
+                          "is-correct": isCorrect(),
+                          "is-wrong-pick": isWrongPick(),
+                          "is-locked": !mcqOpen(),
+                        }}
+                        role="radio"
+                        aria-checked={selected() ? "true" : "false"}
+                        aria-disabled={!mcqOpen() || busy() ? "true" : undefined}
+                        tabindex={tabbable() ? 0 : -1}
+                        onClick={(e) => onMcqOptionClick(e, choice().id)}
+                        onKeyDown={(e) => onMcqOptionKey(e, i())}
+                      >
+                        <span class="v2-mcq-mark" aria-hidden="true">
+                          <Show when={isCorrect()} fallback={<span class="v2-mcq-num">{i() + 1}</span>}>
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                              <path d="M3.2 8.4l3.2 3.2 6.4-7" />
+                            </svg>
+                          </Show>
+                        </span>
+                        <span class="v2-mcq-text" data-citable="true">
+                          {inline(choice().text)}
+                        </span>
+                        <Show when={isCorrect() || isWrongPick()}>
+                          <span class="v2-mcq-badge">{isCorrect() ? "Correct" : "Your choice"}</span>
+                        </Show>
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+              <Show when={mcqOpen()}>
+                <Show when={mcqError()}>
+                  {(msg) => (
+                    <p class="v2-error-line v2-mcq-error" role="alert">
+                      {msg()}
+                    </p>
+                  )}
+                </Show>
+                <div class="v2-pad-foot v2-mcq-foot">
+                  <button
+                    type="button"
+                    class="v2-mcq-reveal"
+                    disabled={busy()}
+                    onClick={() => void submitMcq("reveal")}
+                  >
+                    I'm not sure · Show answer
+                  </button>
+                  <div class="v2-pad-actions">
+                    <button
+                      type="button"
+                      class={{ "v2-btn-primary": true, "is-busy": mcqSubmitting() === "check" }}
+                      disabled={mcqSubmitting() === "check" ? false : busy() || !mcqSelectedId()}
+                      onClick={() => {
+                        if (mcqSubmitting() === "check") cancelPending();
+                        else void submitMcq("check");
+                      }}
+                    >
+                      <Show
+                        when={mcqSubmitting() === "check"}
+                        fallback={
+                          <>
+                            Check <span class="v2-kbd">⌘↵</span>
+                          </>
+                        }
+                      >
+                        <span class="v2-spinner" aria-hidden="true" />
+                        <span class="v2-busy-label">Checking</span>
+                        <span class="v2-busy-stop">Cancel</span>
+                      </Show>
+                    </button>
+                  </div>
+                </div>
+              </Show>
+            </div>
+
+            <Show when={passedVerdict()?.ok ? passedVerdict() : null}>
+              {(v) => {
+                const outcome = () => v()?.mcq_result?.outcome ?? null;
+                return (
+                  <div
+                    ref={mcqVerdictEl}
+                    class={{
+                      "v2-beat-coach": true,
+                      "v2-mcq-verdict": true,
+                      "is-pass": outcome() === "correct",
+                      "is-missed": outcome() !== "correct",
+                    }}
+                    role="status"
+                    tabindex={-1}
+                  >
+                    <Show when={outcome() === "correct" || outcome() === "assisted_correct"}>
+                      <p class="v2-mcq-verdict-title">{outcome() === "correct" ? "Correct" : "Correct with help"}</p>
+                    </Show>
+                    <Show when={v()?.mcq_result}>
+                      {(m) => (
+                        <div class="v2-verdict-body" data-citable="true">
+                          <Show when={m()?.outcome === "wrong" && m()?.why_wrong_selected}>
+                            {(why) => <p>{inline(why() ?? "")}</p>}
+                          </Show>
+                          <p>{inline(m()?.explanation ?? "")}</p>
+                        </div>
+                      )}
+                    </Show>
+                    <VerdictFoot label={mcqScheduleLabel} clean={() => outcome() === "correct"} />
+                  </div>
+                );
+              }}
+            </Show>
+          </div>
+        </Show>
+
         {/* Progressive Solveit-style committed beats */}
         <Show when={beats().length > 0}>
           <div class="v2-beats">
             <For each={beats()}>
               {(beat, idx) => {
-                const isFinalPass = () => Boolean(passedVerdict()?.ok) && idx() === beats().length - 1;
+                // An MCQ's verdict lives on its option card; its beats are only clarification turns.
+                const isFinalPass = () => !isMcq() && Boolean(passedVerdict()?.ok) && idx() === beats().length - 1;
                 const isCleanPass = () => isFinalPass() && passedVerdict()?.grade !== "again";
                 const isMissedClose = () => isFinalPass() && passedVerdict()?.grade === "again";
                 const failed = () => isFailedBeat(beat);
                 const isEditing = () => editingBeatIdx() === idx();
                 const canEdit = () =>
                   !isNonUnit() &&
+                  !isMcq() &&
                   !passedVerdict()?.ok &&
                   !beat.pending &&
                   !failed() &&
@@ -2516,7 +3162,7 @@ export function DrillView() {
                               when={annoSummary().matchedCount > 0}
                               fallback={
                                 <pre
-                                  class={{ "v2-beat-code": true, "is-prose": isNonUnit() }}
+                                  class={{ "v2-beat-code": true, "is-prose": isNonUnit() || isMcq() }}
                                   onDblClick={() => {
                                     if (canEdit()) startEditingBeat(idx());
                                   }}
@@ -2568,7 +3214,7 @@ export function DrillView() {
                               <span>
                                 {beat.coach.trim().length > 0
                                   ? "Writing"
-                                  : isNonUnit()
+                                  : isNonUnit() || isMcq()
                                     ? "Thinking"
                                     : "Checking"}
                               </span>
@@ -2580,15 +3226,17 @@ export function DrillView() {
                           <Match when={failed()}>
                             <div class="v2-beat-failed">
                               <span class="v2-beat-failed-msg">{failedBeatMessage(beat)}</span>
-                              <button
-                                type="button"
-                                class="v2-retry-btn"
-                                disabled={busy()}
-                                onClick={() => void retryBeat(idx())}
-                              >
-                                <RetryIcon />
-                                Retry
-                              </button>
+                              <Show when={!isMcq() || mcqOpen()}>
+                                <button
+                                  type="button"
+                                  class="v2-retry-btn"
+                                  disabled={busy()}
+                                  onClick={() => void (isMcq() ? sendMcqClarify(idx()) : retryBeat(idx()))}
+                                >
+                                  <RetryIcon />
+                                  Retry
+                                </button>
+                              </Show>
                             </div>
                           </Match>
                         </Switch>
@@ -2609,127 +3257,7 @@ export function DrillView() {
                         <AddedUnitsList items={beat.added} removingId={removingId()} onUndo={(u) => void handleUndoAddedUnit(u)} />
 
                         <Show when={isFinalPass()}>
-                          <div class="v2-verdict-foot">
-                            <span class="v2-verdict-trace">
-                              <Show when={intervalLabel()}>
-                                <Show
-                                  when={rep()?.unit_id}
-                                  fallback={<span>{intervalLabel()}</span>}
-                                >
-                                  <button
-                                    type="button"
-                                    class={{ "v2-interval-btn": true, "is-open": bumpOpen() }}
-                                    disabled={overriding()}
-                                    data-tip="Adjust when this comes back"
-                                    aria-expanded={bumpOpen() ? "true" : "false"}
-                                    onClick={() => {
-                                      setBumpOpen((open) => {
-                                        if (open) setPreviewDelayMs(null);
-                                        return !open;
-                                      });
-                                    }}
-                                  >
-                                    <span>{overriding() ? "updating…" : intervalLabel()}</span>
-                                    <svg class="v2-interval-caret" width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                      <path d="M2.5 3.75 5 6.25l2.5-2.5" />
-                                    </svg>
-                                  </button>
-                                </Show>
-                              </Show>
-                              <Show when={nextDepthNote()}>
-                                <span class="v2-verdict-note">
-                                  <Show when={intervalLabel()}>
-                                    <span aria-hidden="true"> · </span>
-                                  </Show>
-                                  {nextDepthNote()}
-                                </span>
-                              </Show>
-                            </span>
-                            <div class="v2-pass-actions">
-                              <button
-                                type="button"
-                                class={{ "v2-btn-primary": true, "is-passed": isCleanPass() }}
-                                onClick={transitionToNext}
-                              >
-                                <Show when={isCleanPass()}>
-                                  <svg class="v2-check-svg" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                                    <path d="M3.2 8.4l3.2 3.2 6.4-7" />
-                                  </svg>
-                                </Show>
-                                Next <span class="v2-kbd">⌘↵</span>
-                              </button>
-                            </div>
-                          </div>
-                          <Show when={bumpOpen() && rep()?.unit_id}>
-                            {(() => {
-                              const effectiveMs = () =>
-                                previewDelayMs() ??
-                                (passedVerdict()?.next_in_ms && passedVerdict()!.next_in_ms! > 0
-                                  ? passedVerdict()!.next_in_ms!
-                                  : 20 * 60_000);
-                              const recommendedMs = () => {
-                                const v = passedVerdict();
-                                if (typeof v?.scheduled_interval_ms === "number" && v.scheduled_interval_ms > 0) {
-                                  return v.scheduled_interval_ms;
-                                }
-                                if (typeof v?.next_in_ms === "number" && v.next_in_ms > 0) {
-                                  return v.next_in_ms;
-                                }
-                                return 20 * 60_000;
-                              };
-                              const recIdx = () => nearestStopIdx(recommendedMs());
-                              const recFrac = () => recIdx() / (RELEARN_STOPS_MS.length - 1);
-                              const curIdx = () => nearestStopIdx(effectiveMs());
-                              const atRecommended = () => curIdx() === recIdx();
-                              return (
-                                <div class="v2-bump-row" role="group" aria-label="Adjust next review time">
-                                  <span class="v2-bump-label">Bring back</span>
-                                  <div class="v2-bump-track-wrap">
-                                    <span
-                                      class={{ "v2-bump-rec-tick": true, "is-active": atRecommended() }}
-                                      style={{ left: `calc(5.5px + (100% - 11px) * ${recFrac()})` }}
-                                      aria-hidden="true"
-                                    />
-                                    <input
-                                      type="range"
-                                      class="v2-bump-range"
-                                      min={0}
-                                      max={RELEARN_STOPS_MS.length - 1}
-                                      step={1}
-                                      value={curIdx()}
-                                      disabled={overriding()}
-                                      aria-label="Bring back interval"
-                                      aria-valuetext={fmtDur(effectiveMs())}
-                                      onInput={(e) => {
-                                        const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
-                                        if (ms !== undefined) setPreviewDelayMs(ms);
-                                      }}
-                                      onChange={(e) => {
-                                        const ms = RELEARN_STOPS_MS[Number(e.currentTarget.value)];
-                                        if (ms !== undefined) void commitDelayOverride(ms);
-                                      }}
-                                    />
-                                    <button
-                                      type="button"
-                                      class={{
-                                        "v2-bump-rec-label": true,
-                                        "is-start": recIdx() === 0,
-                                        "is-end": recIdx() === RELEARN_STOPS_MS.length - 1,
-                                        "is-active": atRecommended(),
-                                      }}
-                                      style={{ left: `calc(5.5px + (100% - 11px) * ${recFrac()})` }}
-                                      disabled={overriding() || atRecommended()}
-                                      data-tip={`Recommended (~${fmtDur(recommendedMs())})`}
-                                      onClick={() => void commitDelayOverride(recommendedMs())}
-                                    >
-                                      {fmtDur(recommendedMs())}
-                                    </button>
-                                  </div>
-                                  <span class="v2-bump-val">{fmtDur(effectiveMs())}</span>
-                                </div>
-                              );
-                            })()}
-                          </Show>
+                          <VerdictFoot label={intervalLabel} note={nextDepthNote} clean={isCleanPass} />
                         </Show>
                       </div>
                     </Show>
@@ -2737,6 +3265,43 @@ export function DrillView() {
                 );
               }}
             </For>
+          </div>
+        </Show>
+
+        {/* Ungraded clarifying line while an MCQ is open */}
+        <Show when={mcqOpen()}>
+          <div class="v2-post-follow-wrap v2-mcq-clarify">
+            <ComposerCitationChips />
+            <form
+              class={{
+                "v2-post-follow": true,
+                "has-text": draft().trim().length > 0 || citations().length > 0,
+              }}
+              onSubmit={(e) => {
+                e.preventDefault();
+                void sendMcqClarify();
+              }}
+            >
+              <input
+                ref={mcqClarifyEl}
+                type="text"
+                class="v2-post-input"
+                placeholder="Or ask a clarifying question…"
+                aria-label="Ask a clarifying question"
+                enterkeyhint="send"
+                spellcheck="false"
+                value={draft()}
+                disabled={busy()}
+                onInput={(e) => setDraftFor(sessionKey(), e.currentTarget.value)}
+              />
+              <Show when={!busy() && (draft().trim().length > 0 || citations().length > 0)}>
+                <button type="submit" class="v2-post-send" aria-label="Ask question">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M8 12.5V3.5M4 7.5L8 3.5l4 4" />
+                  </svg>
+                </button>
+              </Show>
+            </form>
           </div>
         </Show>
 
@@ -2868,7 +3433,7 @@ export function DrillView() {
         </Show>
 
         {/* The ONE active pad at the bottom (hidden once rep passes or while editing a derivation in place) */}
-        <Show when={!passedVerdict()?.ok && editingBeatIdx() === null}>
+        <Show when={!passedVerdict()?.ok && editingBeatIdx() === null && !isMcq()}>
           <Show
             when={activeBlanks()}
             fallback={
@@ -3070,12 +3635,12 @@ export function DrillView() {
                   <div
                     class={{
                       "v2-blank-lines": true,
-                      "is-prose": blanks().isProse,
-                      "is-code": !blanks().isProse,
+                      "is-prose": Boolean(blanks()?.isProse),
+                      "is-code": !blanks()?.isProse,
                     }}
                     data-citable="true"
                   >
-                    <For each={blanks().parsed.lines}>
+                    <For each={blanks()?.parsed.lines ?? []}>
                       {(line) => (
                         <div class={{ "v2-blank-row": true, "has-marker": Boolean(line.marker) }}>
                           <Show when={line.marker}>
@@ -3087,7 +3652,7 @@ export function DrillView() {
                             <For each={line.segments}>
                               {(seg) =>
                                 seg.kind === "text" ? (
-                                  blanks().isProse ? inline(seg.text) : mathOnly(seg.text)
+                                  blanks()?.isProse ? inline(seg.text) : mathOnly(seg.text)
                                 ) : (
                                   <span
                                     ref={(el) => {
@@ -3097,16 +3662,16 @@ export function DrillView() {
                                     }}
                                     class={{
                                       "v2-blank": true,
-                                      "is-code": !blanks().isProse,
+                                      "is-code": !blanks()?.isProse,
                                       "is-empty": !(blankValues()[seg.index]?.trim()),
                                     }}
                                     contenteditable={busy() ? "false" : "true"}
                                     role="textbox"
-                                    aria-label={`Blank ${seg.index + 1} of ${blanks().parsed.blankCount}`}
+                                    aria-label={`Blank ${seg.index + 1} of ${blanks()?.parsed.blankCount ?? 0}`}
                                     spellcheck={false}
                                     autocorrect="off"
                                     autocapitalize="off"
-                                    enterkeyhint={seg.index < blanks().parsed.blankCount - 1 ? "next" : "send"}
+                                    enterkeyhint={seg.index < (blanks()?.parsed.blankCount ?? 0) - 1 ? "next" : "send"}
                                     onBlur={(e) => {
                                       if (!e.currentTarget.innerText.trim()) e.currentTarget.textContent = "";
                                     }}
@@ -3124,6 +3689,7 @@ export function DrillView() {
                                       }
                                     }}
                                     onKeyDown={(e) => {
+                                      const count = blanks()?.parsed.blankCount ?? 0;
                                       if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
                                         e.preventDefault();
                                         void submitFillableBlanks();
@@ -3131,7 +3697,7 @@ export function DrillView() {
                                       }
                                       if (e.key === "Enter" && !e.shiftKey) {
                                         e.preventDefault();
-                                        if (seg.index < blanks().parsed.blankCount - 1) {
+                                        if (seg.index < count - 1) {
                                           blankEls[seg.index + 1]?.focus();
                                         } else {
                                           void submitFillableBlanks();
@@ -3141,7 +3707,7 @@ export function DrillView() {
                                       if (e.key === "Tab") {
                                         e.preventDefault();
                                         const targetIdx = e.shiftKey ? seg.index - 1 : seg.index + 1;
-                                        if (targetIdx >= 0 && targetIdx < blanks().parsed.blankCount) {
+                                        if (targetIdx >= 0 && targetIdx < count) {
                                           blankEls[targetIdx]?.focus();
                                         } else if (!e.shiftKey) {
                                           blankNoteEl?.focus();
@@ -3161,7 +3727,7 @@ export function DrillView() {
                   <div class="v2-pad-foot">
                     <div class="v2-pad-tools">
                       <span class="v2-blank-count">
-                        {filledBlankCount()}/{blanks().parsed.blankCount} filled
+                        {filledBlankCount()}/{blanks()?.parsed.blankCount ?? 0} filled
                       </span>
                     </div>
 
@@ -3171,14 +3737,15 @@ export function DrillView() {
                           type="button"
                           class="v2-btn-secondary"
                           data-tip="Reveal the answer and bring this card back soon"
-                          onClick={() =>
+                          onClick={() => {
+                            const cur = blanks();
                             void submitBeat(
-                              filledBlankCount() > 0
-                                ? assembleFilledStarter(blanks().starter, blankValues(), blankNote())
+                              cur && filledBlankCount() > 0
+                                ? assembleFilledStarter(cur.starter, blankValues(), blankNote())
                                 : undefined,
                               { showPivot: true },
-                            )
-                          }
+                            );
+                          }}
                         >
                           Show answer
                         </button>
@@ -3255,7 +3822,7 @@ export function DrillView() {
         {(pill) => (
           <div
             class="v2-cite-pill"
-            style={{ top: `${pill().top}px`, left: `${pill().left}px` }}
+            style={{ top: `${pill()?.top ?? 0}px`, left: `${pill()?.left ?? 0}px` }}
             onMouseDown={(e) => e.preventDefault()}
           >
             <button
@@ -3305,10 +3872,10 @@ export function DrillView() {
             class="v2-cite-pop"
             role="dialog"
             aria-label="Add citation"
-            style={{ top: `${ed().top}px`, left: `${ed().left}px` }}
+            style={{ top: `${ed()?.top ?? 0}px`, left: `${ed()?.left ?? 0}px` }}
           >
             <div class="v2-cite-pop-quote">
-              <span class="v2-cite-pop-quote-text">{inline(ed().text)}</span>
+              <span class="v2-cite-pop-quote-text">{inline(ed()?.text ?? "")}</span>
             </div>
             <textarea
               ref={citeTextarea}

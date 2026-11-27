@@ -5,6 +5,7 @@
 //   System 2 (Fast generative LLM via OpenRouter): called on low-confidence attempts, reasoning
 //     gaps, sketches/images, or explicit hint requests. Returns 1-2 crisp sentences: either a
 //     surgical question pointing at the exact leap/flaw, or a concise confirmation.
+import { createHash, randomInt } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -24,11 +25,113 @@ export interface JudgeHistoryItem {
   feedback: string;
 }
 
+export interface McqChoice {
+  id: string;
+  text: string;
+}
+
+export interface McqSpec {
+  version: 1;
+  item_id: string;
+  choices: [McqChoice, McqChoice, McqChoice, McqChoice];
+  correct_id: string;
+  explanation: string;
+  why_wrong: Record<string, string>;
+}
+
 export interface PromptCacheEntry {
   prompt: string;
   crux?: string | undefined;
   modality?: RepModality | undefined;
   starter?: string | undefined;
+  mcq?: McqSpec | undefined;
+}
+
+const BANNED_MCQ_PATTERNS = [
+  /\ball of the above\b/i,
+  /\bnone of the above\b/i,
+  /\bboth\s+[a-d1-4]\s+and\s+[a-d1-4]\b/i,
+  /\b(?:option|choice)\s*[a-d1-4]\b/i,
+];
+
+function normChoiceText(s: string): string {
+  return s.toLowerCase().replace(/\s+/g, " ").replace(/[.?!,:;]+$/g, "").trim();
+}
+
+/**
+ * Strictly validates a server-private MCQ spec before caching or serving:
+ * - Exactly 4 unique choices with normalized distinct non-empty text
+ * - `correct_id` matches one of the 4 choice IDs
+ * - `why_wrong` covers EVERY distractor and NO extra/correct keys
+ * - No banned meta-options ("all/none of the above", option-position references)
+ * - Balanced length (key is not conspicuously >2.5x longer than median distractor)
+ * - Balanced `$` math delimiters so KaTeX renders cleanly
+ */
+export function validateMcqSpec(raw: unknown): McqSpec | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (!Array.isArray(o.choices) || o.choices.length !== 4) return null;
+  const choices: McqChoice[] = [];
+  const ids = new Set<string>();
+  const norms = new Set<string>();
+  for (const item of o.choices) {
+    if (!item || typeof item !== "object") return null;
+    const c = item as Record<string, unknown>;
+    const id = typeof c.id === "string" ? c.id.trim() : "";
+    const text = typeof c.text === "string" ? c.text.trim() : "";
+    if (!id || !text || text.length > 260) return null;
+    if (ids.has(id)) return null;
+    const norm = normChoiceText(text);
+    if (!norm || norms.has(norm)) return null;
+    if (BANNED_MCQ_PATTERNS.some((re) => re.test(text))) return null;
+    const unescapedDollars = text.replace(/\\\$/g, "").match(/\$/g)?.length ?? 0;
+    if (unescapedDollars % 2 !== 0) return null;
+    ids.add(id);
+    norms.add(norm);
+    choices.push({ id, text });
+  }
+  const correctId = typeof o.correct_id === "string" ? o.correct_id.trim() : "";
+  if (!correctId || !ids.has(correctId)) return null;
+  const explanation = typeof o.explanation === "string" ? o.explanation.trim() : "";
+  if (explanation.length < 10) return null;
+  if (!o.why_wrong || typeof o.why_wrong !== "object") return null;
+  const whyRaw = o.why_wrong as Record<string, unknown>;
+  const whyWrong: Record<string, string> = {};
+  const distractorIds = choices.filter((c) => c.id !== correctId).map((c) => c.id);
+  for (const did of distractorIds) {
+    const reason = typeof whyRaw[did] === "string" ? whyRaw[did]!.trim() : "";
+    if (reason.length < 8) return null;
+    whyWrong[did] = reason;
+  }
+  if (Object.keys(whyRaw).some((k) => !distractorIds.includes(k) && k !== correctId)) {
+    // Drop unexpected keys rather than storing junk; reject if missing any distractor (checked above).
+  }
+  // Length balance guard: prevent giveaway where the correct option is vastly longer than distractors.
+  const keyLen = choices.find((c) => c.id === correctId)!.text.length;
+  const distLens = choices
+    .filter((c) => c.id !== correctId)
+    .map((c) => c.text.length)
+    .sort((a, b) => a - b);
+  const medianDist = distLens[1] ?? distLens[0] ?? 1;
+  if (keyLen > Math.max(45, medianDist * 2.5)) return null;
+  if (distLens[0]! < Math.max(4, keyLen * 0.25) && keyLen > 60) return null;
+
+  const itemId =
+    typeof o.item_id === "string" && o.item_id.trim()
+      ? o.item_id.trim()
+      : createHash("sha256")
+          .update(choices.map((c) => `${c.id}:${c.text}`).join("|") + "|" + correctId)
+          .digest("hex")
+          .slice(0, 16);
+
+  return {
+    version: 1,
+    item_id: itemId,
+    choices: choices as [McqChoice, McqChoice, McqChoice, McqChoice],
+    correct_id: correctId,
+    explanation,
+    why_wrong: whyWrong,
+  };
 }
 
 export interface JudgeInput {
@@ -1000,7 +1103,7 @@ export class FastJudge {
     try {
       const data = JSON.parse(readFileSync(this.cachePath, "utf8")) as Record<
         string,
-        string | { prompt?: string; crux?: string; modality?: RepModality; starter?: string }
+        string | { prompt?: string; crux?: string; modality?: RepModality; starter?: string; mcq?: unknown }
       >;
       for (const [k, v] of Object.entries(data)) {
         if (typeof v === "string" && v.trim()) {
@@ -1013,9 +1116,21 @@ export class FastJudge {
             v.modality === "fix_bug" ||
             v.modality === "faded_skeleton" ||
             v.modality === "contrast" ||
-            v.modality === "synthesis"
+            v.modality === "synthesis" ||
+            v.modality === "mcq"
               ? v.modality
               : undefined;
+          if (modality === "mcq") {
+            const validMcq = validateMcqSpec(v.mcq);
+            if (!validMcq) continue;
+            this.promptCache.set(k, {
+              prompt: v.prompt.trim(),
+              ...(crux ? { crux } : {}),
+              modality: "mcq",
+              mcq: validMcq,
+            });
+            continue;
+          }
           this.promptCache.set(k, {
             prompt: v.prompt.trim(),
             ...(crux ? { crux } : {}),
@@ -2842,6 +2957,7 @@ Return ONLY valid JSON:
       synthesis: `Modality: MULTI-UNIT SYNTHESIS (clear the primary unit AND the bundled companion unit(s) in ONE compact ~45s task).
 - "prompt": 1-2 crisp sentences posing ONE unified concrete scenario/task that naturally exercises the primary unit AND every bundled unit together without stacking two unrelated sub-questions.
 - "starter": Optionally a compact 2-4 line worked skeleton with 1-3 concise \`___\` holes (placed outside \`$...$\` math spans; no markdown fences) if it cuts boilerplate typing, otherwise null.`,
+      mcq: `Modality: SHARP CONTRAST. Set "starter" to null.`,
     };
 
     const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words), its exact single-claim grading rubric ("expected_crux", max 32 words), and an optional pre-filled editor "starter" matching the requested Modality.
@@ -2984,6 +3100,219 @@ Rules:
       return Promise.race([p, inflight.promise]);
     }
     return p;
+  }
+
+  /**
+   * Generates and blind-verifies a strict server-private 4-choice diagnostic MCQ entry.
+   * Never falls back to raw model output (which could leak the private key); returns null on
+   * any validation, ambiguity, or verifier disagreement so callers serve ordinary open contrast.
+   */
+  async generateMcqEntry(
+    unit: { id: string; text: string; kind: string; topic?: string | null },
+    restsOn: string[],
+    opts: PromptContextOptions = {},
+  ): Promise<PromptCacheEntry | null> {
+    const variant = opts.variant ?? 0;
+    const key = this.promptKey(unit, "recall", restsOn, variant, "mcq", []);
+    const cached = this.promptCache.get(key);
+    if (cached?.modality === "mcq" && cached.mcq) return cached;
+    if (!this.enabled) return null;
+
+    const genSys = `Write ONE sharp diagnostic 4-choice MCQ testing a single boundary condition or distinction for the target unit.
+Strict rules:
+- Frame ONE concrete scenario where all assumptions (dimensions, scalar vs per-coordinate parameters, operations) are stated explicitly so ONLY ONE option is uniquely defensible.
+- Write 4 parallel options ("a","b","c","d") with comparable length, notation, and specificity—never make the correct answer conspicuously longer or more hedged.
+- Three distractors must represent distinct, plausible mistakes. BAN "all of the above", "none of the above", position references ("Option A"), or joke answers.
+- Put math variables/formulas in $...$ with balanced delimiters (double-escape LaTeX backslashes in JSON).
+- Return ONLY valid JSON:
+  {"prompt": string, "expected_crux": string, "choices": [{"id":"a","text":string},{"id":"b","text":string},{"id":"c","text":string},{"id":"d","text":string}], "correct_id": "a"|"b"|"c"|"d", "explanation": string, "why_wrong": { [distractorId]: string }}`;
+
+    const genUser = [
+      `Target unit (${unit.kind}): ${unit.text}`,
+      unit.topic ? `Topic: ${unit.topic}` : null,
+      restsOn.length ? `Rests on: ${restsOn.join("; ")}` : null,
+      opts.priorPrompts?.length
+        ? `Previously asked prompts (use a fresh boundary scenario):\n${opts.priorPrompts.map((x) => `- ${x}`).join("\n")}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const callModel = async (sys: string, usr: string): Promise<string | null> => {
+      const worker = this.promptWorker ?? this.drillWorker;
+      if (worker) {
+        const res = await this.askAgy({
+          fallbackWorker: worker,
+          fallbackWorkerName: "prompt",
+          modelId: this.promptWorker ? this.promptSlug : this.drillSlug,
+          systemPrompt: `${sys}\nAnswer directly with ZERO tool calls.`,
+          userPrompt: usr,
+        });
+        return res.raw.trim() || null;
+      }
+      const res = await this.fetchFn(CHAT_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${this.apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: this.promptModel,
+          reasoning: { effort: "low" },
+          temperature: 0.2,
+          max_tokens: 1800,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: sys },
+            { role: "user", content: usr },
+          ],
+        }),
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+      return data.choices?.[0]?.message?.content?.trim() ?? null;
+    };
+
+    try {
+      const raw = await callModel(genSys, genUser);
+      if (!raw) return null;
+      const parsed = parseJudgeJson<{
+        prompt?: string;
+        expected_crux?: string;
+        choices?: unknown;
+        correct_id?: string;
+        explanation?: string;
+        why_wrong?: Record<string, string>;
+      }>(raw);
+      if (!parsed || typeof parsed.prompt !== "string" || parsed.prompt.trim().length < 12) return null;
+      const promptText = parsed.prompt.trim();
+      const spec = validateMcqSpec(parsed);
+      if (!spec) return null;
+
+      // Blind verifier: solve stem + shuffled choices + source premise WITHOUT knowing proposed correct_id.
+      const shuffled = [...spec.choices];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = randomInt(i + 1);
+        [shuffled[i], shuffled[j]] = [shuffled[j]!, shuffled[i]!];
+      }
+      const verifySys = `You are a strict blind verifier auditing a 4-choice diagnostic MCQ for ambiguity.
+Given the source concept, question stem, and 4 choices, determine whether EXACTLY ONE choice is uniquely defensible under the stated premises.
+Return ONLY valid JSON: {"chosen_id": string | "AMBIGUOUS", "reason": string}`;
+      const verifyUser = [
+        `Source concept: ${unit.text}`,
+        `Question: ${promptText}`,
+        `Choices:\n${shuffled.map((c) => `- [${c.id}] ${c.text}`).join("\n")}`,
+      ].join("\n\n");
+      const vRaw = await callModel(verifySys, verifyUser);
+      if (!vRaw) return null;
+      const vParsed = parseJudgeJson<{ chosen_id?: string; reason?: string }>(vRaw);
+      if (!vParsed || vParsed.chosen_id?.trim() !== spec.correct_id) return null;
+
+      const crux =
+        typeof parsed.expected_crux === "string" && parsed.expected_crux.trim().length >= 4
+          ? parsed.expected_crux.trim()
+          : undefined;
+      const entry: PromptCacheEntry = {
+        prompt: promptText,
+        ...(crux ? { crux } : {}),
+        modality: "mcq",
+        mcq: spec,
+      };
+      this.promptCache.set(key, entry);
+      this.savePromptCache();
+      return entry;
+    } catch (err) {
+      console.error("[judge] generateMcqEntry failed:", err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
+
+  /**
+   * Answers an ungraded clarifying question on an active MCQ without selecting or eliminating any option.
+   * Marks `substantive_help: true` if explanation went beyond neutral notation/setup clarification, and
+   * `revealed_answer: true` only if the reply disclosed the deciding answer.
+   */
+  async clarifyMcq(opts: {
+    prompt: string;
+    choices: { id: string; text: string }[];
+    unitText: string;
+    question: string;
+    turns: { role: "user" | "assistant"; text: string }[];
+  }): Promise<{ message: string; substantive_help: boolean; revealed_answer: boolean }> {
+    if (!this.enabled) {
+      return {
+        message: "Select an option to check your understanding, or choose I'm not sure · Show answer.",
+        substantive_help: false,
+        revealed_answer: false,
+      };
+    }
+    const sys = `You are Myelin's learning partner answering a clarifying question on an active 4-choice MCQ.
+Rules:
+- Answer ONLY setup, notation, or terminology questions in 1-2 crisp sentences.
+- NEVER select, hint at, or eliminate any of the 4 choices!
+- If the learner asks which option is right, direct them to choose "I'm not sure · Show answer" instead of revealing it.
+- Set substantive_help=true ONLY if you had to explain an underlying domain concept (not neutral notation/wording).
+- Set revealed_answer=true ONLY if you accidentally disclosed the deciding answer.
+- Return ONLY valid JSON: {"message": string, "substantive_help": boolean, "revealed_answer": boolean}`;
+    const userMsg = [
+      `Question: ${opts.prompt}`,
+      `Options:\n${opts.choices.map((c, i) => `${i + 1}. ${c.text}`).join("\n")}`,
+      opts.turns.length
+        ? `Prior clarification:\n${opts.turns.map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`).join("\n")}`
+        : null,
+      `Learner question: ${opts.question}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    try {
+      let raw: string | null = null;
+      if (this.drillWorker) {
+        const res = await this.askAgy({
+          fallbackWorker: this.drillWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.drillSlug,
+          systemPrompt: `${sys}\nAnswer directly with ZERO tool calls.`,
+          userPrompt: userMsg,
+        });
+        raw = res.raw.trim() || null;
+      } else {
+        const res = await this.fetchFn(CHAT_URL, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: this.llmModel,
+            temperature: 0.2,
+            max_tokens: 500,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: sys },
+              { role: "user", content: userMsg },
+            ],
+          }),
+        });
+        if (res.ok) {
+          const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+          raw = data.choices?.[0]?.message?.content?.trim() ?? null;
+        }
+      }
+      const parsed = raw
+        ? parseJudgeJson<{ message?: string; substantive_help?: boolean; revealed_answer?: boolean }>(raw)
+        : null;
+      if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
+        return {
+          message: parsed.message.trim(),
+          substantive_help: Boolean(parsed.substantive_help),
+          revealed_answer: Boolean(parsed.revealed_answer),
+        };
+      }
+    } catch (err) {
+      console.error("[judge] clarifyMcq failed:", err instanceof Error ? err.message : err);
+    }
+    return {
+      message: "Choose the option that matches the stated premises, or select I'm not sure · Show answer.",
+      substantive_help: false,
+      revealed_answer: false,
+    };
   }
 
   /** Generates a crisp, self-contained single-beat prompt without giving away the answer (cached per variant). */

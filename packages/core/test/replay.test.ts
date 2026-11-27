@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { applyEvent, canonicalJson, emptyState, fsrsScheduler, parseEvent, replay, ReplayError, type MyelinEvent, type State } from "../src/index.js";
+import { applyEvent, calibration, canonicalJson, emptyState, fsrsScheduler, makeEvent, parseEvent, replay, ReplayError, uuidv7, type MyelinEvent, type State } from "../src/index.js";
 import { buildSession } from "./session.js";
 
 const fixture = (name: string) => fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
@@ -125,5 +125,63 @@ describe("reducers", () => {
     expect(state.preferences.hints!.value).toEqual({ style: "small steps", max: 2 });
     expect(state.goals["g-exam"]!.unit_ids).toEqual(["u-bayes"]);
     expect(state.budget!.seconds).toBe(1800);
+  });
+
+  it("keeps MCQ recognition probes out of production memory, ladders, first_success_at, and calibration", () => {
+    const t0 = 1_790_000_000_000;
+    const uid = uuidv7(t0);
+    const prodId = uuidv7(t0 + 1000);
+    const mcqId = uuidv7(t0 + 20_000_000);
+    const base = replay(
+      [
+        makeEvent(
+          "unit.found",
+          { unit_id: uid, text: "Cov(X,Y)=0 does not imply independence.", kind: "distinction", topic: "Prob", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+          { id: uuidv7(t0), device_id: "server:drill", ts: t0, seq: 1 },
+        ),
+        makeEvent(
+          "unit.probed",
+          { unit_id: uid, depth: "recall", slot: "seam", prompt: "Cov=0?", answer_message_id: null, grade: "again", corrected_grade: null, hints: 0, latency_ms: 8000, scheduler: "fsrs", predicted_recall: 0.6 },
+          { id: prodId, device_id: "server:drill", ts: t0 + 1000, seq: 2 },
+        ),
+      ],
+      s,
+    );
+    const withMcq = replay(
+      [
+        makeEvent(
+          "unit.found",
+          { unit_id: uid, text: "Cov(X,Y)=0 does not imply independence.", kind: "distinction", topic: "Prob", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+          { id: uuidv7(t0), device_id: "server:drill", ts: t0, seq: 1 },
+        ),
+        makeEvent(
+          "unit.probed",
+          { unit_id: uid, depth: "recall", slot: "seam", prompt: "Cov=0?", answer_message_id: null, grade: "again", corrected_grade: null, hints: 0, latency_ms: 8000, scheduler: "fsrs", predicted_recall: 0.6 },
+          { id: prodId, device_id: "server:drill", ts: t0 + 1000, seq: 2 },
+        ),
+        makeEvent(
+          "unit.probed",
+          { unit_id: uid, depth: "recall", slot: "seam", prompt: "Which holds?", answer_message_id: null, grade: "hard", corrected_grade: null, hints: 0, latency_ms: 5000, scheduler: "fsrs", predicted_recall: 0.9, modality: "mcq", mcq_item_id: "item-1", mcq_outcome: "correct", mcq_choice_id: "c1" },
+          { id: mcqId, device_id: "server:drill", ts: t0 + 20_000_000, seq: 3 },
+        ),
+        makeEvent(
+          "unit.probed",
+          { unit_id: uid, corrects: mcqId, grade: "again", note: "Guessed" },
+          { id: uuidv7(t0 + 20_001_000), device_id: "server:drill", ts: t0 + 20_001_000, seq: 4 },
+        ),
+      ],
+      s,
+    );
+    const uBase = base.units[uid]!;
+    const uMcq = withMcq.units[uid]!;
+    expect(uMcq.memory).toEqual(uBase.memory);
+    expect(uMcq.memory_reviews).toBe(uBase.memory_reviews);
+    expect(uMcq.first_success_at).toBe(uBase.first_success_at);
+    expect(uMcq.rebuilt_once).toBe(uBase.rebuilt_once);
+    expect(uMcq.ladders).toEqual(uBase.ladders);
+    expect(uMcq.last_probed_at).toBe(t0 + 20_000_000);
+    expect(withMcq.evidence[mcqId]?.modality).toBe("mcq");
+    expect(withMcq.evidence[mcqId]?.grade).toBe("again");
+    expect(calibration(withMcq)).toEqual(calibration(base));
   });
 });

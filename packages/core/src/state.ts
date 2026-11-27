@@ -81,6 +81,15 @@ export interface Evidence {
   predicted_recall: number | null;
   present: boolean | null;
   note: string | null;
+  modality?: "mcq";
+  mcq_item_id?: string;
+  mcq_outcome?: "correct" | "assisted_correct" | "wrong" | "revealed";
+  mcq_choice_id?: string;
+}
+
+/** True when an evidence record is a recognition-only MCQ probe rather than a production probe. */
+export function isRecognitionProbe(ev: Evidence | undefined | null): boolean {
+  return Boolean(ev && ev.source === "probe" && ev.modality === "mcq");
 }
 
 export interface Goal {
@@ -241,6 +250,9 @@ function learn(u: Unit, ev: Evidence, s: Scheduler): void {
   const grade = ev.grade!;
   const depth = ev.depth!;
   u.last_probed_at = u.last_probed_at === null ? ev.at : Math.max(u.last_probed_at, ev.at);
+  // Recognition-only MCQ probes update exposure recency but never mutate production memory,
+  // review counts, first_success_at, rebuilt_once, or explain/use ladders.
+  if (isRecognitionProbe(ev)) return;
   if (depth === "recall" || depth === "rebuild") {
     u.memory = s.update(u.memory, { grade, at: ev.at });
     u.memory_reviews++;
@@ -379,6 +391,10 @@ const reducers: { [T in EventType]?: Reducer<T> } = {
       predicted_recall: p.predicted_recall,
       present: null,
       note: null,
+      ...(p.modality ? { modality: p.modality } : {}),
+      ...(p.mcq_item_id ? { mcq_item_id: p.mcq_item_id } : {}),
+      ...(p.mcq_outcome ? { mcq_outcome: p.mcq_outcome } : {}),
+      ...(p.mcq_choice_id ? { mcq_choice_id: p.mcq_choice_id } : {}),
     };
     state.evidence[e.id] = ev;
     u.evidence.push(e.id);

@@ -96,7 +96,14 @@ export function calibration(state: State): Calibration {
     let reviews = 0;
     const probes = u.evidence
       .map((id) => state.evidence[id])
-      .filter((ev): ev is Evidence => ev !== undefined && ev.source === "probe" && ev.grade !== null && (ev.depth === "recall" || ev.depth === "rebuild"))
+      .filter(
+        (ev): ev is Evidence =>
+          ev !== undefined &&
+          ev.source === "probe" &&
+          ev.modality !== "mcq" &&
+          ev.grade !== null &&
+          (ev.depth === "recall" || ev.depth === "rebuild"),
+      )
       .sort((a, b) => a.seq - b.seq);
     for (const ev of probes) {
       if (reviews > 0 && ev.slot !== "imported" && ev.predicted_recall !== null) pairs.push({ p: ev.predicted_recall, y: succeeded(ev.grade) ? 1 : 0 });

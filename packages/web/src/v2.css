@@ -3426,3 +3426,243 @@ body,
   }
   .v2-drill-stage { padding: 20px 16px 40px; }
 }
+
+/* ---------- Bounded MCQ option card: select, then Check ---------- */
+.v2-mcq-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.v2-pad.v2-mcq {
+  padding: 6px;
+  gap: 0;
+}
+/* Once settled the card recedes so the verdict beneath it carries the weight. */
+.v2-pad.v2-mcq.is-settled {
+  box-shadow: var(--v2-edge-light);
+}
+.v2-mcq-options {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.v2-mcq-option {
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-height: 48px;
+  padding: 0 12px 0 11px;
+  border-radius: 10px;
+  color: var(--v2-ink-1);
+  cursor: pointer;
+  outline: 0;
+  box-shadow: inset 0 0 0 1px transparent;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 140ms ease, box-shadow 140ms ease, color 140ms ease;
+}
+@media (hover: hover) {
+  .v2-mcq-option:not([aria-disabled="true"]):hover {
+    background: var(--v2-quiet-fill);
+  }
+}
+.v2-mcq-option.is-selected {
+  background: var(--v2-quiet-fill);
+  box-shadow: inset 0 0 0 1px var(--v2-border-strong);
+}
+.v2-mcq-option[aria-disabled="true"] {
+  cursor: default;
+}
+.v2-mcq-option:focus-visible,
+.v2-mcq-reveal:focus-visible,
+.v2-mcq-foot .v2-btn-primary:focus-visible {
+  outline: 2px solid var(--v2-accent);
+  outline-offset: -2px;
+}
+.v2-mcq-foot .v2-btn-primary:focus-visible {
+  outline-offset: 2px;
+}
+/* Index keycap on fine pointers; it becomes a plain radio ring on touch (see below). */
+.v2-mcq-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 14px;
+  border-radius: 6px;
+  font: 500 11px/1 var(--v2-font-sans);
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-3);
+  background: color-mix(in srgb, var(--v2-fg) 7%, transparent);
+  box-shadow: inset 0 -0.5px 0 color-mix(in srgb, var(--v2-fg) 16%, transparent);
+  user-select: none;
+  transition: background-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
+}
+.v2-mcq-option.is-selected .v2-mcq-mark {
+  background: var(--v2-ink-1);
+  color: var(--v2-bg);
+  box-shadow: none;
+}
+.v2-mcq-text {
+  flex: 1;
+  min-width: 0;
+  padding: 11px 4px;
+  font: var(--v2-type-body);
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
+  /* A wide formula scrolls inside its own row instead of pushing the card sideways. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+.v2-mcq-badge {
+  flex: none;
+  margin-top: 16px;
+  font: var(--v2-type-meta);
+  letter-spacing: var(--v2-track-meta);
+  color: var(--v2-ink-3);
+  white-space: nowrap;
+  user-select: none;
+}
+
+/* Settled: the answer is marked by a label and a check, the learner's miss by a label and a quiet outline. */
+.v2-mcq-option.is-locked:not(.is-correct):not(.is-selected),
+.v2-mcq-option.is-locked:not(.is-correct):not(.is-selected) .katex {
+  color: var(--v2-ink-3);
+}
+.v2-mcq-option.is-correct {
+  background: var(--v2-success-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--v2-success) 42%, var(--v2-border));
+}
+.v2-mcq-option.is-correct .v2-mcq-mark {
+  background: transparent;
+  box-shadow: none;
+  color: var(--v2-success);
+}
+.v2-mcq-option.is-correct .v2-mcq-badge {
+  color: var(--v2-success);
+}
+
+.v2-pad-foot.v2-mcq-foot {
+  margin: 6px 0 0;
+  padding: 8px 4px 2px 6px;
+  border-top: 0.5px solid var(--v2-hairline-soft);
+}
+.v2-mcq-reveal {
+  appearance: none;
+  box-sizing: border-box;
+  height: 28px;
+  margin-left: -3px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: color-mix(in srgb, var(--v2-fg) 66%, var(--v2-muted));
+  font: var(--v2-type-label);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 140ms ease, color 140ms ease, transform 120ms ease;
+}
+.v2-mcq-reveal:hover:not(:disabled) {
+  background: var(--v2-quiet-fill);
+  color: var(--v2-fg);
+}
+.v2-mcq-reveal:not(:disabled):active {
+  transform: scale(0.97);
+}
+.v2-mcq-reveal:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.v2-mcq-error {
+  padding: 10px 8px 0 12px;
+}
+
+.v2-mcq-verdict {
+  outline: 0;
+  scroll-margin-bottom: 24px;
+}
+.v2-mcq-verdict:not(.is-pass) {
+  animation: v2-in 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.v2-mcq-verdict-title {
+  margin: 0;
+  font: var(--v2-type-label);
+  color: var(--v2-ink-2);
+}
+.v2-mcq-verdict.is-pass .v2-mcq-verdict-title {
+  color: var(--v2-success);
+}
+.v2-mcq-verdict .v2-verdict-body {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.v2-mcq-clarify {
+  padding: 0 4px;
+}
+
+@media (pointer: coarse) {
+  .v2-mcq-option {
+    min-height: 52px;
+    gap: 10px;
+    padding-left: 12px;
+  }
+  .v2-mcq-text {
+    padding-block: 13px;
+  }
+  .v2-mcq-badge {
+    margin-top: 18px;
+  }
+  /* No keyboard, so no keycap: the mark is a radio ring that fills when chosen. */
+  .v2-mcq-num {
+    display: none;
+  }
+  .v2-mcq-mark,
+  .v2-mcq-option.is-selected .v2-mcq-mark {
+    margin-top: 16px;
+    border-radius: 999px;
+    background: transparent;
+    box-shadow: inset 0 0 0 1.5px var(--v2-border-strong);
+  }
+  .v2-mcq-option.is-selected .v2-mcq-mark {
+    box-shadow: inset 0 0 0 1.5px var(--v2-ink-1);
+  }
+  .v2-mcq-mark::after {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--v2-ink-1);
+    transform: scale(0);
+    transition: transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+  .v2-mcq-option.is-selected .v2-mcq-mark::after {
+    transform: scale(1);
+  }
+  .v2-mcq-option.is-correct .v2-mcq-mark {
+    box-shadow: none;
+  }
+  .v2-mcq-option.is-correct .v2-mcq-mark::after {
+    content: none;
+  }
+  .v2-mcq-reveal,
+  .v2-mcq-foot .v2-pad-actions .v2-btn-primary {
+    height: 44px;
+  }
+  .v2-mcq-reveal {
+    padding: 0 12px;
+    margin-left: -6px;
+  }
+  .v2-mcq-foot .v2-pad-actions .v2-btn-primary {
+    padding: 0 20px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .v2-mcq-option,
+  .v2-mcq-mark,
+  .v2-mcq-mark::after {
+    transition: none;
+  }
+}

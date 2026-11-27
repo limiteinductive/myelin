@@ -18,11 +18,28 @@ export interface QueueUnit {
   due: boolean;
 }
 
+export interface McqChoice {
+  id: string;
+  text: string;
+}
+
+export type McqOutcome = "correct" | "assisted_correct" | "wrong" | "revealed";
+
+export interface McqResult {
+  outcome: McqOutcome;
+  selected_choice_id: string | null;
+  correct_id: string;
+  explanation: string;
+  why_wrong_selected: string | null;
+}
+
 export interface ActiveAttempt {
   attempt_id: string;
   unit_id: string;
   depth: Depth;
   prompt: string;
+  modality?: RepModality;
+  mcq?: { choices: McqChoice[] };
   turns: { user: string; coach: string; failed?: boolean; annotations?: InlineAnnotation[]; added?: AddedUnit[] }[];
   assistance_count: number;
   active_ms: number | null;
@@ -73,7 +90,7 @@ export interface ExploreResponse {
   failed?: boolean;
 }
 
-export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis";
+export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis" | "mcq";
 
 export interface DrillRep {
   unit_id: string;
@@ -83,6 +100,8 @@ export interface DrillRep {
   depth: Depth;
   prompt: string;
   modality?: RepModality;
+  attempt_id?: string;
+  mcq?: { choices: McqChoice[] };
   starter?: string | null;
   bundled_unit_ids?: string[];
   rests_on: string[];
@@ -121,6 +140,7 @@ export interface CheckDrillResponse {
   schedule_kind?: ScheduleKind;
   next_depth?: Depth;
   scheduler: string;
+  mcq_result?: McqResult;
   jev?: {
     model: string;
     latency_ms: number;
@@ -389,12 +409,46 @@ export function deleteExploration(id: string): Promise<{ ok: boolean; id: string
   });
 }
 
-export function fetchNextDrill(opts: { unitId?: string | null; exclude?: string | null } = {}, signal?: AbortSignal): Promise<NextDrillResponse> {
+export function fetchNextDrill(
+  opts: {
+    unitId?: string | null;
+    exclude?: string | null;
+    sittingId?: string | null;
+    sittingSize?: number | null;
+    directDone?: number | null;
+    manual?: boolean;
+    retry?: boolean;
+  } = {},
+  signal?: AbortSignal,
+): Promise<NextDrillResponse> {
   const qs = new URLSearchParams();
   if (opts.unitId) qs.set("unit_id", opts.unitId);
   if (opts.exclude) qs.set("exclude", opts.exclude);
+  if (opts.sittingId) qs.set("sitting_id", opts.sittingId);
+  if (typeof opts.sittingSize === "number" && opts.sittingSize > 0) qs.set("sitting_size", String(opts.sittingSize));
+  if (typeof opts.directDone === "number" && opts.directDone >= 0) qs.set("direct_done", String(opts.directDone));
+  if (opts.manual) qs.set("manual", "1");
+  if (opts.retry) qs.set("retry", "1");
   const q = qs.toString();
   return req<NextDrillResponse>(`/api/drill/next${q ? `?${q}` : ""}`, signal ? { signal } : undefined);
+}
+
+export function submitMcqChoice(
+  payload: {
+    attempt_id: string;
+    unit_id: string;
+    choice_id?: string;
+    reveal?: boolean;
+    latency_ms: number | null;
+  },
+  signal?: AbortSignal,
+): Promise<CheckDrillResponse> {
+  return req<CheckDrillResponse>("/api/drill/check", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
 }
 
 export function checkDrill(

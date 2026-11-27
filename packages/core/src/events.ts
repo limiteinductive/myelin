@@ -64,6 +64,9 @@ const Timing = z.object({
   sent_at: Ms.nullable().default(null),
 });
 
+export const McqOutcome = z.enum(["correct", "assisted_correct", "wrong", "revealed"]);
+export type McqOutcome = z.infer<typeof McqOutcome>;
+
 const ProbeRecord = z.object({
   unit_id: Id,
   depth: Depth,
@@ -79,6 +82,11 @@ const ProbeRecord = z.object({
   latency_ms: Ms.nullable().default(null),
   scheduler: z.string(),
   predicted_recall: z.number().min(0).max(1).nullable().default(null),
+  /** Optional recognition discriminator: MCQ probes stay separate from production mastery folds. */
+  modality: z.literal("mcq").optional(),
+  mcq_item_id: z.string().optional(),
+  mcq_outcome: McqOutcome.optional(),
+  mcq_choice_id: z.string().optional(),
 });
 
 /** A later correction ("that was lucky") is a new unit.probed event that names the probe it corrects. */

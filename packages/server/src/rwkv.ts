@@ -660,9 +660,10 @@ export class RwkvInstantEngine {
     const noteKeyOf = (u: Unit | undefined, fallbackId: string) => (u?.rests_on.length ? `root:${u.rests_on[0]}` : `note:${fallbackId}`);
     const deckKeyOf = (u: Unit | undefined) => `deck:${u?.topic ?? "general"}`;
 
-    // All graded probes in chronological order across the user's whole collection.
+    // All graded production probes in chronological order across the user's whole collection
+    // (recognition-only MCQ probes stay strictly out of the RWKV memory recurrence).
     const probes = Object.values(state.evidence)
-      .filter((ev) => ev.source === "probe" && ev.grade !== null)
+      .filter((ev) => ev.source === "probe" && ev.modality !== "mcq" && ev.grade !== null)
       .sort((a, b) => a.at - b.at || a.seq - b.seq);
 
     const firstReviewDay = probes.length > 0 ? Math.floor(probes[0]!.at / DAY_MS) : Math.floor(now / DAY_MS);
@@ -868,7 +869,8 @@ export function unitExposureStats(state: State, unitId: string, depth?: Depth, n
     if (!ev) continue;
     if (ev.at > (lastExposureAt ?? 0)) lastExposureAt = ev.at;
     if (depth && ev.depth === depth) depthExposures++;
-    if (ev.grade !== "again") {
+    // Recognition-only MCQ passes never increment production pass counters (nor satisfy delayed transfer).
+    if (ev.grade !== "again" && ev.modality !== "mcq") {
       passes++;
       if (depth && ev.depth === depth) depthPasses++;
     }
@@ -896,8 +898,65 @@ const FIRST_RELEARN_MS = 20 * 60 * 1000;
 const MAX_LAPSE_RELEARN_MS = 45 * 60 * 1000;
 const SAME_DAY_RELEARN_WINDOW_MS = 12 * 60 * 60 * 1000;
 const REPEAT_LAPSE_GUARD_MS = 2 * 60 * 60 * 1000;
+/** Pending production check delays anchored to a terminal recognition-only MCQ event. */
+export const MCQ_CLEAN_DELAY_MS = 4 * 60 * 60 * 1000;
+export const MCQ_SHORT_DELAY_MS = 20 * 60 * 1000;
+export const MCQ_ELIGIBILITY_GAP_MS = 4 * 60 * 60 * 1000;
+export const MCQ_RETRY_OVERNIGHT_CAP_MS = 14 * 60 * 60 * 1000;
 
-export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis";
+export type RepModality = "direct" | "fix_bug" | "faded_skeleton" | "contrast" | "synthesis" | "mcq";
+
+/** True when unit `u` has a pending production check after an MCQ probe (no newer direct production probe yet). */
+export function hasPendingMcqProductionCheck(u: Unit, state: State): boolean {
+  let lastProdAt = -1;
+  let lastMcqAt = -1;
+  for (const id of u.evidence) {
+    const ev = state.evidence[id];
+    if (!ev || ev.source !== "probe" || ev.grade === null) continue;
+    if (ev.modality === "mcq") {
+      if (ev.at >= lastMcqAt) lastMcqAt = ev.at;
+    } else if (ev.slot !== "in_context") {
+      if (ev.at >= lastProdAt) lastProdAt = ev.at;
+    }
+  }
+  return lastMcqAt > lastProdAt;
+}
+
+/**
+ * Narrow v1 diagnostic MCQ eligibility:
+ * - Active, non-observe-only `definition` or `distinction`
+ * - `depth === "recall"` and base `modality === "contrast"`
+ * - Exactly 1 direct terminal production probe at `recall` with effective grade `again`,
+ *   0 successful production probes, 0 prior MCQ probes, and >=4h since that failed probe.
+ */
+export function isMcqEligible(
+  u: Unit,
+  state: State,
+  depth: Depth,
+  baseModality: RepModality,
+  now = Date.now(),
+): boolean {
+  if (u.status !== "active" || u.observe_only) return false;
+  const kind = u.kind.trim().toLowerCase();
+  if (kind !== "definition" && kind !== "distinction") return false;
+  if (depth !== "recall" || baseModality !== "contrast") return false;
+
+  const probes = u.evidence
+    .map((id) => state.evidence[id])
+    .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null));
+
+  if (probes.some((ev) => ev.modality === "mcq")) return false;
+  if (probes.some((ev) => ev.grade !== "again")) return false;
+
+  const directTerminal = probes.filter(
+    (ev) => ev.modality !== "mcq" && ev.slot !== "imported" && ev.slot !== "in_context",
+  );
+  if (directTerminal.length !== 1) return false;
+  const only = directTerminal[0]!;
+  if (only.depth !== "recall" || only.grade !== "again") return false;
+  if (now - only.at < MCQ_ELIGIBILITY_GAP_MS) return false;
+  return true;
+}
 
 export interface UnitDueOverride {
   due_at: number;
@@ -964,7 +1023,7 @@ export function computeCalibratedIntervals(
     if (ancestors.size === 0) continue;
     for (const evId of child.evidence) {
       const ev = state.evidence[evId];
-      if (!ev || ev.source !== "probe" || ev.grade === null || ev.grade === "again" || ev.hints > 0) continue;
+      if (!ev || ev.source !== "probe" || ev.modality === "mcq" || ev.grade === null || ev.grade === "again" || ev.hints > 0) continue;
       for (const ancId of ancestors) {
         const anc = state.units[ancId];
         if (!anc || ev.at < anc.found_at) continue;
@@ -980,14 +1039,25 @@ export function computeCalibratedIntervals(
 
   for (const u of Object.values(state.units)) {
     if (u.status === "split" || u.status === "merged" || u.observe_only) continue;
-    const directProbes = u.evidence
+    const allUnitProbes = u.evidence
       .map((id) => state.evidence[id])
       .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null))
+      .sort((a, b) => a.at - b.at || a.seq - b.seq);
+
+    const directProbes = allUnitProbes
+      .filter((ev) => ev.modality !== "mcq")
       .map((ev) => ({ at: ev.at, seq: ev.seq, grade: ev.grade!, hints: ev.hints, implicit: false }));
 
+    const mcqProbes = allUnitProbes.filter((ev) => ev.modality === "mcq");
+    const latestMcq = mcqProbes.at(-1) ?? null;
+    const lastDirectProdAt = directProbes.at(-1)?.at ?? -1;
+    const pendingMcq = latestMcq && latestMcq.at > lastDirectProdAt ? latestMcq : null;
+
+    // Implicit DAG credit must never clear or postpone a pending post-MCQ production check.
     const implicitRaw = (downwardCredits.get(u.id) ?? []).sort((a, b) => a.at - b.at || a.seq - b.seq);
     const merged: { at: number; seq: number; grade: Grade; hints: number; implicit: boolean }[] = [...directProbes];
     for (const imp of implicitRaw) {
+      if (pendingMcq && imp.at >= pendingMcq.at) continue;
       // Avoid double-counting an implicit credit within 4h of an existing direct or implicit event.
       const nearExisting = merged.some((e) => Math.abs(e.at - imp.at) < IMPLICIT_CREDIT_DEDUP_MS);
       if (!nearExisting) {
@@ -997,13 +1067,35 @@ export function computeCalibratedIntervals(
     merged.sort((a, b) => a.at - b.at || a.seq - b.seq);
 
     if (merged.length === 0) {
-      out.set(u.id, {
-        next_in_ms: 0,
-        fsrs_recall: 0,
-        reviews: 0,
-        scheduled_interval_ms: null,
-        schedule_kind: "first",
-      });
+      if (pendingMcq) {
+        const override = dueOverrides?.get(u.id);
+        const mcqClean =
+          pendingMcq.grade !== "again" && pendingMcq.mcq_outcome !== "assisted_correct";
+        const delayMs = mcqClean ? MCQ_CLEAN_DELAY_MS : MCQ_SHORT_DELAY_MS;
+        const effectiveDue =
+          override && override.created_at >= pendingMcq.at ? override.due_at : pendingMcq.at + delayMs;
+        const eventAt = override && override.created_at >= pendingMcq.at ? override.created_at : pendingMcq.at;
+        out.set(u.id, {
+          next_in_ms: Math.max(0, effectiveDue - now),
+          fsrs_recall: 0,
+          reviews: 0,
+          scheduled_interval_ms: Math.max(0, effectiveDue - eventAt),
+          schedule_kind:
+            override && override.created_at >= pendingMcq.at
+              ? "override"
+              : pendingMcq.grade === "again"
+                ? "lapse"
+                : "relearn",
+        });
+      } else {
+        out.set(u.id, {
+          next_in_ms: 0,
+          fsrs_recall: 0,
+          reviews: 0,
+          scheduled_interval_ms: null,
+          schedule_kind: "first",
+        });
+      }
       continue;
     }
 
@@ -1047,13 +1139,22 @@ export function computeCalibratedIntervals(
     const rawDue = typeof mem.due === "number" ? mem.due : lastAt + 12 * 3600_000;
     const stabilityDays = typeof mem.stability === "number" && Number.isFinite(mem.stability) && mem.stability > 0 ? mem.stability : 0.25;
     const override = dueOverrides?.get(u.id);
+    const latestAnchorAt = pendingMcq ? Math.max(lastAt, pendingMcq.at) : lastAt;
     let effectiveDue: number;
     let scheduleKind: ScheduleKind;
     let schedulingEventAt = lastAt;
-    if (override && override.created_at >= lastAt) {
+    if (override && override.created_at >= latestAnchorAt) {
       effectiveDue = override.due_at;
       scheduleKind = "override";
       schedulingEventAt = override.created_at;
+    } else if (pendingMcq) {
+      // Pending production check anchored to the committed recognition event (never alters stability/reviews).
+      const mcqClean =
+        pendingMcq.grade !== "again" && pendingMcq.mcq_outcome !== "assisted_correct";
+      const delayMs = mcqClean ? MCQ_CLEAN_DELAY_MS : MCQ_SHORT_DELAY_MS;
+      effectiveDue = pendingMcq.at + delayMs;
+      scheduleKind = pendingMcq.grade === "again" ? "lapse" : "relearn";
+      schedulingEventAt = pendingMcq.at;
     } else if (lastGrade === "again") {
       const relearnDelay =
         priorPasses === 0
@@ -1068,6 +1169,16 @@ export function computeCalibratedIntervals(
     } else {
       effectiveDue = Math.max(rawDue, lastAt + 12 * 3600_000);
       scheduleKind = "normal";
+    }
+
+    // If a direct production pass immediately reconstructed an MCQ miss/reveal within 12h,
+    // cap its automatic overnight interval at 14h (overnight hard relearn cap).
+    if (!pendingMcq && scheduleKind !== "override" && lastGrade !== "again" && latestMcq && latestMcq.grade === "again") {
+      const sinceMcqMiss = lastAt - latestMcq.at;
+      if (sinceMcqMiss >= 0 && sinceMcqMiss < SAME_DAY_RELEARN_WINDOW_MS) {
+        effectiveDue = Math.min(effectiveDue, lastAt + MCQ_RETRY_OVERNIGHT_CAP_MS);
+        scheduleKind = "relearn";
+      }
     }
 
     const scheduledIntervalMs = Math.max(0, effectiveDue - schedulingEventAt);
@@ -1125,6 +1236,7 @@ export function pickSynthesisCluster(
   for (const other of Object.values(state.units)) {
     if (other.id === primary.id || other.status !== "active" || other.observe_only) continue;
     if (!dueIds.has(other.id)) continue;
+    if (hasPendingMcqProductionCheck(other, state)) continue;
 
     const isDirectNeighbor = prereqSet.has(other.id) || other.rests_on.includes(primary.id);
     const otherTopic = other.topic?.trim().toLowerCase() || null;
@@ -1175,7 +1287,7 @@ export function pickRepModality(
   const probes = state
     ? u.evidence
         .map((id) => state.evidence[id])
-        .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.grade !== null))
+        .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.modality !== "mcq" && ev.grade !== null))
         .sort((a, b) => a.at - b.at || a.seq - b.seq)
     : [];
   const passes = probes.filter((ev) => ev.grade !== "again").length;
@@ -1202,7 +1314,14 @@ export function pickDrillDepth(u: Unit, state?: State): Depth {
   }
   const probes = u.evidence
     .map((id) => state.evidence[id])
-    .filter((ev) => ev !== undefined && ev.source === "probe" && ev.grade !== null && ev.grade !== "again");
+    .filter(
+      (ev) =>
+        ev !== undefined &&
+        ev.source === "probe" &&
+        ev.modality !== "mcq" &&
+        ev.grade !== null &&
+        ev.grade !== "again",
+    );
 
   const passes = probes.length;
   const explainedOnce = probes.some((ev) => ev!.depth === "explain");

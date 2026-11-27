@@ -40,6 +40,25 @@ export interface StoredAttemptTurn {
   added?: { unit_id: string; text: string; kind: string; observe_only: boolean }[];
 }
 
+export interface StoredMcqChoice {
+  id: string;
+  source_id: string;
+  text: string;
+}
+
+export interface StoredMcqAttempt {
+  item_id: string;
+  version: number;
+  choices: StoredMcqChoice[];
+  correct_id: string;
+  explanation: string;
+  why_wrong: Record<string, string>;
+  sitting_id?: string | null;
+  assisted?: boolean;
+  selected_choice_id?: string | null;
+  outcome?: "correct" | "assisted_correct" | "wrong" | "revealed" | null;
+}
+
 export interface DrillAttemptRecord {
   attempt_id: string;
   unit_id: string;
@@ -53,6 +72,7 @@ export interface DrillAttemptRecord {
   probe_id: string | null;
   grade: string | null;
   result: Record<string, unknown> | null;
+  mcq?: StoredMcqAttempt | null;
   created_at: number;
   updated_at: number;
 }
@@ -214,10 +234,21 @@ export class EventStore {
         due_at INTEGER NOT NULL,
         created_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS mcq_issuances (
+        sitting_id TEXT PRIMARY KEY,
+        unit_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS mcq_issuances_unit_idx ON mcq_issuances(unit_id);
     `);
     const expCols = this.db.prepare("PRAGMA table_info(explorations)").all() as unknown as { name?: string }[];
     if (!expCols.some((c) => c.name === "archived")) {
       this.db.exec("ALTER TABLE explorations ADD COLUMN archived INTEGER NOT NULL DEFAULT 0");
+    }
+    const attemptCols = this.db.prepare("PRAGMA table_info(drill_attempts)").all() as unknown as { name?: string }[];
+    if (!attemptCols.some((c) => c.name === "mcq_json")) {
+      this.db.exec("ALTER TABLE drill_attempts ADD COLUMN mcq_json TEXT");
     }
     this.state = emptyState(scheduler);
     this.catchUp();
@@ -335,6 +366,7 @@ export class EventStore {
       probe_id: typeof r.probe_id === "string" ? r.probe_id : null,
       grade: typeof r.grade === "string" ? r.grade : null,
       result: typeof r.result_json === "string" && r.result_json ? (JSON.parse(r.result_json) as Record<string, unknown>) : null,
+      mcq: typeof r.mcq_json === "string" && r.mcq_json ? (JSON.parse(r.mcq_json) as StoredMcqAttempt) : null,
       created_at: Number(r.created_at ?? 0),
       updated_at: Number(r.updated_at ?? 0),
     };
@@ -365,8 +397,8 @@ export class EventStore {
     this.db
       .prepare(
         `INSERT INTO drill_attempts
-          (attempt_id, unit_id, depth, prompt, first_attempt, turns_json, status, assistance_count, active_ms, probe_id, grade, result_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (attempt_id, unit_id, depth, prompt, first_attempt, turns_json, status, assistance_count, active_ms, probe_id, grade, result_json, mcq_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(attempt_id) DO UPDATE SET
           turns_json = excluded.turns_json,
           status = excluded.status,
@@ -375,6 +407,7 @@ export class EventStore {
           probe_id = COALESCE(excluded.probe_id, drill_attempts.probe_id),
           grade = COALESCE(excluded.grade, drill_attempts.grade),
           result_json = COALESCE(excluded.result_json, drill_attempts.result_json),
+          mcq_json = COALESCE(excluded.mcq_json, drill_attempts.mcq_json),
           updated_at = excluded.updated_at`,
       )
       .run(
@@ -390,9 +423,38 @@ export class EventStore {
         rec.probe_id,
         rec.grade,
         rec.result ? JSON.stringify(rec.result) : null,
+        rec.mcq ? JSON.stringify(rec.mcq) : null,
         rec.created_at,
         rec.updated_at,
       );
+  }
+
+  /** Returns the MCQ issued for a given sitting (if any), enforcing at most 1 per sitting. */
+  getMcqIssuance(sittingId: string): { sitting_id: string; unit_id: string; attempt_id: string; created_at: number } | null {
+    const r = this.db
+      .prepare("SELECT sitting_id, unit_id, attempt_id, created_at FROM mcq_issuances WHERE sitting_id = ?")
+      .get(sittingId) as Record<string, unknown> | undefined;
+    if (!r) return null;
+    return {
+      sitting_id: String(r.sitting_id),
+      unit_id: String(r.unit_id),
+      attempt_id: String(r.attempt_id),
+      created_at: Number(r.created_at ?? 0),
+    };
+  }
+
+  /** True if this unit has ever been issued an MCQ (v1: at most one MCQ presentation per unit). */
+  hasUnitMcqIssuance(unitId: string): boolean {
+    const r = this.db.prepare("SELECT 1 FROM mcq_issuances WHERE unit_id = ? LIMIT 1").get(unitId);
+    return Boolean(r);
+  }
+
+  /** Atomically reserves the single MCQ slot for a sitting; returns true iff reserved by this call. */
+  reserveMcqIssuance(sittingId: string, unitId: string, attemptId: string, now = Date.now()): boolean {
+    const res = this.db
+      .prepare("INSERT OR IGNORE INTO mcq_issuances (sitting_id, unit_id, attempt_id, created_at) VALUES (?, ?, ?, ?)")
+      .run(sittingId, unitId, attemptId, now);
+    return Number(res.changes ?? 0) > 0;
   }
 
   abandonActiveAttempts(unitId: string, exceptAttemptId?: string, now = Date.now()): void {

@@ -12,6 +12,7 @@ import {
   snapshot,
   type Store,
 } from "solid-js";
+import { uuidv7 } from "@myelin/core";
 import type { InlineAnnotation } from "./annotate.js";
 import type { Citation } from "./cite.js";
 import {
@@ -59,6 +60,8 @@ export interface UnitSession {
   citations: Citation[];
   passedVerdict: CheckDrillResponse | null;
   overridden: boolean;
+  /** Selected (unsubmitted) MCQ option ID, preserved across brief navigation/reload. */
+  mcqSelectedChoiceId?: string | null;
 }
 
 export interface ExploreSession {
@@ -106,6 +109,8 @@ export interface PracticeState {
   sessions: Record<string, UnitSession>;
   explore: ExploreSession;
   removedUnits: Record<string, true>;
+  /** Stable UUIDv7 for the current committed sitting (null for legacy pre-MCQ sittings). */
+  sittingId: string | null;
   /** Fixed ordered slot IDs locked when the current sitting started (positions never shift). */
   sittingIds: string[];
   /** Active work queue order for the current sitting (retries move to the tail here). */
@@ -114,6 +119,10 @@ export interface PracticeState {
   sittingOutcomes: Record<string, SittingSlotOutcome>;
   /** Distinct committed sitting IDs directly attempted by the learner (retries count once). */
   sittingPracticedIds: Record<string, true>;
+  /** Count of direct production completions finished in this sitting (gates MCQ position and tail-retry spacing). */
+  sittingDirectCompletions: number;
+  /** Minimum sittingDirectCompletions required before presenting an MCQ miss/reveal tail retry. */
+  sittingRetryMinCompletions: Record<string, number>;
   /** Committed sitting IDs resolved indirectly via synthesis/prerequisite rescheduling. */
   sittingRescheduledIds: Record<string, true>;
   /** Units missed directly then reconstructed cleanly on that sitting's tail retry. */
@@ -124,6 +133,8 @@ export interface PracticeState {
   sittingRetriedIds: Record<string, true>;
   /** Units currently queued at the tail of this sitting for their 1 bounded cold retry. */
   sittingRetryIds: Record<string, true>;
+  /** Unit explicitly opened via "Practice again" (manual practice never issues MCQ). */
+  manualPracticeUnitId: string | null;
   /** Global due count across all eligible units reported by GET /api/drill/queue. */
   serverTotalDue: number | null;
   /** Global earliest future due time, non-null ONLY when serverTotalDue === 0. */
@@ -150,6 +161,7 @@ export function emptyUnitSession(rep: DrillRep | null = null, scheduler = "rwkv"
     citations: [],
     passedVerdict: null,
     overridden: false,
+    mcqSelectedChoiceId: null,
   };
 }
 
@@ -171,7 +183,8 @@ export function sessionHasWork(s: UnitSession | undefined): boolean {
     s.postBeats.length > 0 ||
     s.draft.trim().length > 0 ||
     s.citations.length > 0 ||
-    Boolean(s.passedVerdict)
+    Boolean(s.passedVerdict) ||
+    Boolean(s.rep?.modality === "mcq" && s.attemptId)
   );
 }
 
@@ -187,10 +200,13 @@ interface PersistedPractice {
   sessions: Record<string, UnitSession>;
   explore: ExploreSession;
   removedUnits: string[];
+  sittingId?: string | null;
   sittingIds?: string[];
   sittingOrder?: string[];
   sittingOutcomes?: Record<string, SittingSlotOutcome>;
   sittingPracticedIds?: string[];
+  sittingDirectCompletions?: number;
+  sittingRetryMinCompletions?: Record<string, number>;
   sittingRescheduledIds?: string[];
   sittingReconstructed?: ReconstructedItem[];
   sittingCompletedIds?: string[];
@@ -237,6 +253,7 @@ function normalizeSession(s: Partial<UnitSession> | null | undefined): UnitSessi
     citations: Array.isArray(s.citations) ? s.citations : [],
     passedVerdict: s.passedVerdict ?? null,
     overridden: Boolean(s.overridden),
+    mcqSelectedChoiceId: typeof s.mcqSelectedChoiceId === "string" && s.mcqSelectedChoiceId ? s.mcqSelectedChoiceId : null,
   };
 }
 
@@ -402,6 +419,18 @@ function hydratePractice(userId: string): Partial<PersistedPractice> | null {
 
     const savedSittingIds = cleanIdList(parsed?.sittingIds);
     const savedSittingOrder = cleanIdList(parsed?.sittingOrder);
+    const savedSittingId =
+      typeof parsed?.sittingId === "string" && parsed.sittingId.trim() ? parsed.sittingId.trim() : null;
+    const savedDirectCompletions =
+      typeof parsed?.sittingDirectCompletions === "number" && Number.isFinite(parsed.sittingDirectCompletions)
+        ? Math.max(0, Math.floor(parsed.sittingDirectCompletions))
+        : 0;
+    const cleanRetryMin: Record<string, number> = {};
+    if (parsed?.sittingRetryMinCompletions && typeof parsed.sittingRetryMinCompletions === "object") {
+      for (const [id, val] of Object.entries(parsed.sittingRetryMinCompletions)) {
+        if (typeof val === "number" && Number.isFinite(val) && val > 0) cleanRetryMin[id] = Math.floor(val);
+      }
+    }
 
     return {
       version: 2,
@@ -411,10 +440,13 @@ function hydratePractice(userId: string): Partial<PersistedPractice> | null {
       sessions,
       explore,
       removedUnits: [...removedSet],
+      sittingId: savedSittingId,
       sittingIds: savedSittingIds,
       sittingOrder: savedSittingOrder.length > 0 ? savedSittingOrder : savedSittingIds,
       sittingOutcomes: cleanOutcomes,
       sittingPracticedIds: cleanIdList(parsed?.sittingPracticedIds),
+      sittingDirectCompletions: savedDirectCompletions,
+      sittingRetryMinCompletions: cleanRetryMin,
       sittingRescheduledIds: cleanIdList(parsed?.sittingRescheduledIds),
       sittingReconstructed: cleanReconstructed,
       sittingCompletedIds: cleanIdList(parsed?.sittingCompletedIds),
@@ -436,6 +468,7 @@ export interface PracticeStore {
   readonly sittingSlots: () => SittingSlot[];
   readonly sittingFinished: () => boolean;
   readonly sittingPracticedCount: () => number;
+  readonly sittingDirectDoneCount: () => number;
   readonly sittingRescheduledCount: () => number;
   readonly sittingReconstructed: () => ReconstructedItem[];
   readonly soonestNextMs: () => number | null;
@@ -444,6 +477,8 @@ export interface PracticeStore {
   readonly stageKey: () => string;
   readonly reloadNonce: () => number;
 
+  isManualPractice(unitId: string): boolean;
+  isRetryUnit(unitId: string): boolean;
   sidebarLabel(u: QueueUnit): string;
   rememberPrompt(unitId: string, prompt: string): void;
   setMapOpen(open: boolean | ((prev: boolean) => boolean)): void;
@@ -510,15 +545,19 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     sessions: saved?.sessions ?? {},
     explore: saved?.explore ?? emptyExploreSession(),
     removedUnits: initialRemoved,
+    sittingId: saved?.sittingId ?? null,
     sittingIds: saved?.sittingIds ?? [],
     sittingOrder: saved?.sittingOrder ?? saved?.sittingIds ?? [],
     sittingOutcomes: saved?.sittingOutcomes ?? {},
     sittingPracticedIds: initialPracticed,
+    sittingDirectCompletions: saved?.sittingDirectCompletions ?? 0,
+    sittingRetryMinCompletions: saved?.sittingRetryMinCompletions ?? {},
     sittingRescheduledIds: initialRescheduled,
     sittingReconstructed: saved?.sittingReconstructed ?? [],
     sittingCompletedIds: initialCompleted,
     sittingRetriedIds: initialRetried,
     sittingRetryIds: initialRetry,
+    manualPracticeUnitId: null,
     serverTotalDue: null,
     serverEarliestNextMs: null,
     stage: saved?.stage ?? { kind: "explore" },
@@ -623,6 +662,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     if (direct > 0 || Object.keys(state.sittingRescheduledIds).length > 0) return direct;
     return Object.keys(state.sittingCompletedIds).length;
   });
+  const sittingDirectDoneCount = createMemo(() => state.sittingDirectCompletions);
   const sittingRescheduledCount = createMemo(() => Object.keys(state.sittingRescheduledIds).length);
   const sittingReconstructed = createMemo(() => state.sittingReconstructed);
   const sittingDoneCount = createMemo(() => sittingPracticedCount() + sittingRescheduledCount());
@@ -674,10 +714,13 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
           beats: cleanBeats(snap.explore.beats, dropSketches),
         },
         removedUnits: Object.keys(snap.removedUnits),
+        sittingId: snap.sittingId,
         sittingIds: snap.sittingIds,
         sittingOrder: snap.sittingOrder,
         sittingOutcomes: snap.sittingOutcomes,
         sittingPracticedIds: Object.keys(snap.sittingPracticedIds),
+        sittingDirectCompletions: snap.sittingDirectCompletions,
+        sittingRetryMinCompletions: snap.sittingRetryMinCompletions,
         sittingRescheduledIds: Object.keys(snap.sittingRescheduledIds),
         sittingReconstructed: snap.sittingReconstructed,
         sittingCompletedIds: Object.keys(snap.sittingCompletedIds),
@@ -707,6 +750,35 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     },
     { defer: true },
   );
+
+  const isManualPractice = (unitId: string): boolean => state.manualPracticeUnitId === unitId;
+  const isRetryUnit = (unitId: string): boolean => Boolean(state.sittingRetryIds[unitId]);
+
+  /**
+   * Drops any MCQ miss/reveal tail retry whose required 2-card separation can no longer be met
+   * because other sitting cards were rescheduled or removed, falling back cleanly to the 20m timed retry.
+   */
+  const pruneUnseparatedRetries = (s: PracticeState) => {
+    const gatedRetryIds = Object.keys(s.sittingRetryMinCompletions).filter((id) => Boolean(s.sittingRetryIds[id]));
+    if (gatedRetryIds.length === 0) return;
+    const byId = new Map(s.queue.map((u) => [u.unit_id, u]));
+    const order = s.sittingOrder.length > 0 ? s.sittingOrder : s.sittingIds;
+    const otherActiveCount = order.filter((id) => {
+      if (s.sittingCompletedIds[id] || s.sittingRetryMinCompletions[id] !== undefined) return false;
+      const q = byId.get(id);
+      return Boolean(q && (q.due || s.sittingRetryIds[id]));
+    }).length;
+    for (const id of gatedRetryIds) {
+      const needed = s.sittingRetryMinCompletions[id] ?? 0;
+      const remainingGap = needed - s.sittingDirectCompletions;
+      if (remainingGap > otherActiveCount) {
+        delete s.sittingRetryIds[id];
+        delete s.sittingRetryMinCompletions[id];
+        s.sittingCompletedIds[id] = true;
+        if (s.sittingOutcomes[id] === "retry") s.sittingOutcomes[id] = "missed";
+      }
+    }
+  };
 
   const sidebarLabel = (u: QueueUnit): string => {
     const p = state.promptMap[u.unit_id] || u.prompt;
@@ -751,6 +823,9 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       if (s.justCompletedId && s.justCompletedId !== unitId) {
         s.justCompletedId = null;
       }
+      if (s.manualPracticeUnitId && s.manualPracticeUnitId !== unitId) {
+        s.manualPracticeUnitId = null;
+      }
       s.mapOpen = false;
       s.stage = { kind: "unit", unitId };
     });
@@ -760,6 +835,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   const selectFrontier = (frontierId: string) => {
     setState((s) => {
       s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
       s.mapOpen = false;
       s.stage = { kind: "frontier", frontierId };
     });
@@ -769,6 +845,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   const selectExploration = (explorationId: string) => {
     setState((s) => {
       s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
       s.mapOpen = false;
       s.stage = { kind: "exploration", explorationId };
     });
@@ -778,6 +855,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   const selectExplore = () => {
     setState((s) => {
       s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
       s.mapOpen = false;
       s.stage = { kind: "explore" };
     });
@@ -787,6 +865,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   const showSittingDone = () => {
     setState((s) => {
       s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
       s.mapOpen = false;
       s.stage = { kind: "sitting-done" };
     });
@@ -1064,9 +1143,12 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     setState((s) => {
       s.justCompletedId = unitId;
       s.celebratingId = unitId;
+      if (s.manualPracticeUnitId === unitId) s.manualPracticeUnitId = null;
       const verdict = s.sessions[unitId]?.passedVerdict ?? null;
       const grade = verdict?.grade ?? "good";
       const nextIn = verdict?.next_in_ms ?? null;
+      const mcqOutcome = verdict?.mcq_result?.outcome ?? null;
+      const isMcq = Boolean(mcqOutcome || s.sessions[unitId]?.rep?.modality === "mcq");
       const byId = new Map(s.queue.map((u) => [u.unit_id, u]));
       const inSitting = s.sittingIds.includes(unitId);
       const wasRetry = Boolean(s.sittingRetryIds[unitId]);
@@ -1080,22 +1162,31 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       if (inSitting) {
         s.sittingPracticedIds[unitId] = true;
         delete s.sittingRescheduledIds[unitId];
+        if (!isMcq) {
+          s.sittingDirectCompletions += 1;
+        }
       }
 
       // Two-stage relearning: on a miss/reveal with >=2 other sitting cards left, queue AT MOST 1
       // cold retry at the tail of sittingOrder while keeping the unit's fixed tick slot in sittingIds.
+      // For MCQ miss/reveal, also require 2 intervening direct completions before presenting the tail retry.
       if (grade === "again" && inSitting && !s.sittingRetriedIds[unitId] && otherRemaining >= 2) {
         s.sittingRetriedIds[unitId] = true;
         s.sittingRetryIds[unitId] = true;
+        if (isMcq) {
+          s.sittingRetryMinCompletions[unitId] = s.sittingDirectCompletions + 2;
+        }
         delete s.sittingCompletedIds[unitId];
         s.sittingOutcomes[unitId] = "retry";
         s.sittingOrder = [...order.filter((id) => id !== unitId), unitId];
       } else {
         delete s.sittingRetryIds[unitId];
+        delete s.sittingRetryMinCompletions[unitId];
         s.sittingCompletedIds[unitId] = true;
         if (inSitting) {
-          s.sittingOutcomes[unitId] = grade === "again" ? "missed" : "pass";
-          if (wasRetry && grade !== "again" && !s.sittingReconstructed.some((r) => r.unitId === unitId)) {
+          const isAssistedMcq = mcqOutcome === "assisted_correct";
+          s.sittingOutcomes[unitId] = grade === "again" || isAssistedMcq ? "missed" : "pass";
+          if (wasRetry && grade !== "again" && !isMcq && !s.sittingReconstructed.some((r) => r.unitId === unitId)) {
             const label = byId.get(unitId)?.text || s.sessions[unitId]?.rep?.text || unitId;
             s.sittingReconstructed.push({ unitId, label });
           }
@@ -1115,12 +1206,14 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
           // Only mark committed sitting slots that were actually rescheduled indirectly (never inflate count).
           if (s.sittingIds.includes(cid) && !s.sittingCompletedIds[cid] && !s.sittingPracticedIds[cid]) {
             delete s.sittingRetryIds[cid];
+            delete s.sittingRetryMinCompletions[cid];
             s.sittingCompletedIds[cid] = true;
             s.sittingOutcomes[cid] = "rescheduled";
             s.sittingRescheduledIds[cid] = true;
           }
         }
       }
+      pruneUnseparatedRetries(s);
     });
     markDirty();
     celebrateTimer = setTimeout(() => {
@@ -1138,6 +1231,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
   const syncDueOverride = (unitId: string, delayMs: number) => {
     setState((s) => {
       delete s.sittingRetryIds[unitId];
+      delete s.sittingRetryMinCompletions[unitId];
       s.sittingCompletedIds[unitId] = true;
       if (s.sittingIds.includes(unitId) && s.sittingOutcomes[unitId] === "retry") {
         s.sittingOutcomes[unitId] = "missed";
@@ -1147,6 +1241,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
         item.next_in_ms = delayMs;
         item.due = delayMs <= 0;
       }
+      pruneUnseparatedRetries(s);
     });
     markDirty();
   };
@@ -1158,12 +1253,14 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     }
     setState((s) => {
       if (s.justCompletedId === unitId) s.justCompletedId = null;
-      // Manual practice of a Done card never enlarges or mutates a committed sitting.
+      // Manual practice of a Done card never enlarges or mutates a committed sitting and never issues MCQ.
       if (!s.sittingIds.includes(unitId)) {
         delete s.sittingCompletedIds[unitId];
         delete s.sittingRetryIds[unitId];
+        delete s.sittingRetryMinCompletions[unitId];
       }
       delete s.sessions[unitId];
+      s.manualPracticeUnitId = unitId;
       s.mapOpen = false;
       s.stage = { kind: "unit", unitId };
     });
@@ -1179,6 +1276,8 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     if (order.length > 0) {
       for (const id of order) {
         if (id === fromUnitId || snap.sittingCompletedIds[id]) continue;
+        const minComp = snap.sittingRetryMinCompletions[id];
+        if (minComp !== undefined && snap.sittingDirectCompletions < minComp) continue;
         const u = byId.get(id);
         if (u && (u.due || snap.sittingRetryIds[id])) {
           nextDue = u;
@@ -1202,7 +1301,9 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
           if (s.sittingRetryIds[fromUnitId]) delete s.promptMap[fromUnitId];
         }
       }
+      pruneUnseparatedRetries(s);
       s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
       s.stage = nextDue
         ? { kind: "unit", unitId: nextDue.unit_id }
         : hadSittingProgress
@@ -1228,9 +1329,13 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
             .map((u) => u.unit_id);
     setState((s) => {
       s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
+      s.sittingId = fallbackBatch.length > 0 ? uuidv7() : null;
       s.sittingCompletedIds = {};
       s.sittingRetriedIds = {};
       s.sittingRetryIds = {};
+      s.sittingRetryMinCompletions = {};
+      s.sittingDirectCompletions = 0;
       s.sittingOutcomes = {};
       s.sittingPracticedIds = {};
       s.sittingRescheduledIds = {};
@@ -1367,8 +1472,11 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
             }
           }
           if (initialSitting.length > 0) {
+            s.sittingId = uuidv7();
             s.sittingIds = initialSitting;
             s.sittingOrder = [...initialSitting];
+            s.sittingDirectCompletions = 0;
+            s.sittingRetryMinCompletions = {};
             clearedStale = true;
           }
         } else {
@@ -1379,11 +1487,13 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
             for (const id of s.sittingIds) {
               if (!validIds.has(id) && !s.sittingCompletedIds[id]) {
                 delete s.sittingRetryIds[id];
+                delete s.sittingRetryMinCompletions[id];
                 s.sittingCompletedIds[id] = true;
                 if (!s.sittingOutcomes[id]) s.sittingOutcomes[id] = "removed";
                 clearedStale = true;
               }
             }
+            pruneUnseparatedRetries(s);
           }
         }
 
@@ -1408,9 +1518,10 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
           }
         }
 
-        // Cross-device resume: hydrate unfinished server attempts into any empty local unit session.
+        // Cross-device resume: hydrate unfinished server attempts (including untouched issued MCQs) into empty local unit sessions.
         for (const a of res.active_attempts ?? []) {
-          if (!a.turns || a.turns.length === 0) continue;
+          const isActiveMcq = a.modality === "mcq" && Boolean(a.mcq?.choices?.length);
+          if (!isActiveMcq && (!a.turns || a.turns.length === 0)) continue;
           if (!sessionHasWork(s.sessions[a.unit_id])) {
             const q = itemsById.get(a.unit_id);
             const restored = emptyUnitSession(
@@ -1421,6 +1532,9 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
                 topic: q?.topic ?? null,
                 depth: a.depth,
                 prompt: a.prompt,
+                ...(a.modality ? { modality: a.modality } : {}),
+                attempt_id: a.attempt_id,
+                ...(a.mcq ? { mcq: a.mcq } : {}),
                 rests_on: [],
                 p_imm: q?.p_imm ?? 0,
                 reviews: q?.reviews ?? 0,
@@ -1725,6 +1839,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     sittingSlots,
     sittingFinished,
     sittingPracticedCount,
+    sittingDirectDoneCount,
     sittingRescheduledCount,
     sittingReconstructed,
     soonestNextMs,
@@ -1732,6 +1847,8 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     currentExploration,
     stageKey,
     reloadNonce,
+    isManualPractice,
+    isRetryUnit,
     sidebarLabel,
     rememberPrompt,
     setMapOpen,
