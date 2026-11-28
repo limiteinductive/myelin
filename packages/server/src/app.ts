@@ -3162,6 +3162,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         scheduler,
       };
 
+      const nextAssistanceCheck = !verdict.ok && !verdict.failed ? hintsUsed + 1 : hintsUsed;
       store.abandonActiveAttempts(u.id, attemptId, now);
       store.upsertAttempt({
         attempt_id: attemptId,
@@ -3180,7 +3181,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           },
         ],
         status: verdict.ok && !verdict.failed ? "passed" : "active",
-        assistance_count: hintsUsed,
+        assistance_count: nextAssistanceCheck,
         active_ms: latencyMs,
         probe_id: probeId,
         grade: verdict.ok && !verdict.failed ? verdict.grade : null,
@@ -3512,13 +3513,29 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const prevIntervalMs = preScore?.scheduled_interval_ms ?? null;
       const prevScheduleKind = preScore?.schedule_kind ?? "first";
       const creditedUnitIds: string[] = [];
+      let finalGrade: Grade = verdict.grade;
+      let storedAssistanceForUpsert = assistanceCount;
       if (verdict.ok && !verdict.failed) {
-        // Re-check latest recorded assistance from the attempt so substantive clarifications are never dropped.
+        // Re-check latest recorded assistance & failed graded turns so heavily coached reconstructions
+        // can never earn a multi-day pass or false depth promotion.
         const latestAtPass = store.getAttempt(attemptId);
         if (latestAtPass?.status === "passed" && latestAtPass.result) {
           return latestAtPass.result;
         }
-        const storedHints = Math.max(latestAtPass?.assistance_count ?? 0, assistanceCount);
+        const priorGradedMisses = latestAtPass?.turns
+          ? latestAtPass.turns.filter((t) => !t.failed && t.kind !== "clarify").length
+          : body.attempt?.trim() && body.feedback?.trim()
+            ? 1 + Math.floor(turns.length / 2)
+            : 0;
+        const storedHints = Math.max(latestAtPass?.assistance_count ?? 0, assistanceCount, priorGradedMisses);
+        storedAssistanceForUpsert = storedHints;
+        if (showPivot) {
+          finalGrade = "again";
+        } else if (storedHints >= 2 || priorGradedMisses >= 2) {
+          finalGrade = "again";
+        } else if ((storedHints >= 1 || priorGradedMisses >= 1) && (finalGrade === "good" || finalGrade === "easy")) {
+          finalGrade = "hard";
+        }
         const ev = makeEvent(
           "unit.probed",
           {
@@ -3527,7 +3544,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             slot: "seam",
             prompt: (body.prompt ?? "").slice(0, 1000),
             answer_message_id: null,
-            grade: verdict.grade,
+            grade: finalGrade,
             corrected_grade: null,
             hints: storedHints,
             latency_ms: latencyMs,
@@ -3539,7 +3556,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         store.append([ev]);
         probeId = ev.id;
 
-        if (verdict.grade !== "again" && !showPivot && bundledUnits.length > 0) {
+        if (finalGrade !== "again" && !showPivot && bundledUnits.length > 0) {
           let offset = 2;
           for (const companion of bundledUnits) {
             const cPre = scores.get(companion.id);
@@ -3635,6 +3652,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       const payload = {
         ...verdict,
+        grade: finalGrade,
         attempt_id: attemptId,
         added_units: addedUnits,
         ...(creditedUnitIds.length > 0 ? { credited_unit_ids: creditedUnitIds } : {}),
@@ -3650,17 +3668,24 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         scheduler,
       };
 
+      const latestBeforeUpsert = store.getAttempt(attemptId);
       const prevStoredTurns =
-        existingAttempt?.turns && existingAttempt.turns.length > 0
-          ? existingAttempt.turns.filter((t) => !t.failed)
+        latestBeforeUpsert?.turns && latestBeforeUpsert.turns.length > 0
+          ? latestBeforeUpsert.turns.filter((t) => !t.failed)
           : [{ user: body.attempt ?? "", coach: body.feedback ?? "" }];
+      const nextAssistanceFollowup =
+        verdict.ok && !verdict.failed
+          ? storedAssistanceForUpsert
+          : !verdict.failed
+            ? Math.max(latestBeforeUpsert?.assistance_count ?? 0, assistanceCount) + 1
+            : Math.max(latestBeforeUpsert?.assistance_count ?? 0, assistanceCount);
 
       store.upsertAttempt({
         attempt_id: attemptId,
         unit_id: u.id,
         depth,
         prompt: body.prompt ?? "",
-        first_attempt: existingAttempt?.first_attempt || (body.attempt ?? ""),
+        first_attempt: latestBeforeUpsert?.first_attempt || (body.attempt ?? ""),
         turns: [
           ...prevStoredTurns,
           {
@@ -3673,12 +3698,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           },
         ],
         status: verdict.ok && !verdict.failed ? "passed" : "active",
-        assistance_count: assistanceCount,
+        assistance_count: nextAssistanceFollowup,
         active_ms: latencyMs,
         probe_id: probeId,
-        grade: verdict.ok && !verdict.failed ? verdict.grade : null,
+        grade: verdict.ok && !verdict.failed ? finalGrade : null,
         result: verdict.ok && !verdict.failed ? payload : null,
-        created_at: existingAttempt?.created_at ?? now,
+        created_at: latestBeforeUpsert?.created_at ?? now,
         updated_at: now,
       });
 

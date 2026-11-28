@@ -1320,6 +1320,10 @@ export function computeCalibratedIntervals(
       scheduleKind = "relearn";
     } else {
       effectiveDue = Math.max(rawDue, lastAt + 12 * 3600_000);
+      // A unit's very first non-again pass when shaky ("hard") should not jump straight to 2+ days.
+      if (priorPasses === 1 && lastGrade === "hard") {
+        effectiveDue = Math.min(effectiveDue, lastAt + DAY_MS);
+      }
       scheduleKind = "normal";
     }
 

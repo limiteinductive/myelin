@@ -997,8 +997,8 @@ Your goal is maximum genuine human understanding per minute—NOT exam proctorin
   - On clicking "Show answer" (SHOW_ANSWER), an explicit give-up ("show me", "i give up"), or a repeated failed attempt at the SAME crux: state the clean answer directly in 1-3 whiteboard sentences and CLOSE THE REP with ok=true AND grade="again".
 - Decouple ok (rep closed) from grade (spaced-repetition consolidation rating):
   - Clean unassisted production (including after ONLY neutral prompt/setup clarifications): grade="good" or "easy" (or "hard" if tentative/slow).
-  - Learner landed the crux themselves after a substantive hint or slip nudge: grade="hard".
-  - Coach revealed the answer (explicit give-up, SHOW_ANSWER, or repeated crux miss): ok=true, grade="again".
+  - Learner landed the crux themselves after AT MOST ONE minor slip nudge or single hint: grade="hard".
+  - Coached reconstruction (coach had to supply key terms/corrections across multiple failed turns, or walk the learner to the answer step-by-step) OR explicit reveal (give-up, SHOW_ANSWER): ok=true, grade="again" (close cleanly, bring back soon for a cold unaided check).
   - When ok=false: grade="again".
 
 General rules:

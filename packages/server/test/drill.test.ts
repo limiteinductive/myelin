@@ -1022,4 +1022,136 @@ describe("v2 drill and map API", () => {
     expect(progExp.focus?.saved_units).toBe(1);
     expect(progExp.focus?.unsaved_turns).toBe(0);
   });
+
+  it("caps heavily coached reconstructions (2+ failed graded attempts) to grade=again with short relearn instead of 2d", async () => {
+    dir = mkdtempSync(join(tmpdir(), "myelin-coached-cap-"));
+    registry = new Registry(dir);
+    stores = new Stores(dir);
+    const user = registry.createUser("ben");
+    const link = registry.issueLink(user.id);
+
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const bodyStr = String(init?.body ?? "");
+      if (bodyStr.includes("FINAL_ECHO_ANSWER")) {
+        // Even if the model generously returns grade="hard" when the learner echoes the final formula:
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    ok: true,
+                    grade: "hard",
+                    message: "Spot on—that's the O(D) RMSNorm backward pass.",
+                    annotations: [],
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  ok: false,
+                  grade: "again",
+                  message: "Missing g and wrong sign/power on r.",
+                  annotations: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const app = createApp({ registry, stores, judge: new FastJudge({ apiKey: "test-key", enableJev: false, fetchFn: mockFetch }), dataDir: dir });
+    const loginRes = await app.request("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link }),
+    });
+    const cookie = loginRes.headers.get("set-cookie")!.split(";")[0]!;
+    const authed = (headers: Record<string, string> = {}) => ({ cookie, ...headers });
+
+    const { unit_id } = (await (
+      await app.request("/api/units", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({ text: "O(D) RMSNorm backward: (g - mean(g * x_hat) * x_hat) / r", kind: "move" }),
+      })
+    ).json()) as { unit_id: string };
+
+    const attemptId = uuidv7();
+    const t1 = (await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          unit_id,
+          depth: "recall",
+          prompt: "Derive RMSNorm backward in O(D).",
+          attempt: "1/r + mean(g*x)*x/r",
+          latency_ms: 12_000,
+          hints_used: 0,
+        }),
+      })
+    ).json()) as { ok: boolean; message: string };
+    expect(t1.ok).toBe(false);
+    expect(stores.get(user.id).getAttempt(attemptId)?.assistance_count).toBe(1);
+
+    const t2 = (await (
+      await app.request("/api/drill/followup", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          unit_id,
+          depth: "recall",
+          prompt: "Derive RMSNorm backward in O(D).",
+          attempt: "1/r + mean(g*x)*x/r",
+          feedback: t1.message,
+          turns: [],
+          question: "1/r * (1 + mean(g*x_hat)*x)",
+          latency_ms: 8_000,
+          hints_used: 0,
+        }),
+      })
+    ).json()) as { ok: boolean; message: string };
+    expect(t2.ok).toBe(false);
+    expect(stores.get(user.id).getAttempt(attemptId)?.assistance_count).toBe(2);
+
+    const t3 = (await (
+      await app.request("/api/drill/followup", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          attempt_id: attemptId,
+          unit_id,
+          depth: "recall",
+          prompt: "Derive RMSNorm backward in O(D).",
+          attempt: "1/r + mean(g*x)*x/r",
+          feedback: t1.message,
+          turns: [
+            { role: "user", text: "1/r * (1 + mean(g*x_hat)*x)" },
+            { role: "assistant", text: t2.message },
+          ],
+          question: "FINAL_ECHO_ANSWER: 1/r * (g - mean(g * x_hat) * x_hat)",
+          latency_ms: 6_000,
+          hints_used: 0,
+        }),
+      })
+    ).json()) as { ok: boolean; grade: string; next_in_ms: number; next_depth: string };
+    expect(t3.ok).toBe(true);
+    expect(t3.grade).toBe("again");
+    expect(t3.next_in_ms).toBeLessThanOrEqual(45 * 60_000);
+    expect(t3.next_depth).toBe("recall");
+  });
 });
