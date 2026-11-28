@@ -3393,21 +3393,11 @@ export function DrillView() {
                       <button
                         type="button"
                         class={{ "v2-mcq-reveal": true, "is-pending": mcqSubmitting() === "__idk__" }}
+                        data-tip="I don't know — show the answer and bring this card back soon"
                         disabled={busy()}
                         onClick={() => void submitMcq("idk")}
                       >
-                        <Show
-                          when={mcqSubmitting() === "__idk__"}
-                          fallback={
-                            <>
-                              I don&apos;t know{" "}
-                              <span class="v2-mcq-reveal-sep" aria-hidden="true">
-                                ·
-                              </span>{" "}
-                              Show answer
-                            </>
-                          }
-                        >
+                        <Show when={mcqSubmitting() === "__idk__"} fallback="Show answer">
                           <span class="v2-spinner" aria-hidden="true" />
                           <span>Showing answer</span>
                         </Show>

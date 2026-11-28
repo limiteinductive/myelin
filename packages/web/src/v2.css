@@ -4701,44 +4701,42 @@ button.v2-rail-row:focus-visible,
   color: var(--v2-success);
 }
 
-/* "I don't know" is always one tap away, under a hairline, in the same quiet ink as any secondary. */
+/* Quiet "Show answer" escape hatch, right-aligned to match the derivation pad. */
 .v2-mcq-foot {
   display: flex;
   align-items: center;
-  margin: 6px 0 0;
-  padding: 6px 2px 0;
-  border-top: 0.5px solid var(--v2-hairline-soft);
+  justify-content: flex-end;
+  margin: 4px 0 0;
+  padding: 4px 6px 0;
 }
 .v2-mcq-reveal {
   appearance: none;
   box-sizing: border-box;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  height: 30px;
-  padding: 0 9px;
+  gap: 6px;
+  height: 26px;
+  padding: 0 4px;
   border: 0;
-  border-radius: 8px;
+  border-radius: 6px;
   background: transparent;
-  color: color-mix(in srgb, var(--v2-fg) 66%, var(--v2-muted));
-  font: var(--v2-type-label);
+  color: var(--v2-ink-3);
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  letter-spacing: var(--v2-track-meta);
   white-space: nowrap;
   cursor: pointer;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
-  transition: background-color 140ms ease, color 140ms ease;
-}
-.v2-mcq-reveal-sep {
-  color: var(--v2-ink-3);
+  transition: color 140ms ease;
 }
 @media (hover: hover) {
   .v2-mcq-reveal:hover:not(:disabled) {
-    background: var(--v2-quiet-fill);
-    color: var(--v2-fg);
+    color: var(--v2-ink-1);
   }
 }
 .v2-mcq-reveal:not(:disabled):active {
-  background: color-mix(in srgb, var(--v2-fg) 9%, transparent);
+  color: var(--v2-fg);
 }
 .v2-mcq-reveal:disabled {
   cursor: default;
@@ -5020,13 +5018,11 @@ button.v2-rail-row:focus-visible,
     height: 12px;
   }
   .v2-mcq-foot {
-    padding: 6px 0 0;
+    padding: 4px 4px 0;
   }
   .v2-mcq-reveal {
-    width: 100%;
-    height: 48px;
-    padding: 0 12px;
-    border-radius: 10px;
+    height: 36px;
+    padding: 0 8px;
   }
   .v2-gate-strip {
     height: 44px;
