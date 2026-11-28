@@ -848,24 +848,29 @@ body,
 }
 /* Reserve the floating right Progress rail width so the main drill column stays centered between both side panels. */
 .v2-main.has-rail:not(.rail-overlay) .v2-body {
-  padding-right: 268px;
+  padding-right: 308px;
 }
 
-/* ---------- Floating Right-Hand Progress Rail (Fable 5.2 spec) ---------- */
+/* ---------- Floating Right-Hand Progress Rail ----------
+   One anchor per section, and only one display figure in the whole rail (the session clock).
+   Four tiers: clock (display) > anchors (label, medium, ink-1) > key/value rows (label, ink-3 key)
+   > captions and section labels (meta, ink-3). Everything sits on a 4px grid with 32px rows. */
 .v2-rail {
-  --v2-rail-w: 256px;
+  --v2-rail-w: 296px;
+  --v2-rail-pad: 20px;
+  --v2-rail-row-h: 32px;
   position: absolute;
-  top: calc(50px + env(safe-area-inset-top, 0px));
+  top: calc(52px + env(safe-area-inset-top, 0px));
   right: calc(12px + env(safe-area-inset-right, 0px));
   width: var(--v2-rail-w);
-  max-height: calc(100% - 62px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  max-height: calc(100% - 64px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
   box-sizing: border-box;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-width: none;
-  background: color-mix(in srgb, var(--v2-surface) 70%, var(--v2-bg));
-  border: 1px solid var(--v2-border);
-  border-radius: var(--v2-radius);
+  background: color-mix(in srgb, var(--v2-surface) 50%, var(--v2-bg));
+  border: 1px solid var(--v2-hairline-soft);
+  border-radius: calc(var(--v2-radius) + 1px);
   box-shadow: var(--v2-edge-light);
   color: var(--v2-ink-2);
   font: var(--v2-type-label);
@@ -878,75 +883,116 @@ body,
   display: none;
 }
 .v2-rail.is-overlay {
-  box-shadow: var(--v2-float-shadow);
   background: var(--v2-surface);
+  border-color: var(--v2-hairline);
+  box-shadow: var(--v2-float-shadow);
   z-index: 14;
 }
+
 .v2-rail-sec {
-  padding: 12px 16px 14px;
+  padding: 16px var(--v2-rail-pad) 20px;
 }
 .v2-rail-sec + .v2-rail-sec {
   border-top: 1px solid var(--v2-hairline-soft);
 }
+
+/* Section head: a quiet label (Session, This card) or an anchor row (Due now 30, Mastery 68 units). */
 .v2-rail-head {
-  height: 20px;
+  min-height: 24px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 12px;
 }
 .v2-rail-label {
   font: var(--v2-type-meta);
+  font-weight: 400;
   letter-spacing: var(--v2-track-meta);
   color: var(--v2-ink-3);
 }
-.v2-rail-lead {
-  margin-top: 4px;
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-.v2-rail-figure {
-  font: var(--v2-type-prompt);
-  letter-spacing: var(--v2-track-prompt);
+.v2-rail-lead,
+.v2-rail-value {
+  font: var(--v2-type-label);
   color: var(--v2-ink-1);
 }
-.v2-rail-figure small {
+.v2-rail-value {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.v2-rail-value small {
   font: var(--v2-type-meta);
+  font-weight: 400;
+  color: var(--v2-ink-3);
+  margin-left: 4px;
+}
+.v2-rail-value.is-quiet {
+  color: var(--v2-ink-3);
+}
+
+/* The rail's single display figure. */
+.v2-rail-clock {
+  margin-top: 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font: var(--v2-type-display);
+  font-weight: 500;
+  letter-spacing: var(--v2-track-display);
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-1);
+}
+.v2-rail-clock small {
+  font: var(--v2-type-label);
   font-weight: 400;
   letter-spacing: 0;
   color: var(--v2-ink-3);
-  margin-left: 5px;
 }
-.v2-rail-figure.is-reached {
+.v2-rail-clock.is-reached,
+.v2-rail-clock.is-quiet {
   color: var(--v2-ink-3);
 }
-.v2-rail-sub {
-  margin-top: 2px;
+.v2-rail-track {
+  margin-top: 8px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--v2-hairline-soft);
+  overflow: hidden;
+}
+.v2-rail-track i {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--v2-ink-2);
+  transition: width 300ms linear;
+}
+
+/* Caption: the one whisper line under an anchor. */
+.v2-rail-cap {
+  margin-top: 4px;
   font: var(--v2-type-meta);
   font-weight: 400;
+  letter-spacing: var(--v2-track-meta);
   color: var(--v2-ink-3);
+  text-wrap: pretty;
 }
-.v2-rail-aside {
-  font: var(--v2-type-meta);
-  font-weight: 400;
-  color: var(--v2-ink-3);
-  white-space: nowrap;
+.v2-rail-track + .v2-rail-cap {
+  margin-top: 8px;
 }
+
 .v2-rail-target {
   display: inline-flex;
-  gap: 1px;
-  margin-right: -6px;
+  gap: 2px;
+  margin-right: -8px;
 }
 .v2-rail-target button {
   appearance: none;
   border: 0;
   background: transparent;
-  height: 20px;
-  padding: 0 6px;
-  border-radius: 6px;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 7px;
   font: var(--v2-type-meta);
+  font-weight: 400;
   font-variant-numeric: tabular-nums;
   color: var(--v2-ink-3);
   cursor: pointer;
@@ -959,99 +1005,8 @@ body,
   background: var(--v2-quiet-fill);
   color: var(--v2-ink-1);
 }
-.v2-rail-track {
-  margin-top: 8px;
-  height: 2px;
-  border-radius: 1px;
-  background: var(--v2-hairline-soft);
-  overflow: hidden;
-}
-.v2-rail-track i {
-  display: block;
-  height: 100%;
-  background: var(--v2-ink-2);
-  transition: width 300ms linear;
-}
-.v2-rail-bars {
-  margin-top: 12px;
-  height: 32px;
-  display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 5px;
-  align-items: end;
-}
-.v2-rail-bars i {
-  display: block;
-  min-height: 2px;
-  border-radius: 2px 2px 0 0;
-  background: color-mix(in srgb, var(--v2-fg) 17%, transparent);
-  transition: height 220ms ease;
-}
-.v2-rail-bars i.is-today {
-  background: color-mix(in srgb, var(--v2-fg) 58%, transparent);
-}
-.v2-rail-days {
-  margin-top: 5px;
-  display: grid;
-  grid-template-columns: repeat(7, 1fr);
-  gap: 5px;
-  font: var(--v2-type-meta);
-  font-weight: 400;
-  color: color-mix(in srgb, var(--v2-ink-3) 70%, transparent);
-  text-align: center;
-}
-.v2-rail-days .is-today {
-  color: var(--v2-ink-2);
-}
-.v2-rail-seg {
-  margin-top: 10px;
-  height: 4px;
-  display: flex;
-  gap: 2px;
-}
-.v2-rail-seg i {
-  display: block;
-  height: 100%;
-  border-radius: 1px;
-  min-width: 2px;
-}
-.v2-rail-seg i:first-child {
-  border-radius: 2px 1px 1px 2px;
-}
-.v2-rail-seg i:last-child {
-  border-radius: 1px 2px 2px 1px;
-}
-.v2-rail .is-solid {
-  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
-}
-.v2-rail .is-learning {
-  background: color-mix(in srgb, var(--v2-fg) 34%, transparent);
-}
-.v2-rail .is-new {
-  background: color-mix(in srgb, var(--v2-fg) 12%, transparent);
-}
-.v2-rail-legend {
-  margin-top: 8px;
-  display: flex;
-  gap: 12px;
-  font: var(--v2-type-meta);
-  font-weight: 400;
-  color: var(--v2-ink-3);
-}
-.v2-rail-legend span {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.v2-rail-legend b {
-  font-weight: 500;
-  color: var(--v2-ink-2);
-}
-.v2-rail-legend i {
-  width: 6px;
-  height: 6px;
-  border-radius: 1.5px;
-}
+
+/* Key/value rows and tappable list rows share one 32px rhythm. */
 .v2-rail-rows {
   margin-top: 8px;
   display: flex;
@@ -1061,12 +1016,12 @@ body,
   appearance: none;
   border: 0;
   background: transparent;
-  height: 24px;
+  height: var(--v2-rail-row-h);
   padding: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 12px;
   font: var(--v2-type-label);
   font-weight: 400;
   font-variant-numeric: tabular-nums;
@@ -1086,52 +1041,182 @@ body,
 .v2-rail-row .is-quiet {
   color: var(--v2-ink-3);
 }
-button.v2-rail-row {
-  height: 26px;
+button.v2-rail-row,
+.v2-rail-fold {
   margin: 0 -8px;
   padding: 0 8px;
-  border-radius: 7px;
-  color: var(--v2-ink-2);
+  border-radius: 8px;
   cursor: pointer;
   transition: background-color 120ms ease, color 120ms ease;
 }
-button.v2-rail-row:hover {
+button.v2-rail-row {
+  color: var(--v2-ink-2);
+}
+button.v2-rail-row:hover,
+.v2-rail-fold:hover {
   background: color-mix(in srgb, var(--v2-fg) 5%, transparent);
   color: var(--v2-ink-1);
 }
+/* A section that ends on a row already carries the row's own inner air. */
+.v2-rail-rows:last-child,
+.v2-rail-fold:last-child {
+  margin-bottom: -8px;
+}
+
+/* Fold: the same sub-fold the left sidebar uses for Done and Archived. */
+.v2-rail-fold {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  box-sizing: content-box;
+  width: 100%;
+  height: var(--v2-rail-row-h);
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font: var(--v2-type-label);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-3);
+  text-align: left;
+}
+.v2-rail-fold.is-open {
+  color: var(--v2-ink-2);
+}
+.v2-rail-fold svg {
+  width: 10px;
+  height: 10px;
+  opacity: 0.6;
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.v2-rail-fold.is-open svg {
+  transform: rotate(90deg);
+}
+.v2-rail-fold > :last-child {
+  margin-left: auto;
+  color: var(--v2-ink-3);
+}
+.v2-rail-fold + .v2-rail-rows {
+  margin-top: 0;
+}
+button.v2-rail-row:focus,
+.v2-rail-fold:focus,
+.v2-rail-target button:focus {
+  outline: none;
+}
 button.v2-rail-row:focus-visible,
+.v2-rail-fold:focus-visible,
 .v2-rail-target button:focus-visible {
   outline: 1px solid var(--v2-border-strong);
   outline-offset: -1px;
 }
+
+/* 7-day forecast as an inline sparkline: one row instead of a chart block. */
+.v2-rail-spark {
+  height: 18px;
+  display: grid;
+  grid-template-columns: repeat(7, 8px);
+  gap: 4px;
+}
+.v2-rail-spark span {
+  display: flex;
+  align-items: flex-end;
+}
+.v2-rail-spark i {
+  display: block;
+  width: 100%;
+  min-height: 2px;
+  border-radius: 1.5px;
+  background: color-mix(in srgb, var(--v2-fg) 18%, transparent);
+  transition: height 220ms ease;
+}
+.v2-rail-spark i.is-today {
+  background: color-mix(in srgb, var(--v2-fg) 60%, transparent);
+}
+
+/* Mastery: one bar, one caption. The caption's numbers step down in tone with the bar. */
+.v2-rail-seg {
+  margin-top: 10px;
+  height: 4px;
+  display: flex;
+  gap: 2px;
+}
+.v2-rail-seg i {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: 1px;
+}
+.v2-rail-seg i:first-child {
+  border-top-left-radius: 2px;
+  border-bottom-left-radius: 2px;
+}
+.v2-rail-seg i:last-child {
+  border-top-right-radius: 2px;
+  border-bottom-right-radius: 2px;
+}
+.v2-rail-seg .is-solid {
+  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
+}
+.v2-rail-seg .is-learning {
+  background: color-mix(in srgb, var(--v2-fg) 34%, transparent);
+}
+.v2-rail-seg .is-new {
+  background: color-mix(in srgb, var(--v2-fg) 12%, transparent);
+}
+.v2-rail-legend {
+  margin-top: 10px;
+}
+.v2-rail-legend span + span::before {
+  content: "·";
+  margin: 0 6px;
+}
+.v2-rail-legend b {
+  font-weight: 500;
+}
+.v2-rail-legend span:nth-child(1) b {
+  color: var(--v2-ink-1);
+}
+.v2-rail-legend span:nth-child(2) b {
+  color: var(--v2-ink-2);
+}
+
+/* Contextual section: a title that may wrap to two lines, then a caption, then at most two rows. */
 .v2-rail-title {
   margin-top: 4px;
   font: var(--v2-type-label);
+  line-height: 20px;
   color: var(--v2-ink-1);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
   overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  text-wrap: pretty;
 }
 .v2-rail-depth {
-  margin-top: 8px;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font: var(--v2-type-meta);
   font-weight: 400;
-  color: color-mix(in srgb, var(--v2-ink-3) 62%, transparent);
+  letter-spacing: var(--v2-track-meta);
+  color: var(--v2-ink-2);
+  text-transform: capitalize;
 }
-.v2-rail-depth .is-past {
-  color: var(--v2-ink-3);
+.v2-rail-pips {
+  display: inline-flex;
+  gap: 3px;
 }
-.v2-rail-depth .is-now {
-  color: var(--v2-ink-1);
-  font-weight: 500;
-}
-.v2-rail-depth i {
-  flex: 1;
-  height: 1px;
+.v2-rail-pips i {
+  width: 12px;
+  height: 2px;
+  border-radius: 1px;
   background: var(--v2-hairline);
+}
+.v2-rail-pips i.is-on {
+  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
 }
 .v2-rail-note {
   margin: 4px 0 0;
@@ -1140,6 +1225,15 @@ button.v2-rail-row:focus-visible,
   line-height: 18px;
   color: var(--v2-ink-3);
   text-wrap: pretty;
+}
+@media (prefers-reduced-motion: reduce) {
+  .v2-rail,
+  .v2-rail-fold svg,
+  .v2-rail-spark i,
+  .v2-rail-track i {
+    animation: none;
+    transition-duration: 0s;
+  }
 }
 .v2-stage-hidden {
   display: none !important;
@@ -1169,7 +1263,12 @@ button.v2-rail-row:focus-visible,
     box-shadow: var(--v2-float-shadow);
   }
   .v2-rail.is-overlay {
-    width: min(280px, calc(100vw - 24px));
+    --v2-rail-row-h: 40px;
+    width: min(320px, calc(100vw - 24px));
+  }
+  .v2-rail.is-overlay .v2-rail-target button {
+    height: 32px;
+    padding: 0 12px;
   }
 }
 

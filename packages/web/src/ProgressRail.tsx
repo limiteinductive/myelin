@@ -44,6 +44,43 @@ function writeSavedTarget(userId: string, t: SavedTarget): void {
   }
 }
 
+function topicsStorageKey(userId: string): string {
+  return `myelin:rail-topics:${userId}`;
+}
+
+function readTopicsOpen(userId: string): boolean {
+  try {
+    return localStorage.getItem(topicsStorageKey(userId)) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeTopicsOpen(userId: string, open: boolean): void {
+  try {
+    localStorage.setItem(topicsStorageKey(userId), open ? "1" : "0");
+  } catch {
+    /* ignore storage quota */
+  }
+}
+
+// Same chevron the sidebar folds use (App.tsx ChevronIcon); the rail sizes it in CSS.
+const ChevronIcon = () => (
+  <svg
+    width="12"
+    height="12"
+    viewBox="0 0 12 12"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M4.5 2.75 7.75 6 4.5 9.25" />
+  </svg>
+);
+
 function fmtClock(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(sec / 3600);
@@ -131,6 +168,7 @@ export function ProgressRail(props: {
   const [data, setData] = createSignal<ProgressResponse | null>(null);
   const [now, setNow] = createSignal(Date.now());
   const [target, setTarget] = createSignal<SavedTarget>(readSavedTarget(props.userId));
+  const [topicsOpen, setTopicsOpen] = createSignal(readTopicsOpen(props.userId));
   let railEl: HTMLElement | undefined;
 
   const tz = (() => {
@@ -291,17 +329,44 @@ export function ProgressRail(props: {
     return Math.max(1, ...f);
   });
 
+  // One caption under the clock: today's time, then the sitting's count and first-try count.
   const sessionSummary = createMemo(() => {
     const s = data()?.session;
-    if (!s || s.practiced === 0) return "Nothing practiced yet";
-    return `${s.practiced} practiced · ${s.first_try} first-try`;
+    const parts: string[] = [];
+    if (todayMs() >= 60_000) parts.push(`${fmtMinutes(todayMs())} today`);
+    if (s && s.practiced > 0) parts.push(`${s.practiced} practiced`, `${s.first_try} first try`);
+    return parts.length > 0 ? parts.join(" · ") : "Nothing practiced yet";
   });
 
-  const dueSplit = createMemo(() => {
-    const due = data()?.backlog.due;
-    if (!due) return "";
-    return `${due.new} new · ${due.review} review · ${due.shaky} shaky`;
+  // One caption under "Due now": the non-empty split, or what comes next once the backlog is clear.
+  const dueCaption = createMemo(() => {
+    const b = data()?.backlog;
+    if (!b) return "";
+    if (b.due.total === 0) {
+      const cleared = b.cleared_today > 0 ? ` · ${b.cleared_today} cleared today` : "";
+      return b.next_due_in_ms ? `Next due in ${fmtWait(b.next_due_in_ms)}${cleared}` : `All caught up${cleared}`;
+    }
+    return [
+      { n: b.due.new, label: "new" },
+      { n: b.due.review, label: "review" },
+      { n: b.due.shaky, label: "shaky" },
+    ]
+      .filter((p) => p.n > 0)
+      .map((p) => `${p.n} ${p.label}`)
+      .join(" · ");
   });
+
+  const forecastLabel = createMemo(() => {
+    const f = data()?.backlog.forecast ?? [];
+    const later = f.slice(1).reduce((a, n) => a + n, 0);
+    return `Due over the next 7 days: ${f[0] ?? 0} today, ${later} later`;
+  });
+
+  const toggleTopics = () => {
+    const next = !topicsOpen();
+    setTopicsOpen(next);
+    writeTopicsOpen(props.userId, next);
+  };
 
   const isSittingDone = () => practice.state.stage.kind === "sitting-done";
   const isFreshExplore = () => practice.state.stage.kind === "explore";
@@ -325,16 +390,14 @@ export function ProgressRail(props: {
               <div class="v2-rail-head">
                 <span class="v2-rail-label">Session</span>
               </div>
-              <div class="v2-rail-lead">
-                <span class="v2-rail-figure">00:00</span>
-              </div>
-              <div class="v2-rail-sub">Loading…</div>
+              <div class="v2-rail-clock is-quiet">00:00</div>
+              <div class="v2-rail-cap">Loading…</div>
             </section>
           }
         >
           {(d) => (
             <>
-              {/* 1. Session */}
+              {/* 1. Session: the rail's only display figure */}
               <section class="v2-rail-sec">
                 <div class="v2-rail-head">
                   <span class="v2-rail-label">Session</span>
@@ -367,24 +430,21 @@ export function ProgressRail(props: {
                     </div>
                   </Show>
                 </div>
-                <div class="v2-rail-lead">
-                  <span class={{ "v2-rail-figure": true, "is-reached": targetReached() }}>
-                    {fmtClock(stopwatchMs())}
-                    <Show when={targetDurationMs()}>
-                      {(dur) => <small>/ {fmtClock(dur() ?? 0)}</small>}
-                    </Show>
-                  </span>
-                  <span class="v2-rail-aside">{fmtMinutes(todayMs())} today</span>
+                <div class={{ "v2-rail-clock": true, "is-reached": targetReached() }}>
+                  {fmtClock(stopwatchMs())}
+                  <Show when={targetDurationMs()}>
+                    {(dur) => <small>/ {fmtClock(dur() ?? 0)}</small>}
+                  </Show>
                 </div>
                 <Show when={targetDurationMs() !== null}>
                   <div class="v2-rail-track" aria-hidden="true">
                     <i style={{ width: `${targetPct()}%` }} />
                   </div>
                 </Show>
-                <div class="v2-rail-sub">{sessionSummary()}</div>
+                <div class="v2-rail-cap">{sessionSummary()}</div>
               </section>
 
-              {/* 2 & 3. Backlog + Mastery (or calm empty note for brand-new learners) */}
+              {/* 2 & 3. Due + Mastery (or a calm note for brand-new learners) */}
               <Show
                 when={!isNewLearner()}
                 fallback={
@@ -400,53 +460,38 @@ export function ProgressRail(props: {
               >
                 <section class="v2-rail-sec">
                   <div class="v2-rail-head">
-                    <span class="v2-rail-label">Due now</span>
+                    <span class="v2-rail-lead">Due now</span>
+                    <span class={{ "v2-rail-value": true, "is-quiet": (d()?.backlog.due.total ?? 0) === 0 }}>
+                      {d()?.backlog.due.total ?? 0}
+                    </span>
                   </div>
-                  <div class="v2-rail-lead">
-                    <span class="v2-rail-figure">{d()?.backlog.due.total ?? 0}</span>
-                    <Show when={(d()?.backlog.cleared_today ?? 0) > 0}>
-                      <span class="v2-rail-aside">{d()?.backlog.cleared_today} cleared today</span>
-                    </Show>
-                  </div>
-                  <div class="v2-rail-sub">
-                    <Show
-                      when={(d()?.backlog.due.total ?? 0) > 0}
-                      fallback={
-                        d()?.backlog.next_due_in_ms
-                          ? `Next due in ${fmtWait(d()!.backlog.next_due_in_ms!)}`
-                          : "All caught up"
-                      }
-                    >
-                      {dueSplit()}
-                    </Show>
-                  </div>
-                  <div class="v2-rail-bars" aria-label="7-day due forecast">
-                    <For each={d()?.backlog.forecast ?? []}>
-                      {(count, idx) => {
-                        const pct = () => (count > 0 ? Math.max(12, Math.round((count / forecastMax()) * 100)) : 0);
-                        return (
-                          <i
-                            class={{ "is-today": idx() === 0 }}
-                            style={{ height: pct() > 0 ? `${pct()}%` : "2px" }}
-                            data-tip={`${idx() === 0 ? "Today" : `+${idx()}d`}: ${count} due`}
-                          />
-                        );
-                      }}
-                    </For>
-                  </div>
-                  <div class="v2-rail-days" aria-hidden="true">
-                    <For each={d()?.backlog.forecast_days ?? []}>
-                      {(day, idx) => <span class={{ "is-today": idx() === 0 }}>{day}</span>}
-                    </For>
+                  <div class="v2-rail-cap">{dueCaption()}</div>
+                  <div class="v2-rail-rows">
+                    <div class="v2-rail-row">
+                      <span>Next 7 days</span>
+                      <span class="v2-rail-spark" role="img" aria-label={forecastLabel()}>
+                        <For each={d()?.backlog.forecast ?? []}>
+                          {(count, idx) => {
+                            const pct = () => (count > 0 ? Math.max(12, Math.round((count / forecastMax()) * 100)) : 0);
+                            return (
+                              <span data-tip={`${idx() === 0 ? "Today" : `+${idx()}d`}: ${count} due`}>
+                                <i
+                                  class={{ "is-today": idx() === 0 }}
+                                  style={{ height: pct() > 0 ? `${pct()}%` : "2px" }}
+                                />
+                              </span>
+                            );
+                          }}
+                        </For>
+                      </span>
+                    </div>
                   </div>
                 </section>
 
                 <section class="v2-rail-sec">
                   <div class="v2-rail-head">
-                    <span class="v2-rail-label">Mastery</span>
-                  </div>
-                  <div class="v2-rail-lead">
-                    <span class="v2-rail-figure">
+                    <span class="v2-rail-lead">Mastery</span>
+                    <span class="v2-rail-value">
                       {d()?.mastery.total ?? 0}
                       <small>{(d()?.mastery.total ?? 0) === 1 ? "unit" : "units"}</small>
                     </span>
@@ -463,116 +508,113 @@ export function ProgressRail(props: {
                         <i class="is-new" style={{ flex: d()?.mastery.new ?? 0 }} />
                       </Show>
                     </div>
-                  </Show>
-                  <div class="v2-rail-legend">
-                    <span>
-                      <i class="is-solid" />
-                      <b>{d()?.mastery.solid ?? 0}</b> solid
-                    </span>
-                    <span>
-                      <i class="is-learning" />
-                      <b>{d()?.mastery.learning ?? 0}</b> learning
-                    </span>
-                    <span>
-                      <i class="is-new" />
-                      <b>{d()?.mastery.new ?? 0}</b> new
-                    </span>
-                  </div>
-                  <Show when={(d()?.mastery.topics.length ?? 0) > 0}>
-                    <div class="v2-rail-rows">
-                      <For each={d()?.mastery.topics ?? []}>
-                        {(t) => (
-                          <button
-                            type="button"
-                            class="v2-rail-row"
-                            data-tip={t.due > 0 ? `Practice ${t.topic} (${t.due} due)` : `Review ${t.topic}`}
-                            onClick={() => onSelectTopic(t.topic)}
-                          >
-                            <span>{t.topic}</span>
-                            <span class={{ "is-quiet": t.due === 0 }}>{t.due > 0 ? t.due : "·"}</span>
-                          </button>
-                        )}
-                      </For>
+                    <div class="v2-rail-cap v2-rail-legend">
+                      <span>
+                        <b>{d()?.mastery.solid ?? 0}</b> solid
+                      </span>
+                      <span>
+                        <b>{d()?.mastery.learning ?? 0}</b> learning
+                      </span>
+                      <span>
+                        <b>{d()?.mastery.new ?? 0}</b> new
+                      </span>
                     </div>
+                  </Show>
+                  <Show when={(d()?.mastery.topics.length ?? 0) > 0}>
+                    <button
+                      type="button"
+                      class={{ "v2-rail-fold": true, "is-open": topicsOpen() }}
+                      aria-expanded={topicsOpen() ? "true" : "false"}
+                      aria-controls="v2-rail-topics"
+                      onClick={toggleTopics}
+                    >
+                      <span>Topics</span>
+                      <ChevronIcon />
+                      <span>{d()?.mastery.topics.length ?? 0}</span>
+                    </button>
+                    <Show when={topicsOpen()}>
+                      <div class="v2-rail-rows" id="v2-rail-topics">
+                        <For each={d()?.mastery.topics ?? []}>
+                          {(t) => {
+                            const name = plainSidebarText(t.topic) || t.topic;
+                            return (
+                              <button
+                                type="button"
+                                class="v2-rail-row"
+                                data-tip={t.due > 0 ? `Practice ${name} (${t.due} due)` : `Review ${name}`}
+                                onClick={() => onSelectTopic(t.topic)}
+                              >
+                                <span>{name}</span>
+                                <span>{t.due > 0 ? t.due : ""}</span>
+                              </button>
+                            );
+                          }}
+                        </For>
+                      </div>
+                    </Show>
                   </Show>
                 </section>
               </Show>
 
-              {/* 4. Contextual footer: This card or This thread (hidden on sitting-done receipt) */}
+              {/* 4. Contextual section: This card or This thread (hidden on the sitting-done receipt) */}
               <Show when={!isSittingDone()}>
                 <Switch>
                   <Match when={(() => { const f = d()?.focus; return f?.kind === "unit" ? f : null; })()}>
                     {(u) => {
                       const unit = () => u() ?? null;
-                      const depthIdx = () => {
-                        const dep = unit()?.depth;
-                        return dep ? DEPTH_STEPS.indexOf(dep) : 0;
-                      };
+                      const depth = (): Depth => unit()?.depth ?? "recall";
+                      const depthIdx = () => Math.max(0, DEPTH_STEPS.indexOf(depth()));
                       const isFirst = () => (unit()?.reviews ?? 0) === 0;
-                      const latencyLabel = () => {
+                      const caption = () => {
                         const cur = unit();
-                        if (!cur || isFirst() || cur.last_latency_ms === null) return "First time";
+                        if (!cur || isFirst()) return "First time · interval is set after this rep";
+                        const reviews = `${cur.reviews} ${cur.reviews === 1 ? "review" : "reviews"}`;
+                        if (cur.last_latency_ms === null) return reviews;
                         if (cur.first_latency_ms && cur.first_latency_ms !== cur.last_latency_ms) {
-                          return `${fmtLatencySec(cur.first_latency_ms)} → ${fmtLatencySec(cur.last_latency_ms)}`;
+                          return `${reviews} · ${fmtLatencySec(cur.first_latency_ms)} → ${fmtLatencySec(cur.last_latency_ms)}`;
                         }
-                        return fmtLatencySec(cur.last_latency_ms);
+                        return `${reviews} · last answer ${fmtLatencySec(cur.last_latency_ms)}`;
                       };
-                      const intervalLabel = () => {
-                        const cur = unit();
-                        if (!cur || isFirst() || !cur.interval_ms) return "Set after this rep";
-                        return fmtInterval(cur.interval_ms);
+                      const recall = () => {
+                        const p = unit()?.p_imm;
+                        return p === null || p === undefined ? null : `${Math.round(p * 100)}%`;
+                      };
+                      const interval = () => {
+                        const ms = unit()?.interval_ms;
+                        return ms ? fmtInterval(ms) : null;
                       };
                       return (
                         <section class="v2-rail-sec">
                           <div class="v2-rail-head">
                             <span class="v2-rail-label">This card</span>
-                          </div>
-                          <div class="v2-rail-title">{unit()?.topic || "General"}</div>
-                          <div class="v2-rail-depth" aria-label={`Depth: ${unit()?.depth ?? "recall"}`}>
-                            <For each={DEPTH_STEPS}>
-                              {(step, idx) => (
-                                <>
-                                  <Show when={idx() > 0}>
-                                    <i aria-hidden="true" />
-                                  </Show>
-                                  <span
-                                    class={{
-                                      "is-past": idx() < depthIdx(),
-                                      "is-now": idx() === depthIdx(),
-                                    }}
-                                  >
-                                    {step}
-                                  </span>
-                                </>
-                              )}
-                            </For>
-                          </div>
-                          <div class="v2-rail-rows">
-                            <div class="v2-rail-row">
-                              <span>Recall</span>
-                              <span class={{ "is-quiet": isFirst() }}>
-                                {isFirst() || unit()?.p_imm === null || unit()?.p_imm === undefined
-                                  ? "New"
-                                  : `${Math.round(unit()!.p_imm! * 100)}%`}
+                            <span
+                              class="v2-rail-depth"
+                              role="img"
+                              aria-label={`Depth: ${depth()}, step ${depthIdx() + 1} of ${DEPTH_STEPS.length}`}
+                              data-tip={DEPTH_STEPS.join(" → ")}
+                            >
+                              <span class="v2-rail-pips" aria-hidden="true">
+                                <For each={DEPTH_STEPS}>
+                                  {(_, idx) => <i class={{ "is-on": idx() <= depthIdx() }} />}
+                                </For>
                               </span>
-                            </div>
-                            <div class="v2-rail-row">
-                              <span>Reviews</span>
-                              <span class={{ "is-quiet": isFirst() }}>{unit()?.reviews ?? 0}</span>
-                            </div>
-                            <div class="v2-rail-row">
-                              <span>Latency</span>
-                              <span class={{ "is-quiet": isFirst() || unit()?.last_latency_ms === null }}>
-                                {latencyLabel()}
-                              </span>
-                            </div>
-                            <div class="v2-rail-row">
-                              <span>Interval</span>
-                              <span class={{ "is-quiet": isFirst() || !unit()?.interval_ms }}>
-                                {intervalLabel()}
-                              </span>
-                            </div>
+                              {depth()}
+                            </span>
                           </div>
+                          <div class="v2-rail-title">{plainSidebarText(unit()?.topic ?? "") || "General"}</div>
+                          <div class="v2-rail-cap">{caption()}</div>
+                          <Show when={!isFirst()}>
+                            <div class="v2-rail-rows">
+                              <div class="v2-rail-row">
+                                <span>Recall</span>
+                                <span class={{ "is-quiet": recall() === null }}>{recall() ?? "—"}</span>
+                              </div>
+                              <div class="v2-rail-row">
+                                <span>Interval</span>
+                                <span class={{ "is-quiet": interval() === null }}>{interval() ?? "—"}</span>
+                              </div>
+                            </div>
+                          </Show>
                         </section>
                       );
                     }}
@@ -581,36 +623,26 @@ export function ProgressRail(props: {
                   <Match when={(() => { const f = d()?.focus; return f?.kind === "exploration" ? f : null; })()}>
                     {(e) => {
                       const exp = () => e() ?? null;
+                      const summary = () => {
+                        const turns = exp()?.turns ?? 0;
+                        const saved = exp()?.saved_units ?? 0;
+                        const units = saved > 0 ? `${saved} ${saved === 1 ? "unit" : "units"} saved` : "no units yet";
+                        return `${turns} ${turns === 1 ? "turn" : "turns"} · ${units}`;
+                      };
                       return (
                         <section class="v2-rail-sec">
                           <div class="v2-rail-head">
                             <span class="v2-rail-label">This thread</span>
                           </div>
-                          <div class="v2-rail-title">{plainSidebarText(exp()?.title ?? "Exploration")}</div>
-                          <div class="v2-rail-rows">
-                            <div class="v2-rail-row">
-                              <span>Turns</span>
-                              <span>{exp()?.turns ?? 0}</span>
+                          <div class="v2-rail-title">{plainSidebarText(exp()?.title ?? "") || "Exploration"}</div>
+                          <div class="v2-rail-cap">{summary()}</div>
+                          <Show when={exp()?.saving || (exp()?.unsaved_turns ?? 0) > 0}>
+                            <div class="v2-rail-cap">
+                              {exp()?.saving
+                                ? "Saving…"
+                                : `${exp()?.unsaved_turns} unsaved ${exp()?.unsaved_turns === 1 ? "turn" : "turns"} · saves on leave`}
                             </div>
-                            <div class="v2-rail-row">
-                              <span>Units</span>
-                              <span class={{ "is-quiet": (exp()?.saved_units ?? 0) === 0 }}>
-                                {(exp()?.saved_units ?? 0) > 0
-                                  ? `${exp()?.saved_units} saved`
-                                  : "None yet"}
-                              </span>
-                            </div>
-                            <Show when={exp()?.saving || (exp()?.unsaved_turns ?? 0) > 0}>
-                              <div class="v2-rail-row">
-                                <span>Unsaved</span>
-                                <span class="is-quiet">
-                                  {exp()?.saving
-                                    ? "Saving…"
-                                    : `${exp()?.unsaved_turns} ${exp()?.unsaved_turns === 1 ? "turn" : "turns"} · saves on leave`}
-                                </span>
-                              </div>
-                            </Show>
-                          </div>
+                          </Show>
                         </section>
                       );
                     }}
@@ -622,16 +654,7 @@ export function ProgressRail(props: {
                         <span class="v2-rail-label">This thread</span>
                       </div>
                       <div class="v2-rail-title">New exploration</div>
-                      <div class="v2-rail-rows">
-                        <div class="v2-rail-row">
-                          <span>Turns</span>
-                          <span class="is-quiet">0</span>
-                        </div>
-                        <div class="v2-rail-row">
-                          <span>Units</span>
-                          <span class="is-quiet">Saves on leave</span>
-                        </div>
-                      </div>
+                      <div class="v2-rail-cap">Units save when you leave</div>
                     </section>
                   </Match>
                 </Switch>

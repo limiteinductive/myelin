@@ -210,7 +210,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
   const [railPrefOpen, setRailPrefOpen] = createSignal(readRailPref());
   const [railOverlayOpen, setRailOverlayOpen] = createSignal(false);
   const [mainWidth, setMainWidth] = createSignal(typeof window !== "undefined" ? window.innerWidth : 1440);
-  const railOverlay = () => mainWidth() < 940;
+  const railOverlay = () => mainWidth() < 980;
   const railOpen = () => (railOverlay() ? railOverlayOpen() : railPrefOpen());
   const toggleSidebar = () => {
     setSidebarOpen((v) => {
