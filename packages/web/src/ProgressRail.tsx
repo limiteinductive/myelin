@@ -1,10 +1,27 @@
-// Floating right-hand Progress rail: quiet, real-time session timer, backlog & 7-day forecast,
-// global mastery breakdown, and contextual card/thread inspector.
+// Floating right-hand Progress rail: session clock, the explore-or-practice read, the due pile and
+// what it costs, mastery as a share solid, and the contextual card/thread inspector.
+// The full backlog, weekly rhythm and every topic live in ProgressView; the rail links there once
+// ("Overview") and steps back to the Session section alone while that view is open.
 import type { Depth } from "@myelin/core";
 import { createEffect, createMemo, createSignal, For, Match, onSettled, Show, Switch, useContext } from "solid-js";
 import { fetchProgress, type ProgressResponse } from "./drillApi.js";
 import { PracticeContext } from "./practiceStore.js";
+import {
+  BALANCE_LABEL,
+  BALANCE_ORDER,
+  BALANCE_SCALE,
+  barScale,
+  caughtUpCaption,
+  dueSplit,
+  effortCaption,
+  fmtMinutes,
+  sum,
+  weekCaption,
+} from "./progressCopy.js";
 import { plainSidebarText } from "./sidebar.js";
+
+/** Topics the fold lists; the rest are in the full view. */
+const RAIL_TOPICS = 5;
 
 const DEPTH_STEPS: readonly Depth[] = ["recall", "rebuild", "explain", "use"];
 
@@ -81,6 +98,22 @@ const ChevronIcon = () => (
   </svg>
 );
 
+const ArrowIcon = () => (
+  <svg
+    width="12"
+    height="12"
+    viewBox="0 0 12 12"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.5"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M2.25 6h7.5M6.75 3 9.75 6l-3 3" />
+  </svg>
+);
+
 function fmtClock(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(sec / 3600);
@@ -88,24 +121,6 @@ function fmtClock(ms: number): string {
   const s = sec % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-}
-
-function fmtMinutes(ms: number): string {
-  const m = Math.floor(Math.max(0, ms) / 60_000);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  const rem = m % 60;
-  return rem > 0 ? `${h}h ${rem}m` : `${h}h`;
-}
-
-function fmtWait(ms: number): string {
-  const m = Math.max(1, Math.round(ms / 60_000));
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  const remM = m % 60;
-  if (h < 24) return remM >= 5 ? `${h}h ${remM}m` : `${h}h`;
-  const d = Math.round(h / 24);
-  return `${d}d`;
 }
 
 function fmtLatencySec(ms: number): string {
@@ -161,6 +176,9 @@ export function ProgressRail(props: {
   overlay: boolean;
   revision: number;
   keepFresh?: boolean;
+  /** True while the full Progress view fills the stage: the rail keeps only its Session section. */
+  overviewOpen?: boolean;
+  onOpenOverview?: () => void;
   onData?: (data: ProgressResponse | null) => void;
   onCloseOverlay: () => void;
 }) {
@@ -324,11 +342,6 @@ export function ProgressRail(props: {
     return Boolean(d && d.mastery.total === 0 && d.session.practiced === 0);
   });
 
-  const forecastMax = createMemo(() => {
-    const f = data()?.backlog.forecast ?? [];
-    return Math.max(1, ...f);
-  });
-
   // One caption under the clock: today's time, then the sitting's count and first-try count.
   const sessionSummary = createMemo(() => {
     const s = data()?.session;
@@ -338,28 +351,35 @@ export function ProgressRail(props: {
     return parts.length > 0 ? parts.join(" · ") : "Nothing practiced yet";
   });
 
-  // One caption under "Due now": the non-empty split, or what comes next once the backlog is clear.
-  const dueCaption = createMemo(() => {
+  // Two captions under "Due now": what the pile costs, then how it splits. Once it is clear,
+  // one caption says what comes next.
+  const dueCaptions = createMemo(() => {
     const b = data()?.backlog;
-    if (!b) return "";
-    if (b.due.total === 0) {
-      const cleared = b.cleared_today > 0 ? ` · ${b.cleared_today} cleared today` : "";
-      return b.next_due_in_ms ? `Next due in ${fmtWait(b.next_due_in_ms)}${cleared}` : `All caught up${cleared}`;
-    }
-    return [
-      { n: b.due.new, label: "new" },
-      { n: b.due.review, label: "review" },
-      { n: b.due.shaky, label: "shaky" },
-    ]
-      .filter((p) => p.n > 0)
-      .map((p) => `${p.n} ${p.label}`)
-      .join(" · ");
+    if (!b) return [];
+    if (b.due.total === 0) return [caughtUpCaption(b)];
+    return [effortCaption(b), dueSplit(b.due)].filter(Boolean);
   });
 
-  const forecastLabel = createMemo(() => {
-    const f = data()?.backlog.forecast ?? [];
-    const later = f.slice(1).reduce((a, n) => a + n, 0);
-    return `Due over the next 7 days: ${f[0] ?? 0} today, ${later} later`;
+  // The days after today, scaled among themselves so today's pile never flattens them.
+  const upcoming = createMemo(() => {
+    const b = data()?.backlog;
+    const counts = b?.forecast_upcoming ?? [];
+    const scale = barScale(counts);
+    const days = b?.forecast_upcoming_days ?? [];
+    return counts.map((count, i) => ({ count, frac: scale[i] ?? 0, day: days[i] ?? `+${i + 1}d` }));
+  });
+  const upcomingTotal = createMemo(() => sum(upcoming().map((u) => u.count)));
+  const upcomingLabel = createMemo(() => {
+    const days = upcoming();
+    return `Due over the next ${days.length} days: ${upcomingTotal()}. ${days.map((u) => `${u.day} ${u.count}`).join(", ")}`;
+  });
+
+  const railTopics = createMemo(() => (data()?.mastery.topics ?? []).slice(0, RAIL_TOPICS));
+  const topicsCount = createMemo(() => {
+    const m = data()?.mastery;
+    const total = Math.max(m?.topics_total ?? 0, m?.topics.length ?? 0);
+    const shown = railTopics().length;
+    return shown < total ? `${shown} of ${total}` : String(total);
   });
 
   const toggleTopics = () => {
@@ -373,6 +393,11 @@ export function ProgressRail(props: {
 
   const onSelectTopic = (topic: string) => {
     practice.startTopicSitting(topic);
+    if (props.overlay) props.onCloseOverlay();
+  };
+
+  const openOverview = () => {
+    props.onOpenOverview?.();
     if (props.overlay) props.onCloseOverlay();
   };
 
@@ -444,7 +469,10 @@ export function ProgressRail(props: {
                 <div class="v2-rail-cap">{sessionSummary()}</div>
               </section>
 
-              {/* 2 & 3. Due + Mastery (or a calm note for brand-new learners) */}
+              {/* While the full Progress view is open the rail is the session clock and nothing else,
+                  so no figure is on screen twice. */}
+              <Show when={!props.overviewOpen}>
+              {/* 2-4. Balance, Due, Mastery (or a calm note for brand-new learners) */}
               <Show
                 when={!isNewLearner()}
                 fallback={
@@ -458,6 +486,25 @@ export function ProgressRail(props: {
                   </section>
                 }
               >
+                {/* 2. The read: practice first, balanced, or room to explore */}
+                <section class="v2-rail-sec">
+                  <div class="v2-rail-head">
+                    <span class="v2-rail-lead">{BALANCE_LABEL[d()?.balance.status ?? "balanced"]}</span>
+                    <span
+                      class={{ "v2-rail-pips": true, "is-balance": true, "is-warm": d()?.balance.status === "practice" }}
+                      role="img"
+                      aria-label={`Balance: ${BALANCE_LABEL[d()?.balance.status ?? "balanced"]}`}
+                      data-tip={BALANCE_SCALE}
+                    >
+                      <For each={BALANCE_ORDER}>
+                        {(step) => <i class={{ "is-on": step === (d()?.balance.status ?? "balanced") }} />}
+                      </For>
+                    </span>
+                  </div>
+                  <div class="v2-rail-cap">{d() ? weekCaption(d()!.balance) : ""}</div>
+                </section>
+
+                {/* 3. Due now: the pile, what it costs, how it splits, and what follows it */}
                 <section class="v2-rail-sec">
                   <div class="v2-rail-head">
                     <span class="v2-rail-lead">Due now</span>
@@ -465,35 +512,41 @@ export function ProgressRail(props: {
                       {d()?.backlog.due.total ?? 0}
                     </span>
                   </div>
-                  <div class="v2-rail-cap">{dueCaption()}</div>
+                  <For each={dueCaptions()}>{(line) => <div class="v2-rail-cap">{line}</div>}</For>
                   <div class="v2-rail-rows">
+                    <Show when={(d()?.backlog.due.total ?? 0) > 0 && (d()?.backlog.due_later_today ?? 0) > 0}>
+                      <div class="v2-rail-row">
+                        <span>Later today</span>
+                        <span>+{d()?.backlog.due_later_today ?? 0}</span>
+                      </div>
+                    </Show>
                     <div class="v2-rail-row">
-                      <span>Next 7 days</span>
-                      <span class="v2-rail-spark" role="img" aria-label={forecastLabel()}>
-                        <For each={d()?.backlog.forecast ?? []}>
-                          {(count, idx) => {
-                            const pct = () => (count > 0 ? Math.max(12, Math.round((count / forecastMax()) * 100)) : 0);
-                            return (
-                              <span data-tip={`${idx() === 0 ? "Today" : `+${idx()}d`}: ${count} due`}>
+                      <span>Next {upcoming().length} days</span>
+                      <span class="v2-rail-next" role="img" aria-label={upcomingLabel()}>
+                        <span class="v2-rail-spark" aria-hidden="true">
+                          <For each={upcoming()}>
+                            {(u) => (
+                              <span data-tip={`${u.day}: ${u.count} due`}>
                                 <i
-                                  class={{ "is-today": idx() === 0 }}
-                                  style={{ height: pct() > 0 ? `${pct()}%` : "2px" }}
+                                  class={{ "is-zero": u.count === 0 }}
+                                  style={{ height: u.count > 0 ? `${Math.max(3, Math.round(u.frac * 18))}px` : "2px" }}
                                 />
                               </span>
-                            );
-                          }}
-                        </For>
+                            )}
+                          </For>
+                        </span>
+                        <b class={{ "is-quiet": upcomingTotal() === 0 }}>{upcomingTotal()}</b>
                       </span>
                     </div>
                   </div>
                 </section>
 
+                {/* 4. Mastery: anchored on the share that is solid */}
                 <section class="v2-rail-sec">
                   <div class="v2-rail-head">
                     <span class="v2-rail-lead">Mastery</span>
                     <span class="v2-rail-value">
-                      {d()?.mastery.total ?? 0}
-                      <small>{(d()?.mastery.total ?? 0) === 1 ? "unit" : "units"}</small>
+                      {d()?.mastery.solid_pct ?? 0}%<small>solid</small>
                     </span>
                   </div>
                   <Show when={(d()?.mastery.total ?? 0) > 0}>
@@ -520,7 +573,7 @@ export function ProgressRail(props: {
                       </span>
                     </div>
                   </Show>
-                  <Show when={(d()?.mastery.topics.length ?? 0) > 0}>
+                  <Show when={railTopics().length > 0}>
                     <button
                       type="button"
                       class={{ "v2-rail-fold": true, "is-open": topicsOpen() }}
@@ -530,11 +583,11 @@ export function ProgressRail(props: {
                     >
                       <span>Topics</span>
                       <ChevronIcon />
-                      <span>{d()?.mastery.topics.length ?? 0}</span>
+                      <span>{topicsCount()}</span>
                     </button>
                     <Show when={topicsOpen()}>
                       <div class="v2-rail-rows" id="v2-rail-topics">
-                        <For each={d()?.mastery.topics ?? []}>
+                        <For each={railTopics()}>
                           {(t) => {
                             const name = plainSidebarText(t.topic) || t.topic;
                             return (
@@ -554,9 +607,19 @@ export function ProgressRail(props: {
                     </Show>
                   </Show>
                 </section>
+
+                {/* The one way into the full Progress view: a footer row under the global sections */}
+                <Show when={props.onOpenOverview}>
+                  <section class="v2-rail-sec v2-rail-foot">
+                    <button type="button" class="v2-rail-row v2-rail-go" onClick={openOverview}>
+                      <span>Overview</span>
+                      <ArrowIcon />
+                    </button>
+                  </section>
+                </Show>
               </Show>
 
-              {/* 4. Contextual section: This card or This thread (hidden on the sitting-done receipt) */}
+              {/* 5. Contextual section: This card or This thread (hidden on the sitting-done receipt) */}
               <Show when={!isSittingDone()}>
                 <Switch>
                   <Match when={(() => { const f = d()?.focus; return f?.kind === "unit" ? f : null; })()}>
@@ -658,6 +721,7 @@ export function ProgressRail(props: {
                     </section>
                   </Match>
                 </Switch>
+              </Show>
               </Show>
             </>
           )}

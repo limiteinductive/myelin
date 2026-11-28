@@ -100,6 +100,7 @@ export type Stage =
   | { kind: "frontier"; frontierId: string }
   | { kind: "exploration"; explorationId: string }
   | { kind: "sitting-done" }
+  | { kind: "progress" }
   | { kind: "explore" };
 
 export interface PracticeState {
@@ -173,6 +174,7 @@ export function emptyExploreSession(): ExploreSession {
 
 export function sessionKeyForStage(stage: Stage): string {
   if (stage.kind === "explore" || stage.kind === "sitting-done") return "__explore__";
+  if (stage.kind === "progress") return "__progress__";
   if (stage.kind === "frontier") return `briefing:${stage.frontierId}`;
   if (stage.kind === "exploration") return `explore:${stage.explorationId}`;
   return stage.unitId;
@@ -359,6 +361,8 @@ function hydratePractice(userId: string): Partial<PersistedPractice> | null {
         stage = { kind: "exploration", explorationId: parsed.stage.explorationId };
       } else if (parsed.stage.kind === "sitting-done") {
         stage = { kind: "sitting-done" };
+      } else if (parsed.stage.kind === "progress") {
+        stage = { kind: "progress" };
       }
     }
 
@@ -493,6 +497,7 @@ export interface PracticeStore {
   selectFrontier(frontierId: string): void;
   selectExploration(explorationId: string): void;
   selectExplore(): void;
+  selectProgress(): void;
   showSittingDone(): void;
   startExplorationFrom(exp: SavedExploration): void;
   addFrontier(frontier: Frontier): void;
@@ -912,6 +917,17 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
       s.manualPracticeUnitId = null;
       s.mapOpen = false;
       s.stage = { kind: "explore" };
+    });
+    markDirty();
+  };
+
+  const selectProgress = () => {
+    settleActiveExploration();
+    setState((s) => {
+      s.justCompletedId = null;
+      s.manualPracticeUnitId = null;
+      s.mapOpen = false;
+      s.stage = { kind: "progress" };
     });
     markDirty();
   };
@@ -1409,7 +1425,10 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     settleActiveExploration();
     const cap = Math.max(1, Math.min(SITTING_LIMIT, Math.round(limit)));
     const snap = snapshot(state);
-    const matchesTopic = (u: QueueUnit) => (u.topic ?? "").trim().toLowerCase() === cleanTopic;
+    const matchesTopic = (u: QueueUnit) => {
+      const normalized = (u.topic ?? "").trim().toLowerCase();
+      return cleanTopic === "general" ? normalized === "" || normalized === "general" : normalized === cleanTopic;
+    };
     const dueTopic = snap.queue.filter((u) => matchesTopic(u) && u.due).slice(0, cap);
     if (dueTopic.length > 0) {
       const batch = dueTopic.map((u) => u.unit_id);
@@ -1955,6 +1974,7 @@ export function createPracticeStore(userId: string, opts: { autoLoad?: boolean }
     selectFrontier,
     selectExploration,
     selectExplore,
+    selectProgress,
     showSittingDone,
     startExplorationFrom,
     addFrontier,

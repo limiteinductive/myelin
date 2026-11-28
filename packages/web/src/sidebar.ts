@@ -124,6 +124,8 @@ export function plainSidebarText(raw: string): string {
   // Display and inline TeX blocks
   s = s.replace(/\$\$([^$]+)\$\$/g, (_, inner: string) => simplifyTex(inner));
   s = s.replace(/(?<!\\)\$([^$\n]+)\$/g, (_, inner: string) => simplifyTex(inner));
+  // Unclosed trailing inline TeX fragment from source truncation (e.g. "projects $x")
+  s = s.replace(/(?<!\\)\$([a-zA-Z\\][^$\n]*)$/, (_, inner: string) => simplifyTex(inner));
   // Inline code & emphasis
   s = s.replace(/`([^`]+)`/g, "$1");
   s = s.replace(/\*\*([^*]+)\*\*/g, "$1");

@@ -361,6 +361,27 @@ export interface ProgressFocusExploration {
   saving: boolean;
 }
 
+export interface ProgressTopic {
+  topic: string;
+  units: number;
+  due: number;
+  shaky: number;
+  solid: number;
+  learning: number;
+  new: number;
+  due_later_today: number;
+}
+
+export interface ProgressActivityDay {
+  label: string;
+  initial: string;
+  added: number;
+  practiced: number;
+  passed: number;
+}
+
+export type BalanceStatus = "practice" | "balanced" | "explore";
+
 export interface ProgressResponse {
   as_of: number;
   session: {
@@ -373,17 +394,37 @@ export interface ProgressResponse {
   };
   backlog: {
     due: { total: number; new: number; review: number; shaky: number };
+    due_later_today: number;
+    estimated_minutes: number;
+    median_rep_ms: number;
+    sittings_left: number;
     cleared_today: number;
     next_due_in_ms: number | null;
     forecast: number[];
     forecast_days: string[];
+    forecast_upcoming: number[];
+    forecast_upcoming_days: string[];
+  };
+  balance: {
+    status: BalanceStatus;
+    added_7d: number;
+    added_24h: number;
+    practiced_7d: number;
+    passed_7d: number;
+    first_try_7d: number;
+    active_ms_7d: number;
+    activity_7d: ProgressActivityDay[];
   };
   mastery: {
     total: number;
     solid: number;
+    solid_pct: number;
     learning: number;
     new: number;
-    topics: { topic: string; units: number; due: number }[];
+    at_risk: number;
+    depth_counts: { recall: number; rebuild: number; explain: number; use: number };
+    topics_total: number;
+    topics: ProgressTopic[];
   };
   focus: ProgressFocusUnit | ProgressFocusExploration | null;
 }

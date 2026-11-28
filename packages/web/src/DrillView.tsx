@@ -1008,6 +1008,7 @@ export function DrillView() {
       if (citeEditor()) setCiteEditor(null);
     };
     const onKey = (e: KeyboardEvent) => {
+      if (practice.state.stage.kind === "progress") return;
       if (citeEditor()) {
         if (e.key === "Escape") {
           e.preventDefault();

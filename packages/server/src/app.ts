@@ -1205,6 +1205,14 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     }
   }
 
+  function localWeekdayShort(ts: number, tz: string): string {
+    try {
+      return new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "short" }).format(ts) || "·";
+    } catch {
+      return "·";
+    }
+  }
+
   app.get("/api/progress", (c) => {
     const { user } = c.get("session");
     const store = stores.get(user.id);
@@ -1222,18 +1230,48 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       dayBounds.push(localDayStartMs(dayBounds[i - 1]! + 26 * 3_600_000, tz));
     }
     const forecastDays: string[] = [];
+    const forecastLabels: string[] = [];
     for (let i = 0; i < 7; i++) {
-      forecastDays.push(localWeekdayInitial(dayBounds[i]! + 12 * 3_600_000, tz));
+      const midday = dayBounds[i]! + 12 * 3_600_000;
+      forecastDays.push(localWeekdayInitial(midday, tz));
+      forecastLabels.push(localWeekdayShort(midday, tz));
     }
+
+    // Build exact local day boundaries for the past 7 calendar days ending today:
+    // pastBounds[0..6] = start of each day (6 days ago .. today), pastBounds[7] = tomorrow midnight.
+    const pastBounds: number[] = new Array(8);
+    pastBounds[6] = dayStart;
+    pastBounds[7] = dayBounds[1]!;
+    for (let i = 5; i >= 0; i--) {
+      pastBounds[i] = localDayStartMs(pastBounds[i + 1]! - 12 * 3_600_000, tz);
+    }
+    const activity7d = Array.from({ length: 7 }, (_, i) => {
+      const midday = pastBounds[i]! + 12 * 3_600_000;
+      return {
+        label: localWeekdayShort(midday, tz),
+        initial: localWeekdayInitial(midday, tz),
+        added: 0,
+        practiced: 0,
+        passed: 0,
+      };
+    });
+    const pastDayIndex = (ts: number): number => {
+      if (ts < pastBounds[0]! || ts >= pastBounds[7]!) return -1;
+      for (let i = 6; i >= 0; i--) {
+        if (ts >= pastBounds[i]!) return i;
+      }
+      return -1;
+    };
 
     // Active time & session boundary (session = activity since last >30m inactivity gap).
     const SESSION_GAP_MS = 30 * 60_000;
-    const recentEvents = store.readSinceTs(dayStart - 6 * 3_600_000);
+    const recentEvents = store.readSinceTs(pastBounds[0]! - 6 * 3_600_000);
     const marks: Mark[] = [];
     for (const ev of recentEvents) {
       for (const m of marksOf(ev)) addMark(marks, m);
     }
     const todayActiveMs = activeMs(marks, dayStart, now);
+    const activeMs7d = activeMs(marks, pastBounds[0]!, now);
     let sessionStart = now;
     if (marks.length > 0 && now - marks[marks.length - 1]!.at <= SESSION_GAP_MS) {
       let i = marks.length - 1;
@@ -1244,14 +1282,40 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     }
     const sessionActiveMs = sessionStart < now ? activeMs(marks, sessionStart, now) : 0;
 
-    // Daily probe counts & first-try / cleared counts from state.evidence.
+    // Daily + 7-day probe counts, first-try / cleared counts, and 30-day median rep latency.
+    const latencyWindowStart = now - 30 * 86_400_000;
+    const probeLatencies: number[] = [];
     let practiced = 0;
     let firstTry = 0;
+    let practiced7d = 0;
+    let passed7d = 0;
+    let firstTry7d = 0;
     const latestTodayGradeByUnit = new Map<string, { ts: number; grade: Grade | null }>();
     for (const ev of Object.values(state.evidence)) {
-      if (ev.source !== "probe" || ev.at < dayStart || ev.slot === "in_context") continue;
+      if (ev.source !== "probe" || ev.slot === "in_context") continue;
+      if (
+        ev.at >= latencyWindowStart &&
+        typeof ev.latency_ms === "number" &&
+        ev.latency_ms >= 2_000 &&
+        ev.latency_ms <= 900_000
+      ) {
+        probeLatencies.push(ev.latency_ms);
+      }
+      const isPass = Boolean(ev.grade && ev.grade !== "again");
+      const isFirstTry = isPass && (ev.hints ?? 0) === 0;
+      const dIdx = pastDayIndex(ev.at);
+      if (dIdx >= 0) {
+        practiced7d++;
+        activity7d[dIdx]!.practiced++;
+        if (isPass) {
+          passed7d++;
+          activity7d[dIdx]!.passed++;
+        }
+        if (isFirstTry) firstTry7d++;
+      }
+      if (ev.at < dayStart) continue;
       practiced++;
-      if (ev.grade && ev.grade !== "again" && (ev.hints ?? 0) === 0) firstTry++;
+      if (isFirstTry) firstTry++;
       const prev = latestTodayGradeByUnit.get(ev.unit_id);
       if (!prev || ev.at >= prev.ts) {
         latestTodayGradeByUnit.set(ev.unit_id, { ts: ev.at, grade: ev.grade });
@@ -1261,6 +1325,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     for (const entry of latestTodayGradeByUnit.values()) {
       if (entry.grade && entry.grade !== "again") clearedToday++;
     }
+    probeLatencies.sort((a, b) => a - b);
+    const rawMedianMs =
+      probeLatencies.length >= 5
+        ? probeLatencies[Math.floor(probeLatencies.length / 2)]!
+        : 60_000;
+    const medianRepMs = Math.max(30_000, Math.min(150_000, Math.round(rawMedianMs)));
 
     const activeRun = currentRun(state.runs);
     const runInfo = activeRun
@@ -1272,7 +1342,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
       : null;
 
-    // Backlog, 7-day forecast, mastery breakdown, and top topics.
+    // Backlog, 7-day forecast, 7-day intake, mastery & depth breakdown, and full topic list.
     const { scores } = scoreAll(state, store.scheduler, now, store.listUnitDueOverrides());
     const activeUnits = Object.values(state.units).filter((u) => u.status === "active" && !u.observe_only);
 
@@ -1280,12 +1350,29 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     let dueNew = 0;
     let dueReview = 0;
     let dueShaky = 0;
+    let dueLaterToday = 0;
     let nextDueInMs: number | null = null;
     const forecast = [0, 0, 0, 0, 0, 0, 0];
 
     let solid = 0;
     let newTotal = 0;
-    const topicMap = new Map<string, { topic: string; units: number; due: number }>();
+    let atRisk = 0;
+    let added7d = 0;
+    let added24h = 0;
+    const depthCounts: Record<Depth, number> = { recall: 0, rebuild: 0, explain: 0, use: 0 };
+    const topicMap = new Map<
+      string,
+      {
+        topic: string;
+        units: number;
+        due: number;
+        shaky: number;
+        solid: number;
+        learning: number;
+        new: number;
+        due_later_today: number;
+      }
+    >();
 
     for (const u of activeUnits) {
       const s = scores.get(u.id);
@@ -1294,19 +1381,37 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const nextIn = s?.next_in_ms ?? null;
       const schedKind = s?.schedule_kind;
       const isDue = reviews === 0 || (nextIn !== null ? nextIn <= 0 : pImm < 0.85);
+      const isNew = reviews === 0;
+      const isSolid = !isNew && reviews >= 2 && pImm >= 0.88;
+      const isShaky = !isNew && (pImm < 0.78 || schedKind === "relearn" || schedKind === "lapse");
 
-      if (reviews === 0) newTotal++;
-      else if (reviews >= 2 && pImm >= 0.88) solid++;
+      depthCounts[pickDrillDepth(u, state)]++;
 
+      const addedIdx = pastDayIndex(u.found_at);
+      if (addedIdx >= 0) {
+        added7d++;
+        activity7d[addedIdx]!.added++;
+      }
+      if (u.found_at >= now - 86_400_000) added24h++;
+
+      if (isNew) newTotal++;
+      else if (isSolid) solid++;
+      if (isShaky) atRisk++;
+
+      let isLaterToday = false;
       if (isDue) {
         dueTotal++;
         forecast[0]!++;
-        if (reviews === 0) dueNew++;
-        else if (pImm < 0.78 || schedKind === "relearn" || schedKind === "lapse") dueShaky++;
+        if (isNew) dueNew++;
+        else if (isShaky) dueShaky++;
         else dueReview++;
       } else if (nextIn !== null && nextIn > 0) {
         if (nextDueInMs === null || nextIn < nextDueInMs) nextDueInMs = nextIn;
         const dueAt = now + nextIn;
+        if (dueAt < dayBounds[1]!) {
+          dueLaterToday++;
+          isLaterToday = true;
+        }
         if (dueAt < dayBounds[7]!) {
           for (let d = 0; d < 7; d++) {
             if (dueAt < dayBounds[d + 1]!) {
@@ -1317,20 +1422,49 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         }
       }
 
-      const rawTopic = (u.topic ?? "").trim();
-      if (rawTopic) {
-        const key = rawTopic.toLowerCase();
-        const cur = topicMap.get(key) ?? { topic: rawTopic, units: 0, due: 0 };
-        cur.units++;
-        if (isDue) cur.due++;
-        topicMap.set(key, cur);
+      const rawTopic = (u.topic ?? "").trim() || "General";
+      const key = rawTopic.toLowerCase();
+      const cur = topicMap.get(key) ?? {
+        topic: rawTopic,
+        units: 0,
+        due: 0,
+        shaky: 0,
+        solid: 0,
+        learning: 0,
+        new: 0,
+        due_later_today: 0,
+      };
+      cur.units++;
+      if (isNew) cur.new++;
+      else if (isSolid) cur.solid++;
+      else cur.learning++;
+      if (isDue) {
+        cur.due++;
+        if (isShaky) cur.shaky++;
+      } else if (isLaterToday) {
+        cur.due_later_today++;
       }
+      topicMap.set(key, cur);
     }
 
     const learning = Math.max(0, activeUnits.length - solid - newTotal);
-    const topics = [...topicMap.values()]
-      .sort((a, b) => b.due - a.due || b.units - a.units || a.topic.localeCompare(b.topic))
-      .slice(0, 5);
+    const solidPct = activeUnits.length > 0 ? Math.round((solid / activeUnits.length) * 100) : 0;
+    const topicsAll = [...topicMap.values()].sort(
+      (a, b) => b.due - a.due || b.shaky - a.shaky || b.units - a.units || a.topic.localeCompare(b.topic),
+    );
+    const topics = topicsAll.slice(0, 50);
+
+    const SITTING_SIZE = 8;
+    const estimatedMinutes = dueTotal === 0 ? 0 : Math.max(1, Math.round((dueTotal * medianRepMs) / 60_000));
+    const sittingsLeft = dueTotal === 0 ? 0 : Math.ceil(dueTotal / SITTING_SIZE);
+    const balanceStatus: "practice" | "balanced" | "explore" =
+      activeUnits.length === 0
+        ? "explore"
+        : dueTotal >= 16 || dueShaky >= 8 || estimatedMinutes >= 20
+          ? "practice"
+          : dueTotal <= 8 && dueShaky <= 2 && dueTotal + dueLaterToday <= 12
+            ? "explore"
+            : "balanced";
 
     // Contextual focus: never expose unit.text (which is the answer).
     let focus:
@@ -1406,16 +1540,36 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       },
       backlog: {
         due: { total: dueTotal, new: dueNew, review: dueReview, shaky: dueShaky },
+        due_later_today: dueLaterToday,
+        estimated_minutes: estimatedMinutes,
+        median_rep_ms: medianRepMs,
+        sittings_left: sittingsLeft,
         cleared_today: clearedToday,
         next_due_in_ms: dueTotal === 0 ? nextDueInMs : null,
         forecast,
         forecast_days: forecastDays,
+        forecast_upcoming: forecast.slice(1),
+        forecast_upcoming_days: forecastLabels.slice(1),
+      },
+      balance: {
+        status: balanceStatus,
+        added_7d: added7d,
+        added_24h: added24h,
+        practiced_7d: practiced7d,
+        passed_7d: passed7d,
+        first_try_7d: firstTry7d,
+        active_ms_7d: activeMs7d,
+        activity_7d: activity7d,
       },
       mastery: {
         total: activeUnits.length,
         solid,
+        solid_pct: solidPct,
         learning,
         new: newTotal,
+        at_risk: atRisk,
+        depth_counts: depthCounts,
+        topics_total: topicMap.size,
         topics,
       },
       focus,

@@ -5,6 +5,7 @@ import { watchActivity } from "./activity.js";
 import { extractSelectionText, selectionHasMath } from "./cite.js";
 import { DrillView } from "./DrillView.js";
 import { formatMobileProgressReadout, ProgressRail } from "./ProgressRail.js";
+import { ProgressView } from "./ProgressView.js";
 import { createPracticeStore, PracticeContext, sessionHasWork, sessionKeyForStage, type Stage } from "./practiceStore.js";
 import { login, SignInError, Sync, type Me } from "./sync.js";
 import { formatSidebarDrillLabel, plainSidebarText, sidebarLayout } from "./sidebar.js";
@@ -368,7 +369,9 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
           ? { kind: "frontier", frontierId: s.frontierId }
           : s.kind === "exploration"
             ? { kind: "exploration", explorationId: s.explorationId }
-            : { kind: "explore" };
+            : s.kind === "progress"
+              ? { kind: "progress" }
+              : { kind: "explore" };
     return { stage };
   });
 
@@ -399,6 +402,7 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
     if (s.kind === "unit") practice.selectUnit(s.unitId);
     else if (s.kind === "exploration") practice.selectExploration(s.explorationId);
     else if (s.kind === "frontier") practice.selectFrontier(s.frontierId);
+    else if (s.kind === "progress") practice.selectProgress();
     else practice.selectExplore();
   };
 
@@ -569,6 +573,32 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
       practice.startNextSitting();
       closeSidebarOnNarrow();
     }
+  };
+
+  const isProgress = () => practice.state.stage.kind === "progress";
+
+  const progressPracticeLabel = (): string | null => {
+    if (!practice.sittingFinished() && practice.dueQueue().length > 0) return "Continue sitting";
+    if (practice.backlogDueCount() > 0) return "Start sitting";
+    return null;
+  };
+
+  const openPracticeFromProgress = () => {
+    if (practice.sittingFinished() && practice.backlogDueCount() > 0) {
+      practice.startNextSitting();
+      closeSidebarOnNarrow();
+      return;
+    }
+    openPractice();
+  };
+
+  const closeProgress = () => {
+    if (canGoBack()) {
+      goBack();
+      return;
+    }
+    if (canOpenPractice()) openPractice();
+    else practice.selectExplore();
   };
 
   const mobileReadout = createMemo(() =>
@@ -849,7 +879,18 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
           </header>
 
           <div class="v2-body">
-            <DrillView />
+            <div class={{ "v2-stage-hidden": isProgress() }}>
+              <DrillView />
+            </div>
+            <Show when={isProgress()}>
+              <ProgressView
+                data={progressData()}
+                practiceLabel={progressPracticeLabel()}
+                onPractice={openPracticeFromProgress}
+                onExplore={practice.selectExplore}
+                onClose={closeProgress}
+              />
+            </Show>
           </div>
 
           <ProgressRail
@@ -857,7 +898,9 @@ function Workspace(props: { session: Me; go: (s: Screen) => void }) {
             open={railOpen()}
             overlay={railOverlay()}
             revision={progressRev()}
-            keepFresh={narrow()}
+            keepFresh={narrow() || isProgress()}
+            overviewOpen={isProgress()}
+            onOpenOverview={practice.selectProgress}
             onData={setProgressData}
             onCloseOverlay={() => setRailOverlayOpen(false)}
           />

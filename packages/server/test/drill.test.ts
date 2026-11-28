@@ -993,8 +993,39 @@ describe("v2 drill and map API", () => {
     expect(progUnitRes.status).toBe(200);
     const progUnit = (await progUnitRes.json()) as {
       session: { practiced: number; first_try: number };
-      backlog: { due: { total: number; new: number; review: number; shaky: number }; cleared_today: number; forecast: number[]; forecast_days: string[] };
-      mastery: { total: number; solid: number; learning: number; new: number; topics: { topic: string; units: number; due: number }[] };
+      backlog: {
+        due: { total: number; new: number; review: number; shaky: number };
+        due_later_today: number;
+        estimated_minutes: number;
+        median_rep_ms: number;
+        sittings_left: number;
+        cleared_today: number;
+        forecast: number[];
+        forecast_days: string[];
+        forecast_upcoming: number[];
+        forecast_upcoming_days: string[];
+      };
+      balance: {
+        status: "practice" | "balanced" | "explore";
+        added_7d: number;
+        added_24h: number;
+        practiced_7d: number;
+        passed_7d: number;
+        first_try_7d: number;
+        active_ms_7d: number;
+        activity_7d: { label: string; initial: string; added: number; practiced: number; passed: number }[];
+      };
+      mastery: {
+        total: number;
+        solid: number;
+        solid_pct: number;
+        learning: number;
+        new: number;
+        at_risk: number;
+        depth_counts: { recall: number; rebuild: number; explain: number; use: number };
+        topics_total: number;
+        topics: { topic: string; units: number; due: number; shaky: number; solid: number; learning: number; new: number; due_later_today: number }[];
+      };
       focus: { kind: string; unit_id?: string; reviews?: number; text?: string } | null;
     };
     expect(progUnit.session.practiced).toBe(1);
@@ -1002,7 +1033,24 @@ describe("v2 drill and map API", () => {
     expect(progUnit.backlog.cleared_today).toBe(1);
     expect(progUnit.backlog.forecast).toHaveLength(7);
     expect(progUnit.backlog.forecast_days).toHaveLength(7);
+    expect(progUnit.backlog.forecast_upcoming).toHaveLength(6);
+    expect(progUnit.backlog.forecast_upcoming_days).toHaveLength(6);
+    expect(progUnit.backlog.median_rep_ms).toBeGreaterThanOrEqual(30_000);
+    expect(progUnit.backlog.due_later_today).toBeGreaterThanOrEqual(0);
+    expect(["practice", "balanced", "explore"]).toContain(progUnit.balance.status);
+    expect(progUnit.balance.activity_7d).toHaveLength(7);
+    expect(progUnit.balance.practiced_7d).toBe(1);
+    expect(progUnit.balance.passed_7d).toBe(1);
+    expect(progUnit.balance.added_7d).toBeGreaterThanOrEqual(2);
     expect(progUnit.mastery.total).toBeGreaterThanOrEqual(2);
+    expect(progUnit.mastery.solid_pct).toBeGreaterThanOrEqual(0);
+    expect(progUnit.mastery.topics_total).toBe(progUnit.mastery.topics.length);
+    const depthTotal =
+      progUnit.mastery.depth_counts.recall +
+      progUnit.mastery.depth_counts.rebuild +
+      progUnit.mastery.depth_counts.explain +
+      progUnit.mastery.depth_counts.use;
+    expect(depthTotal).toBe(progUnit.mastery.total);
     expect(progUnit.focus?.kind).toBe("unit");
     expect(progUnit.focus?.unit_id).toBe(created.unit_id);
     expect(progUnit.focus?.reviews).toBe(1);

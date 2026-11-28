@@ -854,7 +854,9 @@ body,
 /* ---------- Floating Right-Hand Progress Rail ----------
    One anchor per section, and only one display figure in the whole rail (the session clock).
    Four tiers: clock (display) > anchors (label, medium, ink-1) > key/value rows (label, ink-3 key)
-   > captions and section labels (meta, ink-3). Everything sits on a 4px grid with 32px rows. */
+   > captions and section labels (meta, ink-3). Everything sits on a 4px grid with 32px rows.
+   Sections, top to bottom: Session, the balance read, Due now, Mastery, then the card or thread
+   in focus. While the full Progress view is open only Session renders. */
 .v2-rail {
   --v2-rail-w: 296px;
   --v2-rail-pad: 20px;
@@ -1100,6 +1102,29 @@ button.v2-rail-row:hover,
 .v2-rail-fold + .v2-rail-rows {
   margin-top: 0;
 }
+
+/* The rail's one way into the full Progress view: a footer section holding a single row, in
+   ink-1, with an arrow that leans on hover. */
+.v2-rail-foot {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  display: flex;
+  flex-direction: column;
+}
+button.v2-rail-go {
+  color: var(--v2-ink-1);
+  font-weight: 500;
+}
+.v2-rail-go svg {
+  width: 12px;
+  height: 12px;
+  color: var(--v2-ink-3);
+  transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), color 120ms ease;
+}
+.v2-rail-go:hover svg {
+  color: var(--v2-ink-1);
+  transform: translateX(2px);
+}
 button.v2-rail-row:focus,
 .v2-rail-fold:focus,
 .v2-rail-target button:focus {
@@ -1112,11 +1137,24 @@ button.v2-rail-row:focus-visible,
   outline-offset: -1px;
 }
 
-/* 7-day forecast as an inline sparkline: one row instead of a chart block. */
+/* The days after today as an inline sparkline with their sum beside it. Today's pile is the
+   section's anchor and is never a bar here, so the bars are scaled among themselves and a
+   backlog cannot flatten them. A day with nothing due is a faint 2px stub. */
+.v2-rail-next {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+.v2-rail-next b {
+  min-width: 16px;
+  font-weight: 400;
+  text-align: right;
+}
 .v2-rail-spark {
   height: 18px;
   display: grid;
-  grid-template-columns: repeat(7, 8px);
+  grid-auto-flow: column;
+  grid-auto-columns: 8px;
   gap: 4px;
 }
 .v2-rail-spark span {
@@ -1128,11 +1166,11 @@ button.v2-rail-row:focus-visible,
   width: 100%;
   min-height: 2px;
   border-radius: 1.5px;
-  background: color-mix(in srgb, var(--v2-fg) 18%, transparent);
+  background: color-mix(in srgb, var(--v2-fg) 40%, transparent);
   transition: height 220ms ease;
 }
-.v2-rail-spark i.is-today {
-  background: color-mix(in srgb, var(--v2-fg) 60%, transparent);
+.v2-rail-spark i.is-zero {
+  background: var(--v2-hairline);
 }
 
 /* Mastery: one bar, one caption. The caption's numbers step down in tone with the bar. */
@@ -1218,6 +1256,16 @@ button.v2-rail-row:focus-visible,
 .v2-rail-pips i.is-on {
   background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
 }
+/* Balance: three positions (practice first, balanced, room to explore) with only the current one
+   lit. The practice end is the one place the rail takes a warm tint. */
+.v2-rail-pips.is-balance {
+  flex: none;
+  align-items: center;
+  height: 16px;
+}
+.v2-rail-pips.is-balance.is-warm i.is-on {
+  background: var(--v2-warn);
+}
 .v2-rail-note {
   margin: 4px 0 0;
   font: var(--v2-type-meta);
@@ -1229,12 +1277,545 @@ button.v2-rail-row:focus-visible,
 @media (prefers-reduced-motion: reduce) {
   .v2-rail,
   .v2-rail-fold svg,
+  .v2-rail-go svg,
   .v2-rail-spark i,
   .v2-rail-track i {
     animation: none;
     transition-duration: 0s;
   }
 }
+
+/* ---------- Full Progress view (stage.kind === "progress") ----------
+   One boxless page in the main column: the read and its two actions, then Backlog, Past 7 days,
+   Mastery and Topics, each opened by a hairline and a whisper label. Three tiers, the same as the
+   rail: one display line (the read), section figures (prompt, medium, ink-1), and rows and
+   captions (label and meta). Charts are ink in tonal steps; the only tint is the warm mark on
+   shaky units. Everything sits on the 4px grid. */
+.v2-pv {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 20px 24px 96px;
+  box-sizing: border-box;
+  color: var(--v2-ink-2);
+  font: var(--v2-type-label);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  animation: v2-in 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.v2-pv-top {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.v2-pv-label {
+  margin: 0;
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  letter-spacing: var(--v2-track-meta);
+  color: var(--v2-ink-3);
+}
+.v2-pv-close {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-right: -10px;
+}
+
+/* The read */
+.v2-pv-lede {
+  padding: 28px 0 44px;
+}
+.v2-pv-title-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+.v2-pv-title {
+  margin: 0;
+  font: var(--v2-type-display);
+  letter-spacing: var(--v2-track-display);
+  color: var(--v2-ink-1);
+}
+.v2-pv-read {
+  margin: 12px 0 0;
+  max-width: 34em;
+  font: var(--v2-type-body);
+  color: var(--v2-ink-3);
+  text-wrap: pretty;
+}
+.v2-pv-read b {
+  font-weight: 500;
+  color: var(--v2-ink-1);
+}
+.v2-pv-actions {
+  margin-top: 24px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+/* Sections */
+.v2-pv-sec {
+  padding: 16px 0 40px;
+  border-top: 1px solid var(--v2-hairline-soft);
+}
+.v2-pv-sec:last-child {
+  padding-bottom: 0;
+}
+.v2-pv-head {
+  min-height: 24px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.v2-pv-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  column-gap: 56px;
+  row-gap: 32px;
+  align-items: start;
+}
+
+/* A section figure with its unit ("32 due now"), or a quiet sub-head on the same line box. */
+.v2-pv-stat {
+  margin: 0;
+  font: var(--v2-type-body-sm);
+  line-height: 28px;
+  color: var(--v2-ink-3);
+}
+.v2-pv-stat b {
+  margin-right: 2px;
+  font: var(--v2-type-prompt);
+  letter-spacing: var(--v2-track-prompt);
+  color: var(--v2-ink-1);
+}
+.v2-pv-stat.is-quiet b {
+  color: var(--v2-ink-3);
+}
+.v2-pv-stat.is-sub b {
+  font: var(--v2-type-body-sm);
+  font-weight: 500;
+  line-height: 28px;
+  letter-spacing: 0;
+}
+.v2-pv-cap {
+  margin: 4px 0 0;
+  font: var(--v2-type-label);
+  font-weight: 400;
+  line-height: 20px;
+  color: var(--v2-ink-3);
+  text-wrap: pretty;
+}
+
+/* One slim bar in tonal steps. Mastery: solid, learning, new. Due: shaky, review, new. */
+.v2-pv-seg {
+  margin-top: 16px;
+  height: 6px;
+  display: flex;
+  gap: 2px;
+}
+.v2-pv-seg i {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: 1px;
+}
+.v2-pv-seg i:first-child {
+  border-top-left-radius: 3px;
+  border-bottom-left-radius: 3px;
+}
+.v2-pv-seg i:last-child {
+  border-top-right-radius: 3px;
+  border-bottom-right-radius: 3px;
+}
+.v2-pv-seg .is-solid {
+  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
+}
+.v2-pv-seg .is-learning {
+  background: color-mix(in srgb, var(--v2-fg) 34%, transparent);
+}
+.v2-pv-seg .is-new {
+  background: color-mix(in srgb, var(--v2-fg) 12%, transparent);
+}
+.v2-pv-seg .is-shaky {
+  background: color-mix(in srgb, var(--v2-warn) 82%, transparent);
+}
+.v2-pv-seg + .v2-pv-cap {
+  margin-top: 10px;
+}
+.v2-pv-seg.is-slim {
+  margin-top: 0;
+  height: 4px;
+}
+.v2-pv-legend span + span::before {
+  content: "·";
+  margin: 0 6px;
+}
+.v2-pv-legend b {
+  font-weight: 500;
+}
+.v2-pv-legend span:nth-child(1) b {
+  color: var(--v2-ink-1);
+}
+.v2-pv-legend span:nth-child(2) b {
+  color: var(--v2-ink-2);
+}
+
+/* Key/value rows under a figure. */
+.v2-pv-kv {
+  margin: 12px 0 0;
+}
+.v2-pv-kv > div {
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.v2-pv-kv dt {
+  display: inline-flex;
+  align-items: center;
+  color: var(--v2-ink-3);
+}
+.v2-pv-kv dd {
+  margin: 0;
+  color: var(--v2-ink-1);
+}
+.v2-pv-kv dd.is-quiet {
+  color: var(--v2-ink-3);
+}
+.v2-pv-key {
+  flex: none;
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 8px;
+  border-radius: 2px;
+}
+.v2-pv-key.is-added {
+  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
+}
+.v2-pv-key.is-passed {
+  background: color-mix(in srgb, var(--v2-fg) 28%, transparent);
+}
+.v2-pv-key.is-shaky {
+  background: color-mix(in srgb, var(--v2-warn) 82%, transparent);
+}
+
+/* Next days: one bar per day with its count above and its weekday below, scaled among
+   themselves and never against today's pile. */
+.v2-pv-bars {
+  margin-top: 8px;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
+  column-gap: 8px;
+}
+.v2-pv-bar-col {
+  height: 104px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+}
+.v2-pv-bar-col i {
+  display: block;
+  width: 100%;
+  max-width: 28px;
+  margin-top: 6px;
+  border-radius: 2px 2px 0 0;
+  background: color-mix(in srgb, var(--v2-fg) 40%, transparent);
+  transition: height 220ms ease;
+}
+.v2-pv-bar-col i.is-zero {
+  background: var(--v2-hairline);
+}
+.v2-pv-bar-val {
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  color: var(--v2-ink-1);
+}
+.v2-pv-bar-val.is-quiet {
+  color: var(--v2-ink-3);
+}
+.v2-pv-bar-day {
+  margin-top: 8px;
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  color: var(--v2-ink-3);
+}
+
+/* Past 7 days: a chart standing on its own table. Each day is one column; the paired bars
+   (added, passed) share a scale, and the same column carries the day's numbers underneath. */
+.v2-pv-flow-row {
+  min-height: 28px;
+  display: grid;
+  grid-template-columns: 80px repeat(7, minmax(0, 1fr)) 56px;
+  align-items: center;
+  color: var(--v2-ink-1);
+}
+.v2-pv-flow-row > * {
+  text-align: center;
+}
+.v2-pv-flow-row > :first-child {
+  display: inline-flex;
+  align-items: center;
+  text-align: left;
+  color: var(--v2-ink-2);
+}
+.v2-pv-flow-row > :last-child {
+  text-align: right;
+}
+.v2-pv-flow-row.is-bars {
+  height: 80px;
+  align-items: end;
+  border-bottom: 1px solid var(--v2-hairline-soft);
+}
+.v2-pv-pair {
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 3px;
+}
+.v2-pv-pair i {
+  display: block;
+  width: 10px;
+  border-radius: 2px 2px 0 0;
+  transition: height 220ms ease;
+}
+.v2-pv-pair .is-added {
+  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
+}
+.v2-pv-pair .is-passed {
+  background: color-mix(in srgb, var(--v2-fg) 28%, transparent);
+}
+.v2-pv-pair i.is-zero {
+  background: var(--v2-hairline);
+}
+.v2-pv-flow-row.is-days {
+  min-height: 32px;
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  color: var(--v2-ink-3);
+}
+.v2-pv-flow-row.is-days .is-today {
+  color: var(--v2-ink-1);
+}
+.v2-pv-flow-row .is-zero,
+.v2-pv-flow-row.is-quiet,
+.v2-pv-flow-row.is-quiet > :first-child {
+  color: var(--v2-ink-3);
+}
+.v2-pv-flow-row .is-total {
+  font-weight: 500;
+}
+.v2-pv-flow-row.is-quiet .is-total {
+  font-weight: 400;
+}
+
+/* Depth ladder: four rungs, each a tonal step darker than the one before. */
+.v2-pv-ladder {
+  margin-top: 4px;
+}
+.v2-pv-ladder > div {
+  height: 32px;
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) 28px;
+  column-gap: 12px;
+  align-items: center;
+}
+.v2-pv-ladder > div > :first-child {
+  color: var(--v2-ink-3);
+  text-transform: capitalize;
+}
+.v2-pv-ladder > div > :last-child {
+  text-align: right;
+  color: var(--v2-ink-1);
+}
+.v2-pv-ladder .is-quiet {
+  color: var(--v2-ink-3);
+}
+.v2-pv-ladder-bar {
+  height: 6px;
+  display: flex;
+}
+.v2-pv-ladder-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  transition: width 220ms ease;
+}
+.v2-pv-ladder [data-step="1"] i {
+  background: color-mix(in srgb, var(--v2-fg) 18%, transparent);
+}
+.v2-pv-ladder [data-step="2"] i {
+  background: color-mix(in srgb, var(--v2-fg) 34%, transparent);
+}
+.v2-pv-ladder [data-step="3"] i {
+  background: color-mix(in srgb, var(--v2-fg) 52%, transparent);
+}
+.v2-pv-ladder [data-step="4"] i {
+  background: color-mix(in srgb, var(--v2-fg) 72%, transparent);
+}
+
+/* Topics: a quiet two-way filter, then one row per topic. */
+.v2-pv-filter {
+  display: inline-flex;
+  gap: 2px;
+  margin-right: -8px;
+}
+.v2-pv-filter button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 7px;
+  font: var(--v2-type-meta);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-3);
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.v2-pv-filter button:hover:not(:disabled) {
+  color: var(--v2-ink-1);
+}
+.v2-pv-filter button.is-on {
+  background: var(--v2-quiet-fill);
+  color: var(--v2-ink-1);
+}
+.v2-pv-filter button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.v2-pv-topics {
+  margin: -8px -8px 0;
+  display: flex;
+  flex-direction: column;
+}
+.v2-pv-topic {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  min-height: 40px;
+  padding: 0 8px;
+  border-radius: 8px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px 36px 120px;
+  column-gap: 16px;
+  align-items: center;
+  font: var(--v2-type-label);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-ink-2);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+.v2-pv-topic:hover {
+  background: color-mix(in srgb, var(--v2-fg) 5%, transparent);
+}
+.v2-pv-topic-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--v2-ink-1);
+}
+.v2-pv-topic-bar {
+  display: block;
+}
+.v2-pv-topic-ratio {
+  text-align: right;
+  color: var(--v2-ink-3);
+}
+.v2-pv-topic-due {
+  text-align: right;
+  white-space: nowrap;
+}
+.v2-pv-topic-due.is-quiet {
+  color: var(--v2-ink-3);
+}
+.v2-pv-topic:focus,
+.v2-pv-filter button:focus {
+  outline: none;
+}
+.v2-pv-topic:focus-visible,
+.v2-pv-filter button:focus-visible {
+  outline: 1px solid var(--v2-border-strong);
+  outline-offset: -1px;
+}
+
+@media (max-width: 600px) {
+  .v2-pv {
+    padding: 12px 20px 72px;
+  }
+  .v2-pv-lede {
+    padding: 20px 0 36px;
+  }
+  .v2-pv-sec {
+    padding-bottom: 32px;
+  }
+  .v2-pv-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .v2-pv-flow-row {
+    grid-template-columns: 68px repeat(7, minmax(0, 1fr)) 36px;
+  }
+  .v2-pv-pair {
+    gap: 2px;
+  }
+  .v2-pv-pair i {
+    width: 8px;
+  }
+  /* A topic takes two lines on a phone: its name and what is due, then its bar and ratio. */
+  .v2-pv-topic {
+    min-height: 56px;
+    padding: 8px;
+    grid-template-columns: 96px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "name name due"
+      "bar ratio ratio";
+    column-gap: 12px;
+    row-gap: 6px;
+  }
+  .v2-pv-topic-name {
+    grid-area: name;
+  }
+  .v2-pv-topic-due {
+    grid-area: due;
+  }
+  .v2-pv-topic-bar {
+    grid-area: bar;
+  }
+  .v2-pv-topic-ratio {
+    grid-area: ratio;
+    text-align: left;
+    font: var(--v2-type-meta);
+    font-weight: 400;
+  }
+  .v2-pv-filter button {
+    height: 32px;
+    padding: 0 12px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .v2-pv,
+  .v2-pv-bar-col i,
+  .v2-pv-pair i,
+  .v2-pv-ladder-bar i {
+    animation: none;
+    transition-duration: 0s;
+  }
+}
+
 .v2-stage-hidden {
   display: none !important;
 }
