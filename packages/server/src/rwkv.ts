@@ -1430,7 +1430,9 @@ export function pickSynthesisCluster(
 }
 
 const CODE_CUE_RE =
-  /(\bdef\s|\btorch\.|\bnp\.|\beinsum\b|\bdim=|\bkeepdim|\bbackward\b|\bforward\b|\bpython\b|\bpytorch\b|`[^`]+`)/i;
+  /(\bdef\s+\w|\bclass\s+\w|\breturn\b|\btorch\.|\bnp\.|\beinsum\b|\bdim=|\bkeepdim|\bpython\b|\bpytorch\b|\btriton\b|\bjax\.|\bfunction\s+\w|```)/i;
+
+const CONCEPTUAL_KINDS = new Set(["concept", "pitfall", "fact", "intuition", "knowledge", "definition", "distinction"]);
 
 const FORMULA_CUE_RE =
   /(\\frac|\\sum|\\prod|\\partial|\\nabla|\\int|\bO\(|[A-Za-z0-9_)\]]\s*=\s*[^=])/i;
@@ -1480,7 +1482,9 @@ export function pickRepModality(
   const lastGrade = probes.at(-1)?.grade ?? null;
 
   if (passes === 0 || lastGrade === "again") {
-    if (CODE_CUE_RE.test(u.text)) return "faded_skeleton";
+    // Conceptual / explanatory units stay open-response (never coerced into cryptic code blanks
+    // just because they mention a token like `.mean(-1)` or "backward").
+    if (!CONCEPTUAL_KINDS.has(kind) && CODE_CUE_RE.test(u.text)) return "faded_skeleton";
     if (
       FORMULA_CUE_RE.test(u.text) &&
       (kind === "move" || kind === "mechanism" || kind === "rule" || kind === "result") &&
@@ -1516,7 +1520,8 @@ export function pickDrillDepth(u: Unit, state?: State): Depth {
         ev.source === "probe" &&
         ev.modality !== "mcq" &&
         ev.grade !== null &&
-        ev.grade !== "again",
+        ev.grade !== "again" &&
+        (ev.hints ?? 0) < 2,
     );
 
   const passes = probes.length;

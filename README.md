@@ -48,7 +48,7 @@ Put environment variables in `.env` (never committed):
 
 - **Option 1 — Local Antigravity CLI subscription (no API key needed):**
   - `MYELIN_MODEL=agy`
-  - `MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low` (Explorations stay on `gemini-4-neon-low`; fast Drill checks auto-route to `gemini-4-hydrogen-low`; override with `MYELIN_EXPLORE_MODEL` / `MYELIN_DRILL_MODEL`)
+  - `MYELIN_JUDGE_MODEL=agy/gemini-4-neon-low` (all coaching, clarification, exploration, and prompt roles inherit this verbatim with zero silent downgrades; override any specific role explicitly with `MYELIN_DRILL_MODEL`, `MYELIN_CLARIFY_MODEL`, `MYELIN_EXPLORE_MODEL`, `MYELIN_PROMPT_MODEL`, `MYELIN_SIDECAR_MODEL`, or `MYELIN_TIDY_MODEL`)
 - **Option 2 — OpenRouter API:**
   - `OPENROUTER_API_KEY=...`
   - `MYELIN_JUDGE_MODEL=...` (optional model override)

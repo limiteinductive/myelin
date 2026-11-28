@@ -50,13 +50,15 @@ export interface AgyAcpOptions {
 }
 
 export interface AgyAcpAskOptions {
-  /** Model ID to run this turn on (e.g. "gemini-4-hydrogen-low", "gemini-4-neon-low", "gemini-4-neon-high"). */
+  /** Model ID to run this turn on (e.g. "gemini-4-neon-low", "gemini-4-neon-high"). */
   modelId?: string | undefined;
   /** Optional stable session key (e.g. "drill:<attemptId>", "explore:<expId>") for stateful KV prefix reuse. */
   sessionKey?: string | undefined;
   /** System instructions appended via `_meta.antigravity.systemPrompt.append` on session creation. */
   systemPrompt?: string | undefined;
-  /** Optional turn count guard: if caller's expected prior turns differs from cached session turns, rotate cleanly. */
+  /** Optional lean delta prompt used atomically ONLY when `sessionKey` is still warm & matches `expectedPriorTurns` at execution time. */
+  deltaPrompt?: string | undefined;
+  /** Optional turn count guard: if caller's expected prior turns differs from cached session turns, rotate cleanly and send full prompt. */
   expectedPriorTurns?: number | undefined;
   /** Optional base64 data URL of a sketch image sent natively as an ACP image block. */
   sketchDataUrl?: string | null | undefined;
@@ -460,9 +462,9 @@ export class AgyAcpClient {
 
   async ask(prompt: string, opts: AgyAcpAskOptions = {}): Promise<string> {
     if (opts.signal?.aborted) throw makeAbortError();
+    const enqueuedAt = Date.now();
 
     const run = async (): Promise<string> => {
-      const enqueuedAt = Date.now();
       if (opts.signal?.aborted) throw makeAbortError();
 
       const wasCold = !this.proc || this.proc.killed || this.initializedAt === null;
@@ -522,7 +524,9 @@ export class AgyAcpClient {
         throw makeAbortError();
       }
 
-      const contentBlocks: Record<string, unknown>[] = [{ type: "text", text: prompt }];
+      // Atomic payload selection: send deltaPrompt ONLY when this queued turn actually reused the matching warm session.
+      const activePrompt = sessionReused && opts.deltaPrompt ? opts.deltaPrompt : prompt;
+      const contentBlocks: Record<string, unknown>[] = [{ type: "text", text: activePrompt }];
       if (opts.sketchDataUrl) {
         const m = /^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/.exec(opts.sketchDataUrl);
         if (m && m[1] && m[2]) {
@@ -601,7 +605,7 @@ export class AgyAcpClient {
             thinking_ms: thinkingMs,
             ttft_raw_ms: ttftRawMs,
             llm_ms: Math.max(0, now - writtenAt),
-            prompt_chars: prompt.length,
+            prompt_chars: activePrompt.length,
             output_chars: turn.text.length,
             input_tokens: usage?.inputTokens,
             cache_read_tokens: usage?.cachedReadTokens,

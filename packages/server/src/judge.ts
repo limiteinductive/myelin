@@ -190,6 +190,8 @@ export interface JudgeInput {
   existingUnits?: string[];
   /** Lean always-loaded learner memory profile (learner.md) built by offline Dreaming. */
   learnerMemory?: string | null | undefined;
+  /** Compact evidence-grounded related concepts (prerequisites, recent demonstrations) to bridge from naturally. */
+  relatedEvidence?: string[] | undefined;
   latencyMs: number | null;
   hintsUsed: number;
 }
@@ -350,17 +352,53 @@ export interface ExploreSidecarResult {
   failed?: boolean | undefined;
 }
 
+export type ClarifyHelpLevel = "none" | "hint" | "step" | "solution" | "unknown";
+
+export type ModelRole = "explore" | "drill" | "clarify" | "prompt" | "sidecar" | "tidy";
+
+export interface ResolvedRoleModel {
+  role: ModelRole;
+  provider: "agy" | "openrouter";
+  model: string;
+  slug?: string | undefined;
+  effort: string;
+  source: "option" | "env" | "base";
+}
+
+export interface ModelRouting {
+  base: {
+    provider: "agy" | "openrouter";
+    model: string;
+    slug?: string | undefined;
+    effort: string;
+  };
+  explore: ResolvedRoleModel;
+  drill: ResolvedRoleModel;
+  clarify: ResolvedRoleModel;
+  prompt: ResolvedRoleModel;
+  sidecar: ResolvedRoleModel;
+  tidy: ResolvedRoleModel;
+}
+
 export interface JudgeOptions {
   apiKey?: string | undefined;
   jevModel?: string | undefined;
   llmModel?: string | undefined;
-  /** Optional dedicated fast model for Drill check/follow-up/hint/tidy (also via MYELIN_DRILL_MODEL). */
+  /** Optional explicit model override for Drill checks/follow-ups/hints (also via MYELIN_DRILL_MODEL). Inherits llmModel by default. */
   drillModel?: string | undefined;
-  /** Optional dedicated model for Explorations/Briefings (also via MYELIN_EXPLORE_MODEL). */
+  /** Optional explicit model override for Drill clarifications (also via MYELIN_CLARIFY_MODEL). Inherits llmModel by default. */
+  clarifyModel?: string | undefined;
+  /** Optional explicit model override for Explorations/Briefings/Audits (also via MYELIN_EXPLORE_MODEL). Inherits llmModel by default. */
   exploreModel?: string | undefined;
-  /** Reasoning effort for System 2 (e.g. "low" | "medium" | "high"). Default "medium". */
+  /** Optional explicit model override for prompt/MCQ/Dream generation (also via MYELIN_PROMPT_MODEL). Inherits llmModel by default. */
+  promptModel?: string | undefined;
+  /** Optional explicit model override for async Explore crystallization/titles (also via MYELIN_SIDECAR_MODEL). Inherits llmModel by default. */
+  sidecarModel?: string | undefined;
+  /** Optional explicit model override for cosmetic draft formatting (also via MYELIN_TIDY_MODEL). Inherits llmModel by default. */
+  tidyModel?: string | undefined;
+  /** Reasoning effort for OpenRouter System 2 (e.g. "low" | "medium" | "high"). Default "medium". */
   llmEffort?: string | undefined;
-  /** Path to `agy` binary when `llmModel` starts with `agy` (e.g. `agy/gemini-4-neon-low`). */
+  /** Path to `agy` binary when any role starts with `agy` (e.g. `agy/gemini-4-neon-low`). */
   agyBinary?: string | undefined;
   /** Transport for `agy`: `"acp"` (default persistent multiplexed daemon) or `"stream-json"`. */
   agyTransport?: "acp" | "stream-json" | undefined;
@@ -385,6 +423,70 @@ const CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_JEV = "typesafe/jev-1.14";
 const DEFAULT_LLM = "google/gemini-4-neon";
 const DEFAULT_EFFORT = "medium";
+export const PROMPT_POLICY_VERSION = "v6";
+
+function isAgySpec(spec: string): boolean {
+  return spec === "agy" || spec.startsWith("agy/");
+}
+
+function parseRoleSpec(
+  role: ModelRole,
+  rawModel: string,
+  effort: string,
+  source: "option" | "env" | "base",
+): ResolvedRoleModel {
+  const model = rawModel.trim();
+  const provider: "agy" | "openrouter" = isAgySpec(model) ? "agy" : "openrouter";
+  return {
+    role,
+    provider,
+    model,
+    slug: provider === "agy" ? stripAgyPrefix(model) : undefined,
+    effort,
+    source,
+  };
+}
+
+/**
+ * Single source of truth for per-role model & provider resolution.
+ * Invariant: NO silent downgrades or suffix rewrites. Every role inherits `llmModel`
+ * (or `MYELIN_JUDGE_MODEL`) verbatim unless explicitly overridden via options or its own env var.
+ */
+export function resolveModelRouting(
+  opts: Pick<
+    JudgeOptions,
+    "llmModel" | "llmEffort" | "exploreModel" | "drillModel" | "clarifyModel" | "promptModel" | "sidecarModel" | "tidyModel"
+  > = {},
+  env: Record<string, string | undefined> = process.env,
+): ModelRouting {
+  const baseModel = opts.llmModel?.trim() || env.MYELIN_JUDGE_MODEL?.trim() || DEFAULT_LLM;
+  const effort = opts.llmEffort?.trim() || env.MYELIN_JUDGE_EFFORT?.trim() || DEFAULT_EFFORT;
+  const baseProvider: "agy" | "openrouter" = isAgySpec(baseModel) ? "agy" : "openrouter";
+  const base = {
+    provider: baseProvider,
+    model: baseModel,
+    slug: baseProvider === "agy" ? stripAgyPrefix(baseModel) : undefined,
+    effort,
+  };
+
+  const pick = (role: ModelRole, optVal: string | undefined, envKey: string): ResolvedRoleModel => {
+    const o = optVal?.trim();
+    if (o) return parseRoleSpec(role, o, effort, "option");
+    const e = env[envKey]?.trim();
+    if (e) return parseRoleSpec(role, e, effort, "env");
+    return parseRoleSpec(role, baseModel, effort, "base");
+  };
+
+  return {
+    base,
+    explore: pick("explore", opts.exploreModel, "MYELIN_EXPLORE_MODEL"),
+    drill: pick("drill", opts.drillModel, "MYELIN_DRILL_MODEL"),
+    clarify: pick("clarify", opts.clarifyModel, "MYELIN_CLARIFY_MODEL"),
+    prompt: pick("prompt", opts.promptModel, "MYELIN_PROMPT_MODEL"),
+    sidecar: pick("sidecar", opts.sidecarModel, "MYELIN_SIDECAR_MODEL"),
+    tidy: pick("tidy", opts.tidyModel, "MYELIN_TIDY_MODEL"),
+  };
+}
 
 function parseResourceDirs(explicit?: string[]): string[] {
   const raw =
@@ -1024,23 +1126,30 @@ export class FastJudge {
   private readonly apiKey: string | undefined;
   private readonly jevModel: string;
   private readonly jevEnabled: boolean;
+  readonly routing: ModelRouting;
   private readonly llmModel: string;
   private readonly isAgy: boolean;
   private readonly drillModel: string;
+  private readonly clarifyModel: string;
   private readonly exploreModel: string;
   private readonly promptModel: string;
   private readonly sidecarModel: string;
+  private readonly tidyModel: string;
   private readonly drillSlug: string | undefined;
+  private readonly clarifySlug: string | undefined;
   private readonly exploreSlug: string | undefined;
   private readonly promptSlug: string | undefined;
   private readonly sidecarSlug: string | undefined;
+  private readonly tidySlug: string | undefined;
   private readonly llmEffort: string;
   private readonly acpClient: AgyAcpClient | null;
   private readonly agyWorker: AgyJudgeWorker | null;
   private readonly drillWorker: AgyJudgeWorker | null;
+  private readonly clarifyWorker: AgyJudgeWorker | null;
   private readonly promptWorker: AgyJudgeWorker | null;
   private readonly plannerWorker: AgyJudgeWorker | null;
   private readonly sidecarWorker: AgyJudgeWorker | null;
+  private readonly tidyWorker: AgyJudgeWorker | null;
   private readonly cachePath: string | undefined;
   private readonly perf: PerfLog | undefined;
   private readonly passThreshold: number;
@@ -1053,57 +1162,62 @@ export class FastJudge {
   constructor(opts: JudgeOptions = {}) {
     this.apiKey = opts.apiKey ?? process.env.OPENROUTER_API_KEY;
     this.jevModel = opts.jevModel ?? process.env.MYELIN_JEV_MODEL ?? DEFAULT_JEV;
-    this.llmModel = opts.llmModel ?? process.env.MYELIN_JUDGE_MODEL ?? DEFAULT_LLM;
-    this.llmEffort = opts.llmEffort ?? process.env.MYELIN_JUDGE_EFFORT ?? DEFAULT_EFFORT;
-    this.isAgy = this.llmModel === "agy" || this.llmModel.startsWith("agy/");
+    this.routing = resolveModelRouting(opts, process.env);
+    this.llmModel = this.routing.base.model;
+    this.llmEffort = this.routing.base.effort;
+
+    const roles: ResolvedRoleModel[] = [
+      this.routing.explore,
+      this.routing.drill,
+      this.routing.clarify,
+      this.routing.prompt,
+      this.routing.sidecar,
+      this.routing.tidy,
+    ];
+    this.isAgy = roles.some((r) => r.provider === "agy");
     this.jevEnabled =
-      opts.enableJev ?? (process.env.MYELIN_ENABLE_JEV === "1" ? true : !this.isAgy && Boolean(this.apiKey));
+      opts.enableJev ??
+      (process.env.MYELIN_ENABLE_JEV === "1" ? true : this.routing.drill.provider !== "agy" && Boolean(this.apiKey));
 
-    const baseSlug = this.isAgy ? stripAgyPrefix(this.llmModel) : undefined;
-    // Explorations stay on a strong reasoning model (e.g. gemini-4-neon-low) unless explicitly overridden.
-    this.exploreModel = opts.exploreModel ?? process.env.MYELIN_EXPLORE_MODEL?.trim() ?? this.llmModel;
-    this.exploreSlug = this.isAgy ? stripAgyPrefix(this.exploreModel) ?? baseSlug : undefined;
-
-    // Fast rubric-guided Drill checks/follow-ups/hints/tidy default to gemini-4-hydrogen-low on agy
-    // (when llmModel is agy or agy/gemini-4-neon-*) while preserving explicit user overrides.
-    const explicitDrill = opts.drillModel ?? process.env.MYELIN_DRILL_MODEL?.trim();
-    if (explicitDrill) {
-      this.drillModel = explicitDrill;
-    } else if (this.isAgy && (!baseSlug || /^gemini-4-neon-/.test(baseSlug))) {
-      this.drillModel = "agy/gemini-4-hydrogen-low";
-    } else {
-      this.drillModel = this.llmModel;
-    }
-    this.drillSlug = this.isAgy ? stripAgyPrefix(this.drillModel) ?? baseSlug : undefined;
-
-    // Background prompt generation, briefings, and Dream consolidation keep high reasoning.
-    const promptModelEnv = process.env.MYELIN_PROMPT_MODEL?.trim();
-    const derivedPromptSlug = promptModelEnv?.startsWith("agy/")
-      ? stripAgyPrefix(promptModelEnv)
-      : this.exploreSlug
-        ? this.exploreSlug.replace(/-(minimal|low|medium)$/, "-high")
-        : undefined;
-    this.promptSlug = this.isAgy ? derivedPromptSlug : undefined;
-    this.promptModel = this.isAgy ? (derivedPromptSlug ? `agy/${derivedPromptSlug}` : this.exploreModel) : promptModelEnv || this.llmModel;
-
-    // Async Explore unit-crystallization & title sidecar (runs off the hot path).
-    const sidecarEnv = process.env.MYELIN_SIDECAR_MODEL?.trim();
-    this.sidecarModel = sidecarEnv || (this.isAgy ? "agy/gemini-4-hydrogen-medium" : this.exploreModel);
-    this.sidecarSlug = this.isAgy ? stripAgyPrefix(this.sidecarModel) ?? this.drillSlug : undefined;
+    this.exploreModel = this.routing.explore.model;
+    this.exploreSlug = this.routing.explore.slug;
+    this.drillModel = this.routing.drill.model;
+    this.drillSlug = this.routing.drill.slug;
+    this.clarifyModel = this.routing.clarify.model;
+    this.clarifySlug = this.routing.clarify.slug;
+    this.promptModel = this.routing.prompt.model;
+    this.promptSlug = this.routing.prompt.slug;
+    this.sidecarModel = this.routing.sidecar.model;
+    this.sidecarSlug = this.routing.sidecar.slug;
+    this.tidyModel = this.routing.tidy.model;
+    this.tidySlug = this.routing.tidy.slug;
 
     const agyBin = opts.agyBinary ?? process.env.MYELIN_AGY_BIN;
     const resourceDirs = parseResourceDirs(opts.resourceDirs);
     const transport = opts.agyTransport ?? (process.env.MYELIN_AGY_TRANSPORT === "stream-json" ? "stream-json" : "acp");
 
     this.acpClient = this.isAgy && transport === "acp" ? new AgyAcpClient({ binary: agyBin, resourceDirs }) : null;
-    this.agyWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.exploreSlug, true, resourceDirs, 55_000, 8, this.llmEffort) : null;
-    this.drillWorker =
-      this.isAgy && this.drillSlug !== this.exploreSlug
-        ? new AgyJudgeWorker(agyBin, this.drillSlug, true, resourceDirs, 55_000, 8, this.llmEffort)
-        : this.agyWorker;
-    this.promptWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.promptSlug, false, [], 55_000, 8) : null;
-    this.plannerWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.promptSlug, true, resourceDirs, 120_000, 8) : null;
-    this.sidecarWorker = this.isAgy ? new AgyJudgeWorker(agyBin, this.sidecarSlug, false, [], 45_000, 8) : null;
+    // Share fallback stream-json workers per (slug, allowTools, timeout) so identical roles reuse one warm worker,
+    // while any role resolved to OpenRouter gets `null` here and routes strictly via OpenRouter.
+    const workerPool = new Map<string, AgyJudgeWorker>();
+    const workerFor = (role: ResolvedRoleModel, allowTools: boolean, timeoutMs: number): AgyJudgeWorker | null => {
+      if (role.provider !== "agy") return null;
+      const key = `${role.slug ?? "default"}|${allowTools ? 1 : 0}|${timeoutMs}`;
+      let w = workerPool.get(key);
+      if (!w) {
+        w = new AgyJudgeWorker(agyBin, role.slug, allowTools, allowTools ? resourceDirs : [], timeoutMs, 8, role.effort);
+        workerPool.set(key, w);
+      }
+      return w;
+    };
+
+    this.agyWorker = workerFor(this.routing.explore, true, 55_000);
+    this.drillWorker = workerFor(this.routing.drill, true, 55_000);
+    this.clarifyWorker = workerFor(this.routing.clarify, true, 55_000);
+    this.promptWorker = workerFor(this.routing.prompt, false, 55_000);
+    this.plannerWorker = workerFor(this.routing.prompt, true, 120_000);
+    this.sidecarWorker = workerFor(this.routing.sidecar, false, 45_000);
+    this.tidyWorker = workerFor(this.routing.tidy, false, 25_000);
 
     // Eagerly pre-warm the active transport in the background (0 LLM tokens) so Turn 1 skips cold init.
     if (this.acpClient) {
@@ -1119,6 +1233,22 @@ export class FastJudge {
     this.gapCeiling = opts.gapCeiling ?? 0.3;
     this.fetchFn = opts.fetchFn ?? fetch;
     this.loadPromptCache();
+  }
+
+  getModelRouting(): ModelRouting {
+    return this.routing;
+  }
+
+  formatModelRouting(): string {
+    const fmt = (r: ResolvedRoleModel) => `${r.role}=${r.model}${r.source !== "base" ? `(${r.source})` : ""}`;
+    return [
+      fmt(this.routing.drill),
+      fmt(this.routing.clarify),
+      fmt(this.routing.explore),
+      fmt(this.routing.prompt),
+      fmt(this.routing.sidecar),
+      fmt(this.routing.tidy),
+    ].join(" ");
   }
 
   private loadPromptCache(): void {
@@ -1200,11 +1330,21 @@ export class FastJudge {
 
   close(): void {
     this.acpClient?.dispose();
-    this.agyWorker?.dispose();
-    if (this.drillWorker && this.drillWorker !== this.agyWorker) this.drillWorker.dispose();
-    this.promptWorker?.dispose();
-    this.plannerWorker?.dispose();
-    this.sidecarWorker?.dispose();
+    const disposed = new Set<AgyJudgeWorker>();
+    for (const w of [
+      this.agyWorker,
+      this.drillWorker,
+      this.clarifyWorker,
+      this.promptWorker,
+      this.plannerWorker,
+      this.sidecarWorker,
+      this.tidyWorker,
+    ]) {
+      if (w && !disposed.has(w)) {
+        disposed.add(w);
+        w.dispose();
+      }
+    }
   }
 
   private buildPerf(
@@ -1291,14 +1431,14 @@ export class FastJudge {
     onTrace?: ((trace: AgyTurnTrace) => void) | undefined;
   }): Promise<{ raw: string; worker: PerfWorker }> {
     if (this.acpClient && !this.acpClient.isUnsupported) {
-      const canDelta =
-        Boolean(params.sessionKey && params.deltaPrompt) &&
-        this.acpClient.isSessionWarm(params.sessionKey!, params.modelId, params.systemPrompt, params.expectedPriorTurns);
+      // Pass BOTH full userPrompt and optional deltaPrompt into ACP so full-vs-delta selection
+      // executes atomically inside ACP's per-session queue (eliminating eviction/stale-session races).
       const acpOpts: AgyAcpAskOptions = {
         modelId: params.modelId,
         sessionKey: params.sessionKey,
         systemPrompt: params.systemPrompt,
-        expectedPriorTurns: canDelta ? params.expectedPriorTurns : undefined,
+        deltaPrompt: params.deltaPrompt,
+        expectedPriorTurns: params.expectedPriorTurns,
         sketchDataUrl: params.sketchDataUrl,
         timeoutMs: params.timeoutMs,
         signal: params.signal,
@@ -1306,7 +1446,7 @@ export class FastJudge {
         onTrace: params.onTrace,
       };
       try {
-        const raw = await this.acpClient.ask(canDelta ? params.deltaPrompt! : params.userPrompt, acpOpts);
+        const raw = await this.acpClient.ask(params.userPrompt, acpOpts);
         return { raw, worker: "acp" };
       } catch (err) {
         if (isAbortError(err) || !this.acpClient.isUnsupported) throw err;
@@ -1593,6 +1733,9 @@ export class FastJudge {
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
+      input.relatedEvidence?.length
+        ? `Recently worked related concepts (use to bridge naturally when helpful; respect evidence strength—do NOT claim unconditional mastery if assisted/MCQ):\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
+        : "",
       `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
       input.showPivot ? 'Resolution mode: SHOW_ANSWER (learner clicked Show answer — state the clean answer in 1-3 whiteboard sentences and close the rep with ok=true, grade="again").' : "",
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
@@ -1616,7 +1759,7 @@ export class FastJudge {
     let ttftProseMs: number | undefined;
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.drillWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
     try {
       let raw = "";
       if (this.drillWorker) {
@@ -1767,6 +1910,8 @@ export class FastJudge {
       existingUnits?: string[];
       activeHabits?: string[];
       learnerMemory?: string | null | undefined;
+      relatedEvidence?: string[] | undefined;
+      expectedPriorTurns?: number | undefined;
       attempt: string;
       feedback: string;
       turns: { role: "user" | "assistant"; text: string }[];
@@ -1807,6 +1952,9 @@ export class FastJudge {
       `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
       input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
       input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "",
+      input.relatedEvidence?.length
+        ? `Recently worked related concepts (use to bridge naturally when helpful; respect evidence strength—do NOT claim unconditional mastery if assisted/MCQ):\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
+        : "",
       `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
       resolutionNote,
       input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
@@ -1824,7 +1972,7 @@ export class FastJudge {
     ]
       .filter(Boolean)
       .join("\n");
-    const expectedPriorTurns = 1 + Math.floor(input.turns.length / 2);
+    const expectedPriorTurns = input.expectedPriorTurns ?? 1 + Math.floor(input.turns.length / 2);
 
     const userContent: unknown = input.sketchDataUrl
       ? [
@@ -1837,7 +1985,7 @@ export class FastJudge {
     let ttftProseMs: number | undefined;
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.drillWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
     try {
       let raw = "";
       if (this.drillWorker) {
@@ -1944,70 +2092,113 @@ export class FastJudge {
   }
 
   /**
-   * Answers an explicit clarifying question on an open drill WITHOUT invoking the grader,
-   * closing the rep, or spoiling the target answer.
+   * Answers a learner question on an open drill without invoking the grader or closing the rep.
+   * Distinguishes neutral setup/notation clarifications from genuine mechanism/derivation impasses:
+   * on impasses it writes out concrete intermediate steps cleanly (never evasive hand-waving),
+   * and on repeated impasses or explicit requests it teaches the full derivation cleanly while
+   * reporting exact `help_level` so the server applies honest spaced-repetition grading.
    */
   async clarifyDrill(
     input: {
+      sessionKey?: string | undefined;
+      expectedPriorTurns?: number | undefined;
       prompt: string;
       starter?: string | null | undefined;
       unitText: string;
       question: string;
       turns: { role: "user" | "assistant"; text: string }[];
+      priorClarifyCount?: number | undefined;
       learnerMemory?: string | null | undefined;
+      relatedEvidence?: string[] | undefined;
     },
     onText?: (partialMessage: string) => void,
     onPerf?: (rec: PerfRecord) => void,
     signal?: AbortSignal,
-  ): Promise<{ message: string; substantive_help: boolean; failed?: boolean }> {
+  ): Promise<{ message: string; substantive_help: boolean; help_level: ClarifyHelpLevel; failed?: boolean }> {
     const t0 = Date.now();
-    if (!this.apiKey && !this.isAgy) {
+    if (!this.apiKey && !this.clarifyWorker) {
       return {
         message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL to ask clarifying questions.",
         substantive_help: false,
+        help_level: "none",
         failed: true,
       };
     }
 
-    const sys = `You are Myelin's learning partner answering a clarifying question while a practice prompt is still open.
-Rules:
-- Answer the learner's question directly and naturally (notation, definitions, axes, shapes, setup, terminology) and stop there.
-- NEVER reveal, compute, or hint at the target answer or fill-in-the-blank solutions. If they explicitly ask for the answer, let them know they can click "Show answer" whenever they want.
-- NEVER nag them to fill in the blanks or write out the answer ("Whenever you're ready, write out...")—the input is right in front of them.
-- Set substantive_help=true ONLY if you had to explain an underlying domain concept or mechanism beyond neutral notation/wording/setup clarification.
-- Put math variables/shapes in $...$ and code identifiers in backticks. Answer directly with ZERO tool calls.
-- Return ONLY valid JSON with "message" FIRST so prose streams cleanly: {"message": string, "substantive_help": boolean}`;
+    const sys = `You are Myelin's sharp, peer-level learning partner helping a learner during an open practice prompt.
+Your goal is real understanding—NEVER evasive hand-waving, circular restatement, or exam-proctor secrecy.
+
+Match your response to the learner's actual question:
+1. NEUTRAL CLARIFICATION (help_level="none", substantive_help=false):
+   - Notation, variable names, tensor shapes, axes, or prompt wording.
+   - Answer directly and concisely, then stop. Do NOT leak the answer or nag them to fill in the box.
+2. SMALL NUDGE (help_level="hint", substantive_help=true):
+   - Learner has a specific hypothesis or asks a targeted sanity-check question.
+   - Confirm or correct that exact step clearly without jumping frameworks.
+3. MECHANISM / DERIVATION IMPASSE (help_level="step", substantive_help=true):
+   - Learner says they don't understand how to compute/derive something or asks how a branch/step works.
+   - Commit to ONE coherent framework (match the learner's own framing first—e.g. finish the chain-rule algebra before introducing a geometric picture).
+   - Write out the concrete intermediate equations explicitly (NEVER wave away key derivatives with phrases like "when you work out ∂s/∂x_i and factor s out...").
+   - Bridge naturally from any relevant recently worked concepts if listed below (respecting their evidence strength—never claim unconditional mastery if assisted/MCQ).
+   - Stop just before the final expression ONLY when one crisp, self-evident step remains for the learner to complete.
+4. REPEATED IMPASSE OR FULL DERIVATION REQUEST (help_level="solution", substantive_help=true):
+   - If the learner has already asked 2+ times on the same point without landing it, OR explicitly asks to be shown the full derivation/explanation:
+   - Stop withholding! Walk cleanly through the complete derivation on the whiteboard from start to finish so it truly clicks, then mention in one brief phrase that they can click "Show answer" (or submit) to close and revisit it cold soon.
+
+Formatting & contract:
+- Speak directly in second person ("You..."). No praise fluff or exclamation marks.
+- Put math variables, equations, and shapes in $...$ (double-escape backslashes in JSON like \\\\frac, \\\\partial, \\\\hat). Reserve backticks strictly for literal code identifiers.
+- Answer directly with ZERO tool calls.
+- Return ONLY valid JSON with "message" FIRST so prose streams cleanly: {"message": string, "help_level": "none"|"hint"|"step"|"solution", "substantive_help": boolean}`;
 
     const mem = trimLearnerMemory(input.learnerMemory);
     const thread = input.turns
       .slice(-16)
       .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
       .join("\n");
+    const relatedBlock = input.relatedEvidence?.length
+      ? `Recently worked related concepts (use to bridge naturally if relevant; respect noted evidence strength):\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
+      : "";
+    const impasseHint =
+      (input.priorClarifyCount ?? 0) >= 2
+        ? `Prior clarifications on this prompt so far: ${input.priorClarifyCount} (learner has already struggled across multiple turns—prioritize a clear, complete whiteboard walkthrough rather than withholding steps).`
+        : "";
     const userMsg = [
       mem ? `Learner memory (for calibration only):\n${mem}` : "",
       `Active practice prompt: ${input.prompt}`,
       input.starter?.trim() ? `Starter scaffold:\n${input.starter.trim()}` : "",
-      `Target concept (DO NOT reveal): ${input.unitText}`,
-      thread ? `Prior clarifications:\n${thread}` : "",
+      `Target concept (for grounding): ${input.unitText}`,
+      relatedBlock,
+      impasseHint,
+      thread ? `Prior exchange on this prompt:\n${thread}` : "",
       `Learner question: ${input.question.trim()}`,
     ]
       .filter(Boolean)
       .join("\n\n");
 
+    const deltaMsg = [impasseHint, `Learner question: ${input.question.trim()}`].filter(Boolean).join("\n\n");
+
     let agyTrace: AgyTurnTrace | undefined;
     let ttftProseMs: number | undefined;
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.clarifyWorker
+      ? this.acpClient && !this.acpClient.isUnsupported
+        ? "acp"
+        : "agy"
+      : "openrouter";
     try {
       let raw = "";
-      if (this.drillWorker) {
+      if (this.clarifyWorker) {
         const out = await this.askJsonWithTrace({
-          fallbackWorker: this.drillWorker,
+          fallbackWorker: this.clarifyWorker,
           fallbackWorkerName: "agy",
-          modelId: this.drillSlug,
+          modelId: this.clarifySlug,
           systemPrompt: sys,
           userPrompt: userMsg,
+          deltaPrompt: deltaMsg,
+          sessionKey: input.sessionKey,
+          expectedPriorTurns: input.expectedPriorTurns,
           signal,
           onText,
         });
@@ -2026,10 +2217,10 @@ Rules:
           },
           signal,
           body: JSON.stringify({
-            model: this.drillModel,
-            reasoning: { effort: this.llmEffort },
+            model: this.clarifyModel,
+            reasoning: { effort: this.routing.clarify.effort },
             temperature: 0.2,
-            max_tokens: 900,
+            max_tokens: 1400,
             response_format: { type: "json_object" },
             messages: [
               { role: "system", content: sys },
@@ -2041,10 +2232,18 @@ Rules:
         const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
         raw = data.choices?.[0]?.message?.content ?? "";
       }
-      const parsed = parseJudgeJson<{ message?: string; substantive_help?: boolean }>(raw);
+      const parsed = parseJudgeJson<{ message?: string; substantive_help?: boolean; help_level?: string }>(raw);
       if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
+        const rawLevel = parsed.help_level;
+        const helpLevel: ClarifyHelpLevel =
+          rawLevel === "none" || rawLevel === "hint" || rawLevel === "step" || rawLevel === "solution"
+            ? rawLevel
+            : parsed.substantive_help
+              ? "step"
+              : "none";
+        const substantive = helpLevel !== "none" || Boolean(parsed.substantive_help);
         this.emitPerf(
-          this.buildPerf(t0, "follow-up", this.drillModel, workerKind, true, {
+          this.buildPerf(t0, "follow-up", this.clarifyModel, workerKind, true, {
             trace: agyTrace,
             ttftProseMs,
             proseMs,
@@ -2056,24 +2255,44 @@ Rules:
         );
         return {
           message: parsed.message.trim(),
-          substantive_help: Boolean(parsed.substantive_help),
+          substantive_help: substantive,
+          help_level: helpLevel,
         };
       }
       if (raw.trim()) {
-        return { message: raw.trim(), substantive_help: false };
+        // Malformed metadata fallback: never silently stamp substantive_help=false when prose was delivered.
+        this.emitPerf(
+          this.buildPerf(t0, "follow-up", this.clarifyModel, workerKind, true, {
+            trace: agyTrace,
+            ttftProseMs,
+            proseMs,
+            tailJsonMs,
+            outputChars: raw.length,
+            promptChars: userMsg.length,
+          }),
+          onPerf,
+        );
+        return { message: raw.trim(), substantive_help: true, help_level: "unknown" };
       }
     } catch (err) {
       if (isAbortError(err) || signal?.aborted) {
-        this.emitPerf(this.buildPerf(t0, "follow-up", this.drillModel, workerKind, false, { trace: agyTrace, aborted: true, error: "aborted" }), onPerf);
+        this.emitPerf(
+          this.buildPerf(t0, "follow-up", this.clarifyModel, workerKind, false, { trace: agyTrace, aborted: true, error: "aborted" }),
+          onPerf,
+        );
         throw err;
       }
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[judge] clarifyDrill failed:", msg);
-      this.emitPerf(this.buildPerf(t0, "follow-up", this.drillModel, workerKind, false, { trace: agyTrace, error: msg }), onPerf);
+      this.emitPerf(
+        this.buildPerf(t0, "follow-up", this.clarifyModel, workerKind, false, { trace: agyTrace, error: msg }),
+        onPerf,
+      );
     }
     return {
       message: "Could not answer that question just now.",
       substantive_help: false,
+      help_level: "none",
       failed: true,
     };
   }
@@ -2160,7 +2379,7 @@ Rules:
     let ttftProseMs: number | undefined;
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.agyWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
     try {
       let raw = "";
       if (this.agyWorker) {
@@ -2305,7 +2524,7 @@ Answer directly with ZERO tool calls. Return ONLY valid JSON: {"title": string}`
     const user = `Learner: ${input.userText.slice(0, 600)}\nCoach: ${input.coachMessage.slice(0, 600)}`;
 
     let agyTrace: AgyTurnTrace | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.sidecarWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "sidecar") : "openrouter";
     try {
       let raw = "";
       if (this.sidecarWorker) {
@@ -2420,7 +2639,7 @@ Rules:
       .join("\n\n");
 
     let agyTrace: AgyTurnTrace | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.sidecarWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "sidecar") : "openrouter";
     try {
       let raw = "";
       if (this.sidecarWorker) {
@@ -2526,7 +2745,7 @@ Rules:
     const hintUser = `Prompt: ${input.prompt}\nTarget unit: ${input.unitText}\nRests on: ${input.restsOn.join("; ") || "nothing"}\nLearner so far: ${input.attempt.trim() || "(empty)"}`;
 
     let agyTrace: AgyTurnTrace | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.drillWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
     try {
       let text: string | undefined;
       if (this.drillWorker) {
@@ -2615,15 +2834,19 @@ STRICT RULES:
 - Return ONLY the tidied text verbatim.`;
 
     let out: string | undefined;
-    let modelUsed = this.drillModel;
-    let workerKind: PerfWorker = "openrouter";
+    const modelUsed = this.tidyModel;
+    let workerKind: PerfWorker = this.tidyWorker
+      ? this.acpClient && !this.acpClient.isUnsupported
+        ? "acp"
+        : "agy"
+      : "openrouter";
     let agyTrace: AgyTurnTrace | undefined;
 
-    if (this.drillWorker) {
+    if (this.tidyWorker) {
       const res = await this.askAgy({
-        fallbackWorker: this.drillWorker,
+        fallbackWorker: this.tidyWorker,
         fallbackWorkerName: "agy",
-        modelId: this.drillSlug,
+        modelId: this.tidySlug,
         systemPrompt: sys,
         userPrompt: raw,
         timeoutMs: 25_000,
@@ -2634,8 +2857,6 @@ STRICT RULES:
       out = res.raw;
       workerKind = res.worker;
     } else {
-      const tidyModel = process.env.MYELIN_TIDY_MODEL?.trim() || "google/gemini-2.5-flash-lite";
-      modelUsed = tidyModel;
       const res = await this.fetchFn(CHAT_URL, {
         method: "POST",
         headers: {
@@ -2643,7 +2864,7 @@ STRICT RULES:
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: tidyModel,
+          model: this.tidyModel,
           temperature: 0,
           max_tokens: 1400,
           messages: [
@@ -2729,7 +2950,7 @@ Return ONLY valid JSON:
       .join("\n\n");
 
     let agyTrace: AgyTurnTrace | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.agyWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
     let raw = "";
     try {
       if (this.agyWorker) {
@@ -2937,9 +3158,9 @@ Return ONLY valid JSON:
 
     const t0 = Date.now();
     let agyTrace: AgyTurnTrace | undefined;
-    let workerKind: PerfWorker = "openrouter";
-    let raw = "";
     const worker = this.plannerWorker ?? this.agyWorker;
+    let workerKind: PerfWorker = worker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "planner") : "openrouter";
+    let raw = "";
     if (worker) {
       const res = await this.askAgy({
         fallbackWorker: worker,
@@ -3049,10 +3270,11 @@ Return ONLY valid JSON:
     modality: RepModality = "direct",
     bundledIds: readonly string[] = [],
   ): string {
-    const depSig = restsOn.length > 0 ? restsOn.map((r) => r.slice(0, 24)).join("|") : "";
+    const depSig = restsOn.length > 0 ? createHash("sha256").update(restsOn.join("\0")).digest("hex").slice(0, 12) : "";
     const modSig = modality !== "direct" ? `:m=${modality}` : "";
     const bundleSig = bundledIds.length > 0 ? `:b=${[...bundledIds].sort().join(",")}` : "";
-    return `v5:${unit.id}:${depth}:v${variant}${modSig}${bundleSig}:${depSig}:${unit.text}`;
+    const modelSig = this.promptModel.replace(/[^a-zA-Z0-9._/-]/g, "_");
+    return `${PROMPT_POLICY_VERSION}:${modelSig}:${unit.id}:${depth}:v${variant}${modSig}${bundleSig}:${depSig}:${unit.text}`;
   }
 
   /** Returns a cached prompt + expected crux (+ optional starter) synchronously if already warmed, or null. */
@@ -3185,7 +3407,7 @@ Return ONLY valid JSON:
       mcq: `Modality: SHARP CONTRAST. Set "starter" to null.`,
     };
 
-    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 short sentences, max 34 words), its exact single-claim grading rubric ("expected_crux", max 32 words), and an optional pre-filled editor "starter" matching the requested Modality.
+    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 clear sentences, max 44 words), its exact single-claim grading rubric ("expected_crux", max 40 words), and an optional pre-filled editor "starter" matching the requested Modality.
 Rules:
 - MOTIVATE, DON'T WORKSHEET: Frame a real problem, comparison, or concrete setup directly and plainly—NEVER a disembodied textbook command ("State formula Y"), AND NEVER forced faux-ownership or roleplay ("Your PyTorch LayerNorm...", "A teammate argues...").
 - CLEAN MATH & GRADIENT TYPOGRAPHY: In "prompt", render equations, variables, and tensor shapes in KaTeX (\`$y = \\gamma \\hat{x} + \\beta$\`, \`$(B, T, D)$\`), NOT backticks! Reserve backticks strictly for actual code tokens/flags (like \`dim=-1\` or \`gradcheck\`, at most 2–3 in a prompt). Prefer unambiguous gradient names (\`grad_gamma\`, \`grad_x\`, or $\\nabla_x L$) over ambiguous differential shorthand (\`d_gamma\`, \`dx\`).
@@ -3214,35 +3436,22 @@ Rules:
       .filter(Boolean)
       .join("\n");
 
-    const explicitPromptEnv = Boolean(process.env.MYELIN_PROMPT_MODEL?.trim());
-    const modelForCall = this.isAgy
-      ? background
-        ? explicitPromptEnv
-          ? this.promptModel
-          : this.sidecarModel
-        : this.drillModel
-      : this.promptModel;
-    const slugForCall = this.isAgy
-      ? background
-        ? explicitPromptEnv
-          ? this.promptSlug
-          : this.sidecarSlug
-        : this.drillSlug
-      : this.promptSlug;
-    const fallbackWorkerForCall = this.isAgy
-      ? background
-        ? explicitPromptEnv
-          ? this.promptWorker
-          : (this.sidecarWorker ?? this.promptWorker)
-        : (this.drillWorker ?? this.sidecarWorker ?? this.promptWorker)
-      : this.promptWorker;
-    const timeoutMs = background ? 45_000 : 18_000;
+    // Foreground and background prompt generation use the exact same configured `prompt` model
+    // so scheduling priority never silently lowers exercise or rubric quality.
+    const modelForCall = this.promptModel;
+    const slugForCall = this.promptSlug;
+    const fallbackWorkerForCall = this.promptWorker;
+    const timeoutMs = background ? 45_000 : 25_000;
 
     if (!background) this.activeForegroundPrompts++;
     const t0 = Date.now();
     const p = (async (): Promise<PromptCacheEntry> => {
       let agyTrace: AgyTurnTrace | undefined;
-      let workerKind: PerfWorker = "openrouter";
+      let workerKind: PerfWorker = fallbackWorkerForCall
+        ? this.acpClient && !this.acpClient.isUnsupported
+          ? "acp"
+          : "agy"
+        : "openrouter";
       try {
         let raw: string | undefined;
         if (fallbackWorkerForCall) {
@@ -3268,7 +3477,7 @@ Rules:
             },
             body: JSON.stringify({
               model: modelForCall,
-              reasoning: { effort: background ? "high" : "low" },
+              reasoning: { effort: this.routing.prompt.effort },
               temperature: 0.3,
               max_tokens: 2000,
               response_format: { type: "json_object" },
@@ -3286,9 +3495,7 @@ Rules:
         if (raw) {
           const parsed = parseJudgeJson<{ prompt?: string; expected_crux?: string; starter?: string | null }>(raw);
           const promptText =
-            typeof parsed?.prompt === "string" && parsed.prompt.trim().length > 6
-              ? parsed.prompt.trim()
-              : raw.replace(/^["']|["']$/g, "").trim();
+            typeof parsed?.prompt === "string" && parsed.prompt.trim().length > 6 ? parsed.prompt.trim() : "";
           const cruxText =
             typeof parsed?.expected_crux === "string" && parsed.expected_crux.trim().length > 4
               ? parsed.expected_crux.trim()
@@ -3303,10 +3510,16 @@ Rules:
               ((modality === "faded_skeleton" || modality === "synthesis") && isCodeSkeletonStarter(cleanedStarter)))
               ? cleanedStarter
               : undefined;
-          if (promptText) {
+          // Require valid structured output with a non-empty prompt and rubric before caching.
+          if (promptText && cruxText) {
+            // Prevent a slower background prefetch from overwriting an already-served foreground exercise.
+            if (background) {
+              const existing = this.promptCache.get(key);
+              if (existing) return existing;
+            }
             const entry: PromptCacheEntry = {
               prompt: promptText,
-              ...(cruxText ? { crux: cruxText } : {}),
+              crux: cruxText,
               modality,
               ...(starterText ? { starter: starterText } : {}),
             };
@@ -3322,6 +3535,14 @@ Rules:
               }),
             );
             return entry;
+          }
+          // If prompt prose parsed cleanly without a rubric, return it uncached rather than caching a broken rubric.
+          if (promptText) {
+            return {
+              prompt: promptText,
+              modality,
+              ...(starterText ? { starter: starterText } : {}),
+            };
           }
         }
       } catch (err) {
@@ -3726,7 +3947,7 @@ CRITICAL WRITING RULES:
       .join("\n\n");
 
     let agyTrace: AgyTurnTrace | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.plannerWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "planner") : "openrouter";
     let raw = "";
     try {
       if (this.plannerWorker) {
@@ -3909,7 +4130,7 @@ Rules:
     let ttftProseMs: number | undefined;
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
-    let workerKind: PerfWorker = "openrouter";
+    let workerKind: PerfWorker = this.agyWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
     try {
       let raw = "";
       if (this.agyWorker) {

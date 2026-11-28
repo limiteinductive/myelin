@@ -83,6 +83,15 @@ export interface StoredMcqAttempt {
   gate_continued?: boolean;
 }
 
+export interface StoredDrillExercise {
+  prompt: string;
+  expected_crux?: string | null;
+  starter?: string | null;
+  modality?: string | null;
+  model?: string | null;
+  policy_version?: string | null;
+}
+
 export interface DrillAttemptRecord {
   attempt_id: string;
   unit_id: string;
@@ -97,6 +106,8 @@ export interface DrillAttemptRecord {
   grade: string | null;
   result: Record<string, unknown> | null;
   mcq?: StoredMcqAttempt | null;
+  /** Immutable exercise snapshot (prompt + expected_crux + starter + modality) captured on first contact with this attempt. */
+  exercise?: StoredDrillExercise | null;
   created_at: number;
   updated_at: number;
 }
@@ -308,6 +319,9 @@ export class EventStore {
     if (!attemptCols.some((c) => c.name === "mcq_json")) {
       this.db.exec("ALTER TABLE drill_attempts ADD COLUMN mcq_json TEXT");
     }
+    if (!attemptCols.some((c) => c.name === "exercise_json")) {
+      this.db.exec("ALTER TABLE drill_attempts ADD COLUMN exercise_json TEXT");
+    }
     this.state = emptyState(scheduler);
     this.catchUp();
   }
@@ -430,6 +444,7 @@ export class EventStore {
       grade: typeof r.grade === "string" ? r.grade : null,
       result: typeof r.result_json === "string" && r.result_json ? (JSON.parse(r.result_json) as Record<string, unknown>) : null,
       mcq: typeof r.mcq_json === "string" && r.mcq_json ? (JSON.parse(r.mcq_json) as StoredMcqAttempt) : null,
+      exercise: typeof r.exercise_json === "string" && r.exercise_json ? (JSON.parse(r.exercise_json) as StoredDrillExercise) : null,
       created_at: Number(r.created_at ?? 0),
       updated_at: Number(r.updated_at ?? 0),
     };
@@ -460,8 +475,8 @@ export class EventStore {
     this.db
       .prepare(
         `INSERT INTO drill_attempts
-          (attempt_id, unit_id, depth, prompt, first_attempt, turns_json, status, assistance_count, active_ms, probe_id, grade, result_json, mcq_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (attempt_id, unit_id, depth, prompt, first_attempt, turns_json, status, assistance_count, active_ms, probe_id, grade, result_json, mcq_json, exercise_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(attempt_id) DO UPDATE SET
           depth = excluded.depth,
           prompt = excluded.prompt,
@@ -474,6 +489,7 @@ export class EventStore {
           grade = COALESCE(excluded.grade, drill_attempts.grade),
           result_json = COALESCE(excluded.result_json, drill_attempts.result_json),
           mcq_json = COALESCE(excluded.mcq_json, drill_attempts.mcq_json),
+          exercise_json = COALESCE(drill_attempts.exercise_json, excluded.exercise_json),
           updated_at = excluded.updated_at`,
       )
       .run(
@@ -490,6 +506,7 @@ export class EventStore {
         rec.grade,
         rec.result ? JSON.stringify(rec.result) : null,
         rec.mcq ? JSON.stringify(rec.mcq) : null,
+        rec.exercise ? JSON.stringify(rec.exercise) : null,
         rec.created_at,
         rec.updated_at,
       );

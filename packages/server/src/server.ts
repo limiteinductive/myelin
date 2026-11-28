@@ -44,6 +44,7 @@ export async function startServer({ port = 4317, host = "127.0.0.1", dataDir, we
   const rwkv = RwkvInstantEngine.load();
   const perf = new PerfLog(join(dataDir, "perf.jsonl"));
   const judge = new FastJudge({ cachePath: join(dataDir, "prompts.json"), perf });
+  console.log(`[myelin] models: ${judge.formatModelRouting()}`);
   const app = createApp({ registry, stores, webRoot, tutors, sandbox, keys, files, rwkv, judge, perf, dataDir });
   const { server, address } = await new Promise<{ server: Server; address: { port: number } }>((resolve, reject) => {
     const s = serve({ fetch: app.fetch, port, hostname: host }, (info) => resolve({ server: s as Server, address: info }));

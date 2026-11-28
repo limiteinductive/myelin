@@ -30,7 +30,7 @@ import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { streamSSE } from "hono/streaming";
 import { FileError, type Files } from "./files.js";
 import { FrontierStore, type Frontier } from "./frontiers.js";
-import { FastJudge } from "./judge.js";
+import { FastJudge, PROMPT_POLICY_VERSION, type ClarifyHelpLevel } from "./judge.js";
 import { formatServerTiming, PerfLog, type PerfOp, type PerfRecord } from "./perf.js";
 import { RegistryError, type Device, type Registry, type User } from "./registry.js";
 import {
@@ -54,6 +54,7 @@ import {
   type BriefingRecord,
   type DreamLogRecord,
   type ExplorationRecord,
+  type StoredDrillExercise,
   type StoredMcqAttempt,
   type StoredMcqChoice,
 } from "./store.js";
@@ -63,6 +64,136 @@ import type { Draft, Tutors } from "./tutor/tutor.js";
 
 export const COOKIE = "myelin_device";
 const COOKIE_MAX_AGE = 400 * 24 * 3600; // the longest browsers allow
+
+const RELATED_STOPWORDS = new Set([
+  "the", "and", "for", "that", "with", "this", "from", "into", "over", "when", "what", "why",
+  "how", "are", "was", "were", "has", "have", "had", "not", "but", "can", "will", "its", "their",
+  "than", "then", "each", "both", "only", "same", "more", "most", "some", "such", "does", "use",
+  "uses", "using", "used", "gives", "given", "makes", "make", "takes", "take", "rather", "instead",
+  "because", "where", "which", "while", "since", "through", "between", "across", "along", "about",
+]);
+
+function domainTokens(text: string): Set<string> {
+  const out = new Set<string>();
+  const matches = text.toLowerCase().match(/[a-z][a-z0-9_]{2,}/g) ?? [];
+  for (const tok of matches) {
+    if (!RELATED_STOPWORDS.has(tok)) out.add(tok);
+  }
+  return out;
+}
+
+function fmtShortAge(ms: number): string {
+  const m = Math.max(1, Math.round(Math.max(0, ms) / 60_000));
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 36) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
+/**
+ * Retrieves up to `limit` compact, evidence-grounded related concepts (prerequisites, lexically
+ * related units, and recent demonstrations) while strictly excluding the target unit and
+ * answer-equivalent near-duplicates. Preserves honest provenance (MCQ vs. assisted vs. unaided).
+ */
+export function buildRelatedEvidenceContext(
+  state: State,
+  target: Unit,
+  now: number,
+  limit = 4,
+): string[] {
+  const targetToks = domainTokens(`${target.text} ${target.topic ?? ""}`);
+  const targetTopic = (target.topic ?? "").trim().toLowerCase();
+  const restsSet = new Set(target.rests_on);
+  const scored: { text: string; score: number; at: number }[] = [];
+
+  for (const other of Object.values(state.units)) {
+    if (other.id === target.id || other.status !== "active" || other.observe_only) continue;
+    const otherToks = domainTokens(`${other.text} ${other.topic ?? ""}`);
+    let overlap = 0;
+    for (const t of targetToks) {
+      if (otherToks.has(t)) overlap++;
+    }
+    // Skip near-duplicate rewrites of the exact same unit so we never leak an answer twin.
+    const minSize = Math.min(targetToks.size, otherToks.size);
+    if (minSize >= 4 && overlap / minSize >= 0.8) continue;
+
+    const isPrereq = restsSet.has(other.id) || other.rests_on.includes(target.id);
+    const otherTopic = (other.topic ?? "").trim().toLowerCase();
+    const sameTopic = Boolean(targetTopic && targetTopic !== "general" && otherTopic === targetTopic);
+
+    const passingProbes = other.evidence
+      .map((id) => state.evidence[id])
+      .filter(
+        (ev): ev is NonNullable<typeof ev> =>
+          Boolean(ev && ev.source === "probe" && ev.slot !== "in_context" && ev.grade && ev.grade !== "again"),
+      )
+      .sort((a, b) => a.at - b.at || a.seq - b.seq);
+    const latestPass = passingProbes.at(-1) ?? null;
+
+    if (!isPrereq && !latestPass) continue;
+    const relevance = (isPrereq ? 10 : 0) + (sameTopic ? 3 : 0) + overlap * 2.5;
+    if (relevance <= 0) continue;
+
+    let recency = 0;
+    if (latestPass) {
+      const ageMs = Math.max(0, now - latestPass.at);
+      if (ageMs <= 2 * 3_600_000) recency = 5;
+      else if (ageMs <= 48 * 3_600_000) recency = 3;
+      else if (ageMs <= 7 * 86_400_000) recency = 1.5;
+    }
+
+    let tag: string;
+    if (latestPass) {
+      const age = fmtShortAge(now - latestPass.at);
+      const hints = latestPass.hints ?? 0;
+      const how =
+        latestPass.modality === "mcq"
+          ? "recognized via MCQ"
+          : hints === 0
+            ? "recalled unaided"
+            : `worked through with ${hints} ${hints === 1 ? "hint" : "hints"}`;
+      tag = `${how}, ${age}`;
+    } else {
+      tag = "prerequisite";
+    }
+    const snippet = other.text.replace(/\s+/g, " ").trim().slice(0, 220);
+    scored.push({ text: `[${tag}] ${snippet}`, score: relevance + recency, at: latestPass?.at ?? other.found_at });
+  }
+
+  scored.sort((a, b) => b.score - a.score || b.at - a.at);
+  return scored.slice(0, limit).map((s) => s.text);
+}
+
+/** Converts a clarification's help_level into durable assistance units (solution = 2 -> guarantees grade="again" on close). */
+export function assistanceIncrementForHelpLevel(level: ClarifyHelpLevel, substantiveHelp: boolean): number {
+  if (level === "solution") return 2;
+  if (level === "hint" || level === "step" || level === "unknown") return 1;
+  return substantiveHelp ? 1 : 0;
+}
+
+/**
+ * Single server-owned grade policy shared across both initial `/api/drill/check` and `/api/drill/followup`.
+ * Ensures identical assistance histories always yield identical spaced-repetition grades.
+ */
+export function resolveEffectiveGrade(args: {
+  rawGrade: Grade;
+  showPivot: boolean;
+  storedAssistance: number;
+  clientHints: number;
+  priorGradedMisses: number;
+}): { finalGrade: Grade; effectiveHints: number } {
+  const effectiveHints = Math.max(0, args.storedAssistance, args.clientHints, args.priorGradedMisses);
+  if (args.showPivot) {
+    return { finalGrade: "again", effectiveHints: Math.max(1, effectiveHints) };
+  }
+  if (effectiveHints >= 2 || args.priorGradedMisses >= 2) {
+    return { finalGrade: "again", effectiveHints };
+  }
+  if ((effectiveHints >= 1 || args.priorGradedMisses >= 1) && (args.rawGrade === "good" || args.rawGrade === "easy")) {
+    return { finalGrade: "hard", effectiveHints };
+  }
+  return { finalGrade: args.rawGrade, effectiveHints };
+}
 const HEARTBEAT_MS = 20_000;
 const PAGE = 2_000;
 
@@ -2990,11 +3121,26 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         ? body.modality
         : pickRepModality(u, state, depth, bundledUnits);
     const stage2Prod = preAttempt?.mcq?.phase === "production" ? preAttempt.mcq.production : null;
+    const savedExercise = preAttempt?.exercise ?? null;
     const cachedPromptEntry =
       judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds) ??
       judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures);
-    const prompt = body.prompt?.trim() || stage2Prod?.prompt || cachedPromptEntry?.prompt || (await judge.promptFor(u, restsOn, depth));
-    const expectedCrux = stage2Prod?.expected_crux || cachedPromptEntry?.crux;
+    const prompt =
+      savedExercise?.prompt ||
+      body.prompt?.trim() ||
+      stage2Prod?.prompt ||
+      cachedPromptEntry?.prompt ||
+      (await judge.promptFor(u, restsOn, depth));
+    const expectedCrux = savedExercise?.expected_crux || stage2Prod?.expected_crux || cachedPromptEntry?.crux;
+    const activeStarter = savedExercise?.starter ?? cachedPromptEntry?.starter ?? null;
+    const exerciseSnapshot: StoredDrillExercise = savedExercise ?? {
+      prompt,
+      expected_crux: expectedCrux ?? null,
+      starter: activeStarter,
+      modality: reqModality,
+      model: judge.routing.prompt.model,
+      policy_version: PROMPT_POLICY_VERSION,
+    };
     const firstContact = u.told && preStats.passes === 0;
     const showPivot = Boolean(body.show_pivot);
 
@@ -3029,26 +3175,32 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       return c.json(existingAttempt.result);
     }
 
-    // Explicit clarifying question on an open drill: never invoke the grader, close the rep, or leak the answer.
+    // Explicit clarifying question on an open drill: never invoke the grader or close the rep.
     if (Boolean(body.clarify) && !showPivot) {
       const nowClarify = Date.now();
       const trendClarify = latencyTrend(state, u);
       const priorClarifyTurns: { role: "user" | "assistant"; text: string }[] = [];
+      let priorClarifyCount = 0;
       for (const t of existingAttempt?.turns ?? []) {
         if (t.failed) continue;
+        if (t.kind === "clarify") priorClarifyCount++;
         if (t.user.trim()) priorClarifyTurns.push({ role: "user", text: t.user });
         if (t.coach.trim()) priorClarifyTurns.push({ role: "assistant", text: t.coach });
       }
-      judge.closeSession(`drill:${attemptId}`);
+      const relatedEvidence = buildRelatedEvidenceContext(state, u, nowClarify);
       return respondMaybeStream(c, async (onText, onPerf, signal) => {
         const clarified = await judge.clarifyDrill(
           {
+            sessionKey: `clarify:${user.id}:${attemptId}`,
+            expectedPriorTurns: priorClarifyCount,
+            priorClarifyCount,
             prompt,
-            starter: cachedPromptEntry?.starter,
+            starter: activeStarter,
             unitText: u.text,
             question: attempt,
             turns: priorClarifyTurns,
             learnerMemory: learnerMemoryOf(store),
+            relatedEvidence,
           },
           onText,
           onPerf,
@@ -3072,7 +3224,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         // Terminal-status guard: never let a late Ask reopen or overwrite an already-passed rep.
         const latestAttempt = store.getAttempt(attemptId);
         if (latestAttempt?.status !== "passed") {
-          const nextAssistance = (latestAttempt?.assistance_count ?? 0) + (clarified.substantive_help ? 1 : 0);
+          const deltaAssist = clarified.failed
+            ? 0
+            : assistanceIncrementForHelpLevel(clarified.help_level, clarified.substantive_help);
+          const nextAssistance = (latestAttempt?.assistance_count ?? 0) + deltaAssist;
           const prevTurns = latestAttempt?.turns?.filter((t) => !t.failed) ?? [];
           store.abandonActiveAttempts(u.id, attemptId, nowClarify);
           store.upsertAttempt({
@@ -3096,6 +3251,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             probe_id: null,
             grade: null,
             result: null,
+            exercise: latestAttempt?.exercise ?? exerciseSnapshot,
             created_at: latestAttempt?.created_at ?? nowClarify,
             updated_at: nowClarify,
           });
@@ -3123,11 +3279,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const trend = latencyTrend(state, u);
     const habits = activeHabits(state);
     const latencyMs = typeof body.latency_ms === "number" && body.latency_ms >= 0 ? Math.round(body.latency_ms) : null;
-    const hintsUsed = Math.max(
-      0,
-      Math.round(body.hints_used ?? 0),
+    const storedCheckAssistance = Math.max(
+      existingAttempt?.assistance_count ?? 0,
       preAttempt?.mcq?.phase === "production" ? preAttempt.assistance_count : 0,
     );
+    const hintsUsed = Math.max(0, Math.round(body.hints_used ?? 0), storedCheckAssistance);
 
     const history = Array.isArray(body.history)
       ? body.history
@@ -3138,11 +3294,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const existingUnits = Object.values(state.units)
       .filter((u2) => u2.status === "active" && !u2.observe_only)
       .map((u2) => u2.text);
+    const relatedEvidence = buildRelatedEvidenceContext(state, u, now);
 
     return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.check(
         {
-          sessionKey: `drill:${attemptId}`,
+          sessionKey: `drill:${user.id}:${attemptId}`,
           prompt,
           expectedCrux,
           firstContact,
@@ -3158,6 +3315,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           history,
           activeHabits: habits.map((h) => h.text),
           learnerMemory: learnerMemoryOf(store),
+          relatedEvidence,
           latencyMs,
           hintsUsed: showPivot ? Math.max(1, hintsUsed) : hintsUsed,
         },
@@ -3180,7 +3338,28 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const prevIntervalMs = preScore?.scheduled_interval_ms ?? null;
       const prevScheduleKind = preScore?.schedule_kind ?? "first";
       const creditedUnitIds: string[] = [];
+      let finalGradeCheck: Grade = verdict.grade;
+      let storedAssistanceCheck = hintsUsed;
       if (verdict.ok && !verdict.failed) {
+        // Re-check latest stored attempt before committing probe so duplicate/raced submissions cannot double-log
+        // and clarification assistance recorded before the initial check applies the exact same grade clamp.
+        const latestAtCheckPass = store.getAttempt(attemptId);
+        if (latestAtCheckPass?.status === "passed" && latestAtCheckPass.result) {
+          return latestAtCheckPass.result;
+        }
+        const priorGradedMissesCheck = latestAtCheckPass?.turns
+          ? latestAtCheckPass.turns.filter((t) => !t.failed && t.kind !== "clarify").length
+          : 0;
+        const resolved = resolveEffectiveGrade({
+          rawGrade: verdict.grade,
+          showPivot,
+          storedAssistance: Math.max(latestAtCheckPass?.assistance_count ?? 0, storedCheckAssistance),
+          clientHints: Math.max(0, Math.round(body.hints_used ?? 0)),
+          priorGradedMisses: priorGradedMissesCheck,
+        });
+        finalGradeCheck = resolved.finalGrade;
+        storedAssistanceCheck = resolved.effectiveHints;
+
         const ev = makeEvent(
           "unit.probed",
           {
@@ -3189,9 +3368,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             slot: "seam",
             prompt: prompt.slice(0, 1000),
             answer_message_id: null,
-            grade: verdict.grade,
+            grade: finalGradeCheck,
             corrected_grade: null,
-            hints: showPivot ? Math.max(1, hintsUsed) : hintsUsed,
+            hints: storedAssistanceCheck,
             latency_ms: latencyMs,
             scheduler,
             predicted_recall: preScore ? preScore.p_imm : null,
@@ -3200,9 +3379,11 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         );
         store.append([ev]);
         probeId = ev.id;
+        judge.closeSession(`drill:${user.id}:${attemptId}`);
+        judge.closeSession(`clarify:${user.id}:${attemptId}`);
 
         // Synthesis multiplier: passing a bundled multi-unit rep cleanly credits companion units in context.
-        if (verdict.grade !== "again" && !showPivot && bundledUnits.length > 0) {
+        if (finalGradeCheck !== "again" && !showPivot && bundledUnits.length > 0) {
           let offset = 2;
           for (const companion of bundledUnits) {
             const cPre = scores.get(companion.id);
@@ -3301,6 +3482,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
 
       const payload = {
         ...verdict,
+        grade: finalGradeCheck,
         attempt_id: attemptId,
         added_units: addedUnits,
         ...(creditedUnitIds.length > 0 ? { credited_unit_ids: creditedUnitIds } : {}),
@@ -3316,15 +3498,23 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         scheduler,
       };
 
-      const nextAssistanceCheck = !verdict.ok && !verdict.failed ? hintsUsed + 1 : hintsUsed;
+      const latestBeforeCheckUpsert = store.getAttempt(attemptId);
+      const prevCheckTurns = latestBeforeCheckUpsert?.turns?.filter((t) => !t.failed) ?? [];
+      const nextAssistanceCheck =
+        verdict.ok && !verdict.failed
+          ? storedAssistanceCheck
+          : !verdict.failed
+            ? Math.max(latestBeforeCheckUpsert?.assistance_count ?? 0, hintsUsed) + 1
+            : Math.max(latestBeforeCheckUpsert?.assistance_count ?? 0, hintsUsed);
       store.abandonActiveAttempts(u.id, attemptId, now);
       store.upsertAttempt({
         attempt_id: attemptId,
         unit_id: u.id,
         depth,
         prompt,
-        first_attempt: existingAttempt?.first_attempt || attempt || "(sketch)",
+        first_attempt: latestBeforeCheckUpsert?.first_attempt || attempt || "(sketch)",
         turns: [
+          ...prevCheckTurns,
           {
             user: attempt,
             coach: verdict.message,
@@ -3338,9 +3528,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         assistance_count: nextAssistanceCheck,
         active_ms: latencyMs,
         probe_id: probeId,
-        grade: verdict.ok && !verdict.failed ? verdict.grade : null,
+        grade: verdict.ok && !verdict.failed ? finalGradeCheck : null,
         result: verdict.ok && !verdict.failed ? payload : null,
-        created_at: existingAttempt?.created_at ?? now,
+        exercise: latestBeforeCheckUpsert?.exercise ?? exerciseSnapshot,
+        created_at: latestBeforeCheckUpsert?.created_at ?? now,
         updated_at: now,
       });
 
@@ -3390,18 +3581,30 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       body.modality && ["direct", "fix_bug", "faded_skeleton", "contrast", "synthesis"].includes(body.modality)
         ? body.modality
         : pickRepModality(u, state, depth, bundledUnits);
-    const expectedCrux =
-      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds)?.crux ??
-      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures)?.crux;
-    const firstContact = u.told && preStats.passes === 0;
-    const turns = Array.isArray(body.turns)
-      ? body.turns.filter((t): t is { role: "user" | "assistant"; text: string } => (t?.role === "user" || t?.role === "assistant") && typeof t?.text === "string").slice(-20)
-      : [];
     const attemptId = typeof body.attempt_id === "string" && body.attempt_id.trim() ? body.attempt_id.trim() : uuidv7();
     const existingAttempt = store.getAttempt(attemptId);
     if (existingAttempt?.status === "passed" && existingAttempt.result) {
       return c.json(existingAttempt.result);
     }
+    const savedFollowupExercise = existingAttempt?.exercise ?? null;
+    const peekedFollowupEntry =
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds) ??
+      judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures);
+    const followupPrompt = savedFollowupExercise?.prompt || body.prompt || existingAttempt?.prompt || "";
+    const expectedCrux = savedFollowupExercise?.expected_crux || peekedFollowupEntry?.crux;
+    const followupStarter = savedFollowupExercise?.starter ?? peekedFollowupEntry?.starter ?? null;
+    const followupExerciseSnapshot: StoredDrillExercise = savedFollowupExercise ?? {
+      prompt: followupPrompt,
+      expected_crux: expectedCrux ?? null,
+      starter: followupStarter,
+      modality: reqModality,
+      model: judge.routing.prompt.model,
+      policy_version: PROMPT_POLICY_VERSION,
+    };
+    const firstContact = u.told && preStats.passes === 0;
+    const turns = Array.isArray(body.turns)
+      ? body.turns.filter((t): t is { role: "user" | "assistant"; text: string } => (t?.role === "user" || t?.role === "assistant") && typeof t?.text === "string").slice(-20)
+      : [];
 
     // Active MCQ clarification (Stage 1 gate or standalone only; Stage 2 production uses normal drill clarification).
     if (existingAttempt?.mcq && existingAttempt.mcq.phase !== "production") {
@@ -3529,19 +3732,21 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       if (body.attempt?.trim()) priorClarifyTurns.push({ role: "user", text: body.attempt.trim() });
       if (body.feedback?.trim()) priorClarifyTurns.push({ role: "assistant", text: body.feedback.trim() });
       priorClarifyTurns.push(...turns);
-      const cachedStarter =
-        judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures, reqModality, bundledIds)?.starter ??
-        judge.peekPromptEntry(u, depth, restsOn, preStats.depthExposures)?.starter;
-      judge.closeSession(`drill:${attemptId}`);
+      const priorClarifyCount = (existingAttempt?.turns ?? []).filter((t) => !t.failed && t.kind === "clarify").length;
+      const relatedEvidence = buildRelatedEvidenceContext(state, u, now);
       return respondMaybeStream(c, async (onText, onPerf, signal) => {
         const clarified = await judge.clarifyDrill(
           {
-            prompt: body.prompt ?? "",
-            starter: cachedStarter,
+            sessionKey: `clarify:${user.id}:${attemptId}`,
+            expectedPriorTurns: priorClarifyCount,
+            priorClarifyCount,
+            prompt: followupPrompt,
+            starter: followupStarter,
             unitText: u.text,
             question: questionText,
             turns: priorClarifyTurns,
             learnerMemory: learnerMemoryOf(store),
+            relatedEvidence,
           },
           onText,
           onPerf,
@@ -3565,7 +3770,10 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         // Terminal-status guard: never let a late Ask reopen or overwrite an already-passed rep.
         const latestAttempt = store.getAttempt(attemptId);
         if (latestAttempt?.status !== "passed") {
-          const nextAssistance = (latestAttempt?.assistance_count ?? 0) + (clarified.substantive_help ? 1 : 0);
+          const deltaAssist = clarified.failed
+            ? 0
+            : assistanceIncrementForHelpLevel(clarified.help_level, clarified.substantive_help);
+          const nextAssistance = (latestAttempt?.assistance_count ?? 0) + deltaAssist;
           const prevStoredTurns =
             latestAttempt?.turns && latestAttempt.turns.length > 0
               ? latestAttempt.turns.filter((t) => !t.failed)
@@ -3576,7 +3784,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             attempt_id: attemptId,
             unit_id: u.id,
             depth,
-            prompt: body.prompt ?? "",
+            prompt: followupPrompt,
             first_attempt: latestAttempt?.first_attempt || (body.attempt ?? ""),
             turns: [
               ...prevStoredTurns,
@@ -3593,6 +3801,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             probe_id: null,
             grade: null,
             result: null,
+            exercise: latestAttempt?.exercise ?? followupExerciseSnapshot,
             created_at: latestAttempt?.created_at ?? now,
             updated_at: now,
           });
@@ -3622,12 +3831,17 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     const existingUnits = Object.values(state.units)
       .filter((u2) => u2.status === "active" && !u2.observe_only)
       .map((u2) => u2.text);
+    const relatedEvidence = buildRelatedEvidenceContext(state, u, now);
+    const committedGradedTurns = existingAttempt?.turns
+      ? existingAttempt.turns.filter((t) => !t.failed && t.kind !== "clarify").length
+      : undefined;
 
     return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.continueRep(
         {
-          sessionKey: `drill:${attemptId}`,
-          prompt: body.prompt ?? "",
+          sessionKey: `drill:${user.id}:${attemptId}`,
+          expectedPriorTurns: committedGradedTurns,
+          prompt: followupPrompt,
           expectedCrux,
           firstContact,
           showPivot,
@@ -3639,6 +3853,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           existingUnits,
           activeHabits: habits.map((h) => h.text),
           learnerMemory: learnerMemoryOf(store),
+          relatedEvidence,
           attempt: body.attempt ?? "",
           feedback: body.feedback ?? "",
           turns,
@@ -3681,22 +3896,23 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           : body.attempt?.trim() && body.feedback?.trim()
             ? 1 + Math.floor(turns.length / 2)
             : 0;
-        const storedHints = Math.max(latestAtPass?.assistance_count ?? 0, assistanceCount, priorGradedMisses);
-        storedAssistanceForUpsert = storedHints;
-        if (showPivot) {
-          finalGrade = "again";
-        } else if (storedHints >= 2 || priorGradedMisses >= 2) {
-          finalGrade = "again";
-        } else if ((storedHints >= 1 || priorGradedMisses >= 1) && (finalGrade === "good" || finalGrade === "easy")) {
-          finalGrade = "hard";
-        }
+        const resolved = resolveEffectiveGrade({
+          rawGrade: verdict.grade,
+          showPivot,
+          storedAssistance: Math.max(latestAtPass?.assistance_count ?? 0, assistanceCount),
+          clientHints: Math.max(0, Math.round(body.hints_used ?? 0)),
+          priorGradedMisses,
+        });
+        finalGrade = resolved.finalGrade;
+        storedAssistanceForUpsert = resolved.effectiveHints;
+        const storedHints = resolved.effectiveHints;
         const ev = makeEvent(
           "unit.probed",
           {
             unit_id: u.id,
             depth,
             slot: "seam",
-            prompt: (body.prompt ?? "").slice(0, 1000),
+            prompt: followupPrompt.slice(0, 1000),
             answer_message_id: null,
             grade: finalGrade,
             corrected_grade: null,
@@ -3709,6 +3925,8 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         );
         store.append([ev]);
         probeId = ev.id;
+        judge.closeSession(`drill:${user.id}:${attemptId}`);
+        judge.closeSession(`clarify:${user.id}:${attemptId}`);
 
         if (finalGrade !== "again" && !showPivot && bundledUnits.length > 0) {
           let offset = 2;
@@ -3838,7 +4056,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         attempt_id: attemptId,
         unit_id: u.id,
         depth,
-        prompt: body.prompt ?? "",
+        prompt: followupPrompt,
         first_attempt: latestBeforeUpsert?.first_attempt || (body.attempt ?? ""),
         turns: [
           ...prevStoredTurns,
@@ -3857,6 +4075,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         probe_id: probeId,
         grade: verdict.ok && !verdict.failed ? finalGrade : null,
         result: verdict.ok && !verdict.failed ? payload : null,
+        exercise: latestBeforeUpsert?.exercise ?? followupExerciseSnapshot,
         created_at: latestBeforeUpsert?.created_at ?? now,
         updated_at: now,
       });

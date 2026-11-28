@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { AgyAcpClient, type AgyTurnTrace } from "../src/agy-acp.js";
-import { FastJudge } from "../src/judge.js";
+import { FastJudge, resolveModelRouting } from "../src/judge.js";
 
 function makeFakeAcpServer(dir: string): string {
   const bin = join(dir, "fake-agy-acp.mjs");
@@ -54,6 +54,11 @@ for await (const line of rl) {
         ok: text.includes("PASS_ME"),
         grade: text.includes("PASS_ME") ? "good" : "again",
         message: "model=" + s.modelId + " sid=" + sid + " turn=" + s.turns + " chars=" + text.length + (hasImage ? " img=1" : ""),
+        prompt: "Prompt model=" + s.modelId + " sid=" + sid + " turn=" + s.turns,
+        expected_crux: "Expected crux for " + s.modelId,
+        starter: null,
+        help_level: "step",
+        substantive_help: true,
         question: null,
         title: "Test Title",
         suggested_units: [],
@@ -173,7 +178,27 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
     }
   });
 
-  it("routes Drill to gemini-4-hydrogen-low, keeps Explore on gemini-4-neon-low, reuses KV deltas, and skips OpenRouter Jev on agy", async () => {
+  it("inherits configured model verbatim across all roles with zero silent downgrades, supports explicit overrides, reuses KV deltas, and prevents bg prompt overwrite", async () => {
+    // 1. Pure routing invariant: every role inherits MYELIN_JUDGE_MODEL verbatim unless explicitly overridden.
+    const inherited = resolveModelRouting({ llmModel: "agy/gemini-4-neon-low" }, {});
+    expect(inherited.drill.model).toBe("agy/gemini-4-neon-low");
+    expect(inherited.clarify.model).toBe("agy/gemini-4-neon-low");
+    expect(inherited.explore.model).toBe("agy/gemini-4-neon-low");
+    expect(inherited.prompt.model).toBe("agy/gemini-4-neon-low");
+    expect(inherited.sidecar.model).toBe("agy/gemini-4-neon-low");
+    expect(inherited.tidy.model).toBe("agy/gemini-4-neon-low");
+
+    // Explicit cross-provider override resolves its own provider cleanly (not forced onto base provider).
+    const mixed = resolveModelRouting(
+      { llmModel: "agy/gemini-4-neon-low" },
+      { MYELIN_TIDY_MODEL: "google/gemini-2.5-flash-lite", MYELIN_DRILL_MODEL: "agy/gemini-4-neon-medium" },
+    );
+    expect(mixed.tidy.provider).toBe("openrouter");
+    expect(mixed.tidy.model).toBe("google/gemini-2.5-flash-lite");
+    expect(mixed.tidy.slug).toBeUndefined();
+    expect(mixed.drill.provider).toBe("agy");
+    expect(mixed.drill.slug).toBe("gemini-4-neon-medium");
+
     const dir = mkdtempSync(join(tmpdir(), "myelin-acp-judge-"));
     const bin = makeFakeAcpServer(dir);
     const fetchCalls: string[] = [];
@@ -188,7 +213,7 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
       fetchFn: mockFetch,
     });
     try {
-      // Drill check -> gemini-4-hydrogen-low, 0 OpenRouter calls!
+      // Drill check -> stays on gemini-4-neon-low (zero silent downgrade to hydrogen!), 0 OpenRouter calls.
       const chk = await judge.check({
         sessionKey: "drill:a1",
         prompt: "Derive Poisson from Binomial",
@@ -202,7 +227,7 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
         hintsUsed: 0,
       });
       expect(fetchCalls).toHaveLength(0);
-      expect(chk.message).toContain("model=gemini-4-hydrogen-low");
+      expect(chk.message).toContain("model=gemini-4-neon-low");
       expect(chk.message).toContain("turn=1");
 
       // Drill follow-up -> reuses same KV-cached ACP session with tiny delta prompt!
@@ -221,11 +246,35 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
         hintsUsed: 1,
       });
       expect(fu.ok).toBe(true);
-      expect(fu.message).toContain("model=gemini-4-hydrogen-low");
+      expect(fu.message).toContain("model=gemini-4-neon-low");
       expect(fu.message).toContain("turn=2");
-      // Delta prompt is tiny (<100 chars) instead of re-sending full context!
       const charsMatch = /chars=(\d+)/.exec(fu.message);
       expect(Number(charsMatch?.[1] ?? 9999)).toBeLessThan(100);
+
+      // Clarify -> stays on gemini-4-neon-low AND reuses warm clarify session across turns!
+      const cl1 = await judge.clarifyDrill({
+        sessionKey: "clarify:a1",
+        expectedPriorTurns: 0,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        question: "what is proj_grad?",
+        turns: [],
+      });
+      expect(cl1.message).toContain("model=gemini-4-neon-low");
+      expect(cl1.message).toContain("turn=1");
+
+      const cl2 = await judge.clarifyDrill({
+        sessionKey: "clarify:a1",
+        expectedPriorTurns: 1,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        question: "show ds/dx_i",
+        turns: [{ role: "user", text: "what is proj_grad?" }, { role: "assistant", text: cl1.message }],
+      });
+      expect(cl2.message).toContain("model=gemini-4-neon-low");
+      expect(cl2.message).toContain("turn=2");
+      const cl2Chars = /chars=(\d+)/.exec(cl2.message);
+      expect(Number(cl2Chars?.[1] ?? 9999)).toBeLessThan(80);
 
       // Exploration -> stays on gemini-4-neon-low, Turn 2 reuses KV delta!
       const exp1 = await judge.explore({
@@ -253,7 +302,7 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
       const exp2Chars = /chars=(\d+)/.exec(exp2.message);
       expect(Number(exp2Chars?.[1] ?? 9999)).toBeLessThan(60);
 
-      // Async sidecar runs on gemini-4-hydrogen-medium
+      // Async sidecar inherits gemini-4-neon-low
       const sidecar = await judge.extractExploreMeta({
         userText: "Explain linear attention",
         coachMessage: exp1.message,
@@ -265,43 +314,39 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
       expect(sidecar.title).toBe("Test Title");
       expect(sidecar.suggested_units).toEqual([]);
 
-      // Tidy works on agy at $0 cost without hitting OpenRouter
+      // Tidy inherits gemini-4-neon-low on agy at $0 cost without hitting OpenRouter
       const tidied = await judge.tidyInput("def foo(x):\n ret x");
       expect(fetchCalls).toHaveLength(0);
       expect(tidied.text).toBeTruthy();
 
-      // Foreground promptFor cache miss uses fast gemini-4-hydrogen-low and does not stall
-      // behind a background gemini-4-hydrogen-medium prefetch for the same unit!
-      const slowBg = judge.promptFor(
-        { id: "u-slow", text: "SLOW_TURN unit text", kind: "result" },
-        [],
-        "recall",
-        {},
-        true,
-      );
-      const tFg = Date.now();
+      // Both foreground and background promptFor use the exact same configured prompt model (gemini-4-neon-low).
       const fgPrompt = await judge.promptFor(
-        { id: "u-slow", text: "unit text", kind: "result" },
+        { id: "u-fg", text: "unit text", kind: "result" },
         [],
         "recall",
         {},
         false,
       );
-      // Even when racing against an already-in-flight SLOW_TURN background prefetch on the exact same key:
-      const tRace = Date.now();
-      const racedPrompt = await judge.promptFor(
-        { id: "u-slow", text: "SLOW_TURN unit text", kind: "result" },
-        [],
-        "recall",
-        {},
-        false,
-      );
-      expect(fgPrompt).toContain("model=gemini-4-hydrogen-low");
-      expect(Date.now() - tFg).toBeLessThan(250);
-      expect(racedPrompt).toContain("model=gemini-4-hydrogen-low");
-      expect(Date.now() - tRace).toBeLessThan(250);
-      const bgPrompt = await slowBg;
-      expect(bgPrompt).toContain("model=gemini-4-hydrogen-medium");
+      expect(fgPrompt).toContain("model=gemini-4-neon-low");
+
+      // Atomic ACP delta safety: if a cached session is closed/evicted before turn 2, ACP sends the full prompt (never an orphan delta).
+      judge.closeSession("clarify:a1");
+      const cl3 = await judge.clarifyDrill({
+        sessionKey: "clarify:a1",
+        expectedPriorTurns: 2,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        question: "one more check",
+        turns: [
+          { role: "user", text: "what is proj_grad?" },
+          { role: "assistant", text: cl1.message },
+          { role: "user", text: "show ds/dx_i" },
+          { role: "assistant", text: cl2.message },
+        ],
+      });
+      expect(cl3.message).toContain("turn=1");
+      const cl3Chars = /chars=(\d+)/.exec(cl3.message);
+      expect(Number(cl3Chars?.[1] ?? 0)).toBeGreaterThan(150);
     } finally {
       judge.close();
       rmSync(dir, { recursive: true, force: true });

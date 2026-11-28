@@ -3,9 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { uuidv7 } from "@myelin/core";
 import { afterEach, describe, expect, it } from "vitest";
-import { createApp } from "../src/app.js";
+import { buildRelatedEvidenceContext, createApp, resolveEffectiveGrade } from "../src/app.js";
 import { FastJudge } from "../src/judge.js";
 import { Registry } from "../src/registry.js";
+import { pickRepModality } from "../src/rwkv.js";
 import { Stores } from "../src/stores.js";
 
 describe("v2 drill and map API", () => {
@@ -43,7 +44,18 @@ describe("v2 drill and map API", () => {
         );
       }
       return new Response(
-        JSON.stringify({ choices: [{ message: { content: "Explain why X^T X + lambda I is invertible." } }] }),
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  prompt: "Explain why X^T X + lambda I is invertible.",
+                  expected_crux: "Left-multiply Av=0 by v^T to show ||Xv||^2 + lambda ||v||^2 = 0 => v = 0.",
+                }),
+              },
+            },
+          ],
+        }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     };
@@ -1201,5 +1213,165 @@ describe("v2 drill and map API", () => {
     expect(t3.grade).toBe("again");
     expect(t3.next_in_ms).toBeLessThanOrEqual(45 * 60_000);
     expect(t3.next_depth).toBe("recall");
+  });
+
+  it("enforces shared grade policy across clarify -> initial check, immutable exercise binding, evidence-aware related context, and conceptual modality guard", async () => {
+    dir = mkdtempSync(join(tmpdir(), "myelin-coach-refactor-"));
+    registry = new Registry(dir);
+    stores = new Stores(dir);
+    const user = registry.createUser("ben");
+    const link = registry.issueLink(user.id);
+
+    let capturedClarifyPrompt = "";
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const bodyStr = String(init?.body ?? "");
+      if (bodyStr.includes("Learner question:")) {
+        capturedClarifyPrompt = bodyStr;
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    message: "Here is the complete derivation: dL/ds = sum g_j c_j and ds/dx_i = -s^3 c_i / D, so their product is -s x_hat_i mean(g * x_hat).",
+                    help_level: "solution",
+                    substantive_help: true,
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  ok: true,
+                  grade: "good",
+                  message: "Right—mean(g * x_hat).",
+                  annotations: [],
+                  habit_observed: null,
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", llmModel: "google/gemini-4-neon", enableJev: false, fetchFn: mockFetch });
+    const app = createApp({ registry, stores, judge });
+    const session = await app.request("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link }),
+    });
+    expect(session.status).toBe(200);
+    const cookie = (session.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const authed = (extra?: Record<string, string>) => ({ cookie, ...(extra ?? {}) });
+
+    // Create RMSNorm unit (passed with 1 hint) + LayerNorm concept unit (different topic, rests_on: [])
+    const rmsRes = await app.request("/api/units", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        text: "RMSNorm backward pass computes grad_x = inv_rms * (grad_x_hat - x_hat * (grad_x_hat * x_hat).mean(-1)) via the scale path.",
+        kind: "mechanism",
+        topic: "RMSNorm backward",
+      }),
+    });
+    const rmsId = ((await rmsRes.json()) as { unit_id: string }).unit_id;
+
+    // Log a passing probe on RMSNorm with 1 hint
+    const store = stores.get(user.id);
+    const now = Date.now();
+    await app.request("/api/drill/check", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        unit_id: rmsId,
+        depth: "recall",
+        prompt: "Derive RMSNorm backward",
+        attempt: "inv_rms * (g - x_hat * mean(g * x_hat))",
+        latency_ms: 4_000,
+        hints_used: 1,
+      }),
+    });
+
+    const lnRes = await app.request("/api/units", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        text: "In the LayerNorm backward pass, projecting `grad_x_hat` onto `x_hat` uses `.mean(-1)` rather than `.sum(-1)` because unit variance gives ||x_hat||^2 = D.",
+        kind: "concept",
+        topic: "Broadcasting in forward pass",
+      }),
+    });
+    const lnId = ((await lnRes.json()) as { unit_id: string }).unit_id;
+    store.catchUp();
+
+    // 1. Conceptual unit mentioning `backward` and backticked `.mean(-1)` must NOT be forced into faded_skeleton!
+    const lnUnit = store.state.units[lnId]!;
+    expect(pickRepModality(lnUnit, store.state, "recall", [])).toBe("direct");
+
+    // 2. Evidence-aware related context finds RMSNorm across different topics even with rests_on=[] and labels provenance honestly.
+    const related = buildRelatedEvidenceContext(store.state, lnUnit, now + 5_000);
+    expect(related.length).toBeGreaterThanOrEqual(1);
+    expect(related[0]).toContain("worked through with 1 hint");
+    expect(related[0]).toContain("RMSNorm backward pass");
+
+    // 3. Clarify with help_level="solution" records assistance=2, preserves immutable exercise, and passes relatedEvidence.
+    const attemptId = "01a22000-0000-7000-8000-000000000042";
+    const clRes = await app.request("/api/drill/check", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        unit_id: lnId,
+        depth: "recall",
+        prompt: "Why does LayerNorm projection divide by D?",
+        attempt: "teach me the full derivation",
+        clarify: true,
+        latency_ms: 3_000,
+        hints_used: 0,
+      }),
+    });
+    expect(clRes.status).toBe(200);
+    expect(capturedClarifyPrompt).toContain("RMSNorm backward pass");
+    const midAttempt = store.getAttempt(attemptId)!;
+    expect(midAttempt.assistance_count).toBe(2);
+    expect(midAttempt.exercise?.prompt).toBe("Why does LayerNorm projection divide by D?");
+
+    // 4. Subsequent initial /api/drill/check applies the EXACT same grade clamp (again, NOT good!) and keeps immutable exercise.
+    const chkRes = await app.request("/api/drill/check", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        attempt_id: attemptId,
+        unit_id: lnId,
+        depth: "recall",
+        prompt: "DIFFERENT_PROMPT_THAT_MUST_NOT_OVERRIDE",
+        attempt: "because ||x_hat||^2 = D",
+        latency_ms: 5_000,
+        hints_used: 0,
+      }),
+    });
+    const chk = (await chkRes.json()) as { ok: boolean; grade: string };
+    expect(chk.ok).toBe(true);
+    expect(chk.grade).toBe("again");
+    expect(store.getAttempt(attemptId)?.exercise?.prompt).toBe("Why does LayerNorm projection divide by D?");
+
+    // 5. Shared policy check: 1 hint clamps good -> hard; 2 hints clamps good -> again.
+    expect(
+      resolveEffectiveGrade({ rawGrade: "good", showPivot: false, storedAssistance: 1, clientHints: 0, priorGradedMisses: 0 }),
+    ).toEqual({ finalGrade: "hard", effectiveHints: 1 });
+    expect(
+      resolveEffectiveGrade({ rawGrade: "easy", showPivot: false, storedAssistance: 2, clientHints: 0, priorGradedMisses: 0 }),
+    ).toEqual({ finalGrade: "again", effectiveHints: 2 });
   });
 });

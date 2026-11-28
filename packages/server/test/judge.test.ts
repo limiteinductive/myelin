@@ -371,7 +371,19 @@ for await (const line of rl) {
       bodies.push(String(init?.body ?? ""));
       n++;
       return new Response(
-        JSON.stringify({ choices: [{ message: { content: n === 1 ? "First hat question?" : "Unseen card transfer question?" } }] }),
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify(
+                  n === 1
+                    ? { prompt: "First hat question?", expected_crux: "Sum indicator expectations by linearity." }
+                    : { prompt: "Unseen card transfer question?", expected_crux: "Apply linearity of expectation to indicators." },
+                ),
+              },
+            },
+          ],
+        }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     };
@@ -457,7 +469,18 @@ for await (const line of rl) {
       attempt++;
       if (attempt === 1) return new Response("upstream 503", { status: 503 });
       return new Response(
-        JSON.stringify({ choices: [{ message: { content: "A real generated prompt?" } }] }),
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  prompt: "A real generated prompt?",
+                  expected_crux: "Dividing by n - 1 corrects sample mean bias.",
+                }),
+              },
+            },
+          ],
+        }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     };
@@ -485,7 +508,7 @@ for await (const line of rl) {
     expect(parsedTab?.message).toBe("Shape is $d_k \\times d_v$ and $L \\times L$.");
   });
 
-  it("tidies rough code cosmetically via cheap model and strips accidental markdown fences", async () => {
+  it("tidies rough code cosmetically inheriting base model by default, respects explicit tidyModel override, and strips accidental markdown fences", async () => {
     const bodies: string[] = [];
     const mockFetch: typeof fetch = async (_url, init) => {
       bodies.push(String(init?.body ?? ""));
@@ -499,8 +522,12 @@ for await (const line of rl) {
     const judge = new FastJudge({ apiKey: "test-key", fetchFn: mockFetch });
     const out = await judge.tidyInput("def rms_norm(x)\n  ret x/rms");
     expect(out).toEqual({ text: "def rms_norm(x):\n    return x / rms", changed: true });
-    expect(bodies[0]).toContain("google/gemini-2.5-flash-lite");
+    expect(bodies[0]).toContain("google/gemini-4-neon");
     expect(bodies[0]).toContain("NEVER complete unfinished code");
+
+    const explicitTidy = new FastJudge({ apiKey: "test-key", tidyModel: "google/gemini-2.5-flash-lite", fetchFn: mockFetch });
+    await explicitTidy.tidyInput("def rms_norm(x)\n  ret x/rms");
+    expect(bodies[1]).toContain("google/gemini-2.5-flash-lite");
   });
 
   it("consolidates learner memory in dream() and injects learnerMemory into check() and promptFor()", async () => {
@@ -528,7 +555,18 @@ for await (const line of rl) {
         );
       }
       return new Response(
-        JSON.stringify({ choices: [{ message: { content: "A calibrated prompt?" } }] }),
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  prompt: "A calibrated prompt?",
+                  expected_crux: "Gamma broadcasts across the trailing feature dimension.",
+                }),
+              },
+            },
+          ],
+        }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     };
