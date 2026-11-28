@@ -329,6 +329,91 @@ describe("AgyAcpClient persistent daemon, stateful KV sessions, concurrency & ca
       );
       expect(fgPrompt).toContain("model=gemini-4-neon-low");
 
+      // Unified attempt session: Ask -> Submit (miss) -> Ask -> Submit (pass) -> Post-Rep follow-up
+      // ALL share ONE ACP sessionKey & ONE system prompt with monotonic turns 1..5 and tiny delta prompts!
+      const unifiedKey = "attempt:u1:att-unified";
+      const bigContext = `<learner_profile>\nPrefers explicit index notation.\n${"x".repeat(400)}\n</learner_profile>`;
+
+      const u1 = await judge.clarifyDrill({
+        sessionKey: unifiedKey,
+        expectedPriorTurns: 0,
+        priorClarifyCount: 0,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        question: "what is s?",
+        turns: [],
+        situationalContext: bigContext,
+      });
+      const sidMatch = /sid=(sess-\d+)/.exec(u1.message);
+      expect(sidMatch?.[1]).toBeTruthy();
+      expect(u1.message).toContain("turn=1");
+
+      const u2 = await judge.check({
+        sessionKey: unifiedKey,
+        expectedPriorTurns: 1,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        unitKind: "concept",
+        depth: "recall",
+        restsOn: [],
+        attempt: "sum(g * x_hat)",
+        situationalContext: bigContext,
+        latencyMs: 5000,
+        hintsUsed: 0,
+      });
+      expect(u2.ok).toBe(false);
+      expect(u2.message).toContain(`sid=${sidMatch![1]}`);
+      expect(u2.message).toContain("turn=2");
+      expect(Number(/chars=(\d+)/.exec(u2.message)?.[1] ?? 9999)).toBeLessThan(120);
+
+      const u3 = await judge.clarifyDrill({
+        sessionKey: unifiedKey,
+        expectedPriorTurns: 2,
+        priorClarifyCount: 1,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        question: "why divide by D?",
+        turns: [],
+        situationalContext: bigContext,
+      });
+      expect(u3.message).toContain(`sid=${sidMatch![1]}`);
+      expect(u3.message).toContain("turn=3");
+      expect(Number(/chars=(\d+)/.exec(u3.message)?.[1] ?? 9999)).toBeLessThan(120);
+
+      const u4 = await judge.continueRep({
+        sessionKey: unifiedKey,
+        expectedPriorTurns: 3,
+        prompt: "Derive LayerNorm grad",
+        unitText: "LayerNorm projection uses mean(-1)",
+        unitKind: "concept",
+        depth: "recall",
+        restsOn: [],
+        attempt: "sum(g * x_hat)",
+        feedback: u2.message,
+        turns: [],
+        reply: "PASS_ME because ||x_hat||^2 = D so mean(-1)",
+        situationalContext: bigContext,
+        latencyMs: 7000,
+        hintsUsed: 1,
+      });
+      expect(u4.ok).toBe(true);
+      expect(u4.message).toContain(`sid=${sidMatch![1]}`);
+      expect(u4.message).toContain("turn=4");
+      expect(Number(/chars=(\d+)/.exec(u4.message)?.[1] ?? 9999)).toBeLessThan(120);
+
+      // Post-rep follow-up reuses the EXACT SAME warm session after pass (not closed on pass!)
+      const u5 = await judge.postRepFollowUp({
+        sessionKey: unifiedKey,
+        expectedPriorTurns: 4,
+        situationalContext: bigContext,
+        priorExchange: "",
+        reply: "How does this compare to RMSNorm?",
+        grade: "hard",
+      });
+      expect(u5.message).toContain(`sid=${sidMatch![1]}`);
+      expect(u5.message).toContain("turn=5");
+      expect(Number(/chars=(\d+)/.exec(u5.message)?.[1] ?? 9999)).toBeLessThan(120);
+
       // Atomic ACP delta safety: if a cached session is closed/evicted before turn 2, ACP sends the full prompt (never an orphan delta).
       judge.closeSession("clarify:a1");
       const cl3 = await judge.clarifyDrill({

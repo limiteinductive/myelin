@@ -1,9 +1,14 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { uuidv7 } from "@myelin/core";
+import { makeEvent, uuidv7 } from "@myelin/core";
 import { afterEach, describe, expect, it } from "vitest";
-import { buildRelatedEvidenceContext, createApp, resolveEffectiveGrade } from "../src/app.js";
+import {
+  buildRelatedEvidenceContext,
+  buildSituationalContextPacket,
+  createApp,
+  resolveEffectiveGrade,
+} from "../src/app.js";
 import { FastJudge } from "../src/judge.js";
 import { Registry } from "../src/registry.js";
 import { pickRepModality } from "../src/rwkv.js";
@@ -1225,7 +1230,7 @@ describe("v2 drill and map API", () => {
     let capturedClarifyPrompt = "";
     const mockFetch: typeof fetch = async (_url, init) => {
       const bodyStr = String(init?.body ?? "");
-      if (bodyStr.includes("Learner question:")) {
+      if (bodyStr.includes('mode=\\"CLARIFY\\"') || bodyStr.includes("Learner question:")) {
         capturedClarifyPrompt = bodyStr;
         return new Response(
           JSON.stringify({
@@ -1373,5 +1378,253 @@ describe("v2 drill and map API", () => {
     expect(
       resolveEffectiveGrade({ rawGrade: "easy", showPivot: false, storedAssistance: 2, clientHints: 0, priorGradedMisses: 0 }),
     ).toEqual({ finalGrade: "again", effectiveHints: 2 });
+  });
+
+  it("builds a rich situational context packet, routes post-rep follow-ups with rep_fix, and serves cached production prompts without blocking on cold MCQs", async () => {
+    dir = mkdtempSync(join(tmpdir(), "myelin-phase1-ctx-"));
+    registry = new Registry(dir);
+    stores = new Stores(dir);
+    const user = registry.createUser("ben");
+    const link = registry.issueLink(user.id);
+
+    let capturedPostRepBody = "";
+    let mcqGenCalls = 0;
+    const mockFetch: typeof fetch = async (_url, init) => {
+      const bodyStr = String(init?.body ?? "");
+      if (bodyStr.includes("competitive 3- or 4-choice MCQ")) {
+        mcqGenCalls++;
+        return new Response(JSON.stringify({ choices: [{ message: { content: "{}" } }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (bodyStr.includes('mode=\\"POST_REP\\"')) {
+        capturedPostRepBody = bodyStr;
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    message: "Fair catch — adjusting the grade to good and clarifying the unit wording.",
+                    rep_fix: {
+                      reworded_unit: "LayerNorm backward pass projects grad_x_hat onto x_hat using .mean(-1) because ||x_hat||^2 = D.",
+                      recommended_grade: "good",
+                      improved_prompt: null,
+                    },
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (bodyStr.includes("expected_crux") && !bodyStr.includes("<turn ")) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    prompt: "Why does LayerNorm backward divide the projection term by D?",
+                    expected_crux: "Unit variance gives ||x_hat||^2 = D, so projecting onto x_hat divides by D (mean).",
+                  }),
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  closed: true,
+                  demonstrated: true,
+                  quality: "hesitant",
+                  message: "Right—||x_hat||^2 = D.",
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    };
+
+    const judge = new FastJudge({ apiKey: "test-key", llmModel: "google/gemini-4-neon", enableJev: false, fetchFn: mockFetch });
+    const app = createApp({ registry, stores, judge });
+    const session = await app.request("/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: link }),
+    });
+    const cookie = (session.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const authed = (extra?: Record<string, string>) => ({ cookie, ...(extra ?? {}) });
+    const store = stores.get(user.id);
+    const now = Date.now();
+
+    // Seed learner profile + 4 units:
+    // 1. Target LayerNorm unit (stamped with stale Exploration topic "Broadcasting in forward pass")
+    // 2. Unrelated einsum unit with the SAME stale Exploration topic (must lose to RMSNorm!)
+    // 3. Passed RMSNorm VJP unit (different topic, high math/token overlap)
+    // 4. Recently FAILED sibling LayerNorm scale-path unit (must surface with honest "struggled" tag!)
+    store.saveAgentMemory({
+      key: "learner",
+      content: "Prefers explicit index notation and algebraic derivations.",
+      last_dream_seq: 0,
+      last_dream_at: now,
+      dream_count: 1,
+      updated_at: now,
+      updated_by: "dream",
+    });
+    const uLn = uuidv7(now - 10_000);
+    const uEinsum = uuidv7(now - 9_000);
+    const uRms = uuidv7(now - 8_000);
+    const uFailedSibling = uuidv7(now - 7_000);
+    store.append([
+      makeEvent(
+        "unit.found",
+        { unit_id: uLn, text: "In LayerNorm backward, projecting grad_x_hat onto x_hat uses mean(-1) because ||x_hat||^2 = D.", kind: "distinction", topic: "Broadcasting in forward pass", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 10_000), device_id: "server:drill", ts: now - 10_000 },
+      ),
+      makeEvent(
+        "unit.found",
+        { unit_id: uEinsum, text: "In torch.einsum, repeated letters across inputs sum over that axis.", kind: "concept", topic: "Broadcasting in forward pass", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 9_000), device_id: "server:drill", ts: now - 9_000 },
+      ),
+      makeEvent(
+        "unit.found",
+        { unit_id: uRms, text: "RMSNorm backward pass computes grad_x = inv_rms * (grad_x_hat - x_hat * mean(grad_x_hat * x_hat)).", kind: "mechanism", topic: "RMSNorm VJP", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 8_000), device_id: "server:drill", ts: now - 8_000 },
+      ),
+      makeEvent(
+        "unit.found",
+        { unit_id: uFailedSibling, text: "LayerNorm backward splits grad_x_hat into mean subtraction and variance scale paths.", kind: "mechanism", topic: "LayerNorm", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 7_000), device_id: "server:drill", ts: now - 7_000 },
+      ),
+      makeEvent(
+        "unit.probed",
+        { unit_id: uEinsum, depth: "recall", slot: "seam", prompt: "einsum?", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 5000, scheduler: "fsrs", predicted_recall: 0.5 },
+        { id: uuidv7(now - 6 * 3_600_000), device_id: "server:drill", ts: now - 6 * 3_600_000 },
+      ),
+      makeEvent(
+        "unit.probed",
+        { unit_id: uRms, depth: "recall", slot: "seam", prompt: "RMSNorm backward?", answer_message_id: null, grade: "good", corrected_grade: null, hints: 0, latency_ms: 6000, scheduler: "fsrs", predicted_recall: 0.5 },
+        { id: uuidv7(now - 20 * 60_000), device_id: "server:drill", ts: now - 20 * 60_000 },
+      ),
+      makeEvent(
+        "unit.probed",
+        { unit_id: uFailedSibling, depth: "recall", slot: "seam", prompt: "LayerNorm two paths?", answer_message_id: null, grade: "again", corrected_grade: null, hints: 2, latency_ms: 9000, scheduler: "fsrs", predicted_recall: 0.4 },
+        { id: uuidv7(now - 10 * 60_000), device_id: "server:drill", ts: now - 10 * 60_000 },
+      ),
+    ]);
+
+    // Record source exploration & sitting attempt history
+    store.saveExploration({
+      id: "exp-origin-ln",
+      title: "Broadcasting in forward pass",
+      turns: [{ user: "Wait why does projecting onto x_hat divide by D instead of norm squared?", coach: "Because unit variance makes ||x_hat||^2 = D." }],
+      crystallized_units: [{ unit_id: uLn, text: "LayerNorm projection", kind: "distinction", observe_only: false }],
+      created_at: now - 3_600_000,
+      updated_at: now - 3_600_000,
+    });
+    store.upsertAttempt({
+      attempt_id: "att-sibling-recent",
+      unit_id: uFailedSibling,
+      depth: "recall",
+      prompt: "LayerNorm two paths?",
+      first_attempt: "forgot the scale path factor",
+      turns: [{ user: "forgot the scale path factor", coach: "Include the inv_std derivative." }],
+      status: "passed",
+      assistance_count: 2,
+      active_ms: 9000,
+      probe_id: null,
+      grade: "again",
+      result: null,
+      created_at: now - 10 * 60_000,
+      updated_at: now - 10 * 60_000,
+    });
+    store.catchUp();
+
+    // 1. Situational Context Packet includes profile, origin exploration, 3h sitting trajectory, AND both RMSNorm + failed sibling (outscoring einsum)
+    const lnUnit = store.state.units[uLn]!;
+    const packet = buildSituationalContextPacket({
+      state: store.state,
+      store,
+      unit: lnUnit,
+      now,
+      depth: "recall",
+      prompt: "Why divide by D?",
+      learnerMemory: store.getAgentMemory("learner")?.content,
+    });
+    expect(packet).toContain("<learner_profile>");
+    expect(packet).toContain("explicit index notation");
+    expect(packet).toContain('Source exploration "Broadcasting in forward pass"');
+    expect(packet).toContain("<sitting_trajectory window=\"last_3h\">");
+    expect(packet).toContain("LayerNorm backward splits grad_x_hat");
+    expect(packet).toContain("struggled");
+    expect(packet).toContain("RMSNorm backward pass");
+    expect(packet).not.toContain("torch.einsum");
+
+    // 2. Cached production prompt serves immediately in /api/drill/next without blocking synchronously on a cold MCQ!
+    await judge.promptEntryFor(lnUnit, [], "recall", { variant: 0, modality: "contrast" });
+    const nextRes = await app.request(
+      `/api/drill/next?unit_id=${uLn}&sitting_id=${uuidv7()}&sitting_size=8`,
+      { headers: authed() },
+    );
+    const nextData = (await nextRes.json()) as { rep: { modality: string; prompt: string } };
+    expect(nextData.rep.modality).not.toBe("mcq");
+    expect(nextData.rep.prompt).toContain("divide");
+    // Background warmMcqs may run async after response, wait a tick — crucially /api/drill/next returned cached production immediately!
+    expect(mcqGenCalls).toBeLessThanOrEqual(1);
+
+    // 3. Complete attempt -> post-rep follow-up with rep_context.attempt_id routes via postRepFollowUp and applies rep_fix!
+    const attId = "att-post-rep-1";
+    const chk = await (
+      await app.request("/api/drill/check", {
+        method: "POST",
+        headers: authed({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          attempt_id: attId,
+          unit_id: uLn,
+          depth: "recall",
+          prompt: "Why divide by D?",
+          attempt: "||x_hat||^2 = D",
+          latency_ms: 4000,
+          hints_used: 0,
+        }),
+      })
+    ).json() as { ok: boolean; grade: string; probe_id: string };
+    expect(chk.ok).toBe(true);
+    expect(chk.grade).toBe("hard");
+
+    const postRes = await app.request("/api/drill/explore", {
+      method: "POST",
+      headers: authed({ "content-type": "application/json" }),
+      body: JSON.stringify({
+        mode: "post_rep",
+        initial: "Completed practice on: LayerNorm",
+        reply: "That grade felt too harsh — I got it cleanly.",
+        rep_context: {
+          attempt_id: attId,
+          unit_id: uLn,
+          depth: "recall",
+          prompt: "Why divide by D?",
+          probe_id: chk.probe_id,
+          grade: chk.grade,
+        },
+      }),
+    });
+    expect(postRes.status).toBe(200);
+    const postData = (await postRes.json()) as { rep_fix_applied?: { grade?: string; reworded_unit?: string } };
+    expect(capturedPostRepBody).toContain('mode=\\"POST_REP\\"');
+    expect(capturedPostRepBody).toContain("RMSNorm backward pass");
+    expect(postData.rep_fix_applied?.grade).toBe("good");
+    expect(postData.rep_fix_applied?.reworded_unit).toContain("projects grad_x_hat");
   });
 });

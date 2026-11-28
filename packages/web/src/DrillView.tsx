@@ -2518,6 +2518,7 @@ export function DrillView() {
             ...(b.added && b.added.length > 0 ? { added: b.added } : {}),
           })),
           rep_context: {
+            attempt_id: vNow?.attempt_id ?? unitSession()?.attemptId ?? r.attempt_id ?? null,
             unit_id: r.unit_id,
             depth: r.depth,
             prompt: r.prompt,

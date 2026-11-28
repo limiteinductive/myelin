@@ -722,24 +722,18 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
 
     const store = stores.get(user.id);
     const now = Date.now();
-    const uConcept = uuidv7(now - 3000);
-    const uCode = uuidv7(now - 2000);
-    const uCode2 = uuidv7(now - 1000);
+    const uConcept = uuidv7(now - 4000);
+    const uCodeLeak = uuidv7(now - 3000);
     store.append([
       makeEvent(
         "unit.found",
         { unit_id: uConcept, text: "Zero covariance does not imply statistical independence.", kind: "concept", topic: "Probability", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 4000), device_id: "server:drill", ts: now - 4000 },
+      ),
+      makeEvent(
+        "unit.found",
+        { unit_id: uCodeLeak, text: "Implement stable row-wise log-softmax in torch using dim=-1 and keepdim=True.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
         { id: uuidv7(now - 3000), device_id: "server:drill", ts: now - 3000 },
-      ),
-      makeEvent(
-        "unit.found",
-        { unit_id: uCode, text: "Implement stable row-wise logsumexp in torch using dim=-1 and keepdim=True.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
-        { id: uuidv7(now - 2000), device_id: "server:drill", ts: now - 2000 },
-      ),
-      makeEvent(
-        "unit.found",
-        { unit_id: uCode2, text: "Implement stable softmax backward in torch along dim=-1.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
-        { id: uuidv7(now - 1000), device_id: "server:drill", ts: now - 1000 },
       ),
     ]);
 
@@ -771,13 +765,21 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
     // 2. Anti-spoiler verifier rejects leaking preliminary gate -> falls back cleanly to ordinary production!
     leakMode = true;
     const leakRes = await (
-      await app.request(`/api/drill/next?unit_id=${uCode}&sitting_id=${sitting1}&sitting_size=8`, { headers: authed() })
+      await app.request(`/api/drill/next?unit_id=${uCodeLeak}&sitting_id=${sitting1}&sitting_size=8`, { headers: authed() })
     ).json() as { rep: { modality: string; mcq?: unknown } };
     expect(leakRes.rep.modality).not.toBe("mcq");
     expect(leakRes.rep.mcq).toBeUndefined();
 
     // 3. Clean preliminary gate -> Pass Stage 1 -> zero probe emitted yet -> atomic Stage 2 resume -> Stage 2 settle emits 1 probe!
     leakMode = false;
+    const uCode = uuidv7(now - 2000);
+    store.append([
+      makeEvent(
+        "unit.found",
+        { unit_id: uCode, text: "Implement stable row-wise logsumexp in torch using dim=-1 and keepdim=True.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 2000), device_id: "server:drill", ts: now - 2000 },
+      ),
+    ]);
     const sitting2 = uuidv7();
     const gRes = await (
       await app.request(`/api/drill/next?unit_id=${uCode}&sitting_id=${sitting2}&sitting_size=8`, { headers: authed() })
@@ -813,6 +815,14 @@ describe("MCQ validation, scheduling isolation, and HTTP lifecycle", () => {
     expect(resumeRes.rep.gate_summary?.chosen_text).toContain("row 2");
 
     // 4. Explicit IDK on a preliminary gate short-circuits cleanly & allows "Try the full problem anyway"!
+    const uCode2 = uuidv7(now - 1000);
+    store.append([
+      makeEvent(
+        "unit.found",
+        { unit_id: uCode2, text: "Implement stable softmax backward in torch along dim=-1.", kind: "move", topic: "Numerical", rests_on: [], origin: "need", told: false, observe_only: false, message_id: null },
+        { id: uuidv7(now - 1000), device_id: "server:drill", ts: now - 1000 },
+      ),
+    ]);
     const sitting3 = uuidv7();
     const g2Res = await (
       await app.request(`/api/drill/next?unit_id=${uCode2}&sitting_id=${sitting3}&sitting_size=8`, { headers: authed() })

@@ -613,7 +613,7 @@ for await (const line of rl) {
           { status: 200, headers: { "content-type": "application/json" } },
         );
       }
-      if (b.includes("expected_crux") && b.includes("Return ONLY valid JSON")) {
+      if (b.includes("expected_crux") && b.includes("Return ONLY valid JSON") && !b.includes("<turn ")) {
         return new Response(
           JSON.stringify({
             choices: [
@@ -773,7 +773,7 @@ for await (const line of rl) {
     });
     expect(explicitReveal.ok).toBe(true);
     expect(explicitReveal.grade).toBe("again");
-    expect(calls[calls.length - 1]?.body).toContain("SHOW_ANSWER");
+    expect(calls[calls.length - 1]?.body).toContain('mode=\\"REVEAL\\"');
   });
 
   it("generates adaptive fix_bug starters via promptEntryFor and parses Dream map compaction proposals", async () => {

@@ -455,6 +455,64 @@ export class EventStore {
     return r ? this.parseAttemptRow(r) : null;
   }
 
+  /** Returns the most recent attempts for a specific unit (newest first), using drill_attempts_unit_status. */
+  listUnitAttempts(unitId: string, limit = 3): DrillAttemptRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM drill_attempts WHERE unit_id = ? ORDER BY updated_at DESC LIMIT ?")
+      .all(unitId, Math.max(1, limit)) as unknown as Record<string, unknown>[];
+    return rows.map((r) => this.parseAttemptRow(r));
+  }
+
+  /** Returns recent drill attempts across all units since `sinceTs` (newest first) for sitting-trajectory & Dreaming. */
+  listRecentAttempts(sinceTs = 0, limit = 20, excludeAttemptId?: string): DrillAttemptRecord[] {
+    const rows = excludeAttemptId
+      ? (this.db
+          .prepare("SELECT * FROM drill_attempts WHERE updated_at >= ? AND attempt_id != ? ORDER BY updated_at DESC LIMIT ?")
+          .all(sinceTs, excludeAttemptId, Math.max(1, limit)) as unknown as Record<string, unknown>[])
+      : (this.db
+          .prepare("SELECT * FROM drill_attempts WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT ?")
+          .all(sinceTs, Math.max(1, limit)) as unknown as Record<string, unknown>[]);
+    return rows.map((r) => this.parseAttemptRow(r));
+  }
+
+  /**
+   * Finds the source Exploration (if any) that crystallized `unitId`, returning its title and
+   * the learner's closing/origin turn excerpt so the coach sees unresolved confusion at birth.
+   */
+  findUnitOriginExploration(unitId: string): {
+    exploration_id: string;
+    title: string;
+    user_excerpt: string | null;
+    last_user_excerpt: string | null;
+    turns_count: number;
+    created_at: number;
+  } | null {
+    const rows = this.db
+      .prepare(
+        "SELECT id, title, turns_json, crystallized_units_json, created_at FROM explorations WHERE crystallized_units_json LIKE ? OR turns_json LIKE ? ORDER BY updated_at DESC LIMIT 3",
+      )
+      .all(`%${unitId}%`, `%${unitId}%`) as unknown as Record<string, unknown>[];
+    for (const r of rows) {
+      const turns = JSON.parse(String(r.turns_json || "[]")) as StoredBriefingTurn[];
+      const cryst = JSON.parse(String(r.crystallized_units_json || "[]")) as { unit_id?: string }[];
+      const inCryst = cryst.some((c) => c?.unit_id === unitId);
+      const matchedTurnIdx = turns.findIndex((t) => Array.isArray(t.added) && t.added.some((a) => a?.unit_id === unitId));
+      if (!inCryst && matchedTurnIdx < 0) continue;
+      const matchedUser = matchedTurnIdx >= 0 ? (turns[matchedTurnIdx]?.user ?? "").replace(/\s+/g, " ").trim().slice(0, 180) : null;
+      const lastTurn = turns.at(-1);
+      const lastUser = lastTurn?.user ? lastTurn.user.replace(/\s+/g, " ").trim().slice(0, 180) : null;
+      return {
+        exploration_id: String(r.id),
+        title: String(r.title || "Exploration"),
+        user_excerpt: matchedUser || null,
+        last_user_excerpt: lastUser && lastUser !== matchedUser ? lastUser : null,
+        turns_count: turns.length,
+        created_at: Number(r.created_at ?? 0),
+      };
+    }
+    return null;
+  }
+
   /** Returns the latest active (in-progress) attempt per unit for cross-device resume. */
   getActiveAttempts(): DrillAttemptRecord[] {
     const rows = this.db
@@ -775,29 +833,6 @@ export class EventStore {
   deleteExploration(id: string): boolean {
     const info = this.db.prepare("DELETE FROM explorations WHERE id = ?").run(id);
     return Number(info.changes ?? 0) > 0;
-  }
-
-  /** Recent drill attempt transcripts (both passed and active) since `sinceMs` for offline Dreaming. */
-  listRecentAttempts(sinceMs = 0, limit = 20): DrillAttemptRecord[] {
-    const rows = this.db
-      .prepare("SELECT * FROM drill_attempts WHERE updated_at >= ? ORDER BY updated_at DESC LIMIT ?")
-      .all(sinceMs, limit) as unknown as Record<string, unknown>[];
-    return rows.map((r) => ({
-      attempt_id: String(r.attempt_id),
-      unit_id: String(r.unit_id),
-      depth: String(r.depth),
-      prompt: String(r.prompt),
-      first_attempt: String(r.first_attempt),
-      turns: JSON.parse(String(r.turns_json || "[]")) as StoredAttemptTurn[],
-      status: String(r.status) as DrillAttemptRecord["status"],
-      assistance_count: Number(r.assistance_count ?? 0),
-      active_ms: r.active_ms === null || r.active_ms === undefined ? null : Number(r.active_ms),
-      probe_id: r.probe_id === null || r.probe_id === undefined ? null : String(r.probe_id),
-      grade: r.grade === null || r.grade === undefined ? null : String(r.grade),
-      result: r.result_json ? (JSON.parse(String(r.result_json)) as Record<string, unknown>) : null,
-      created_at: Number(r.created_at ?? 0),
-      updated_at: Number(r.updated_at ?? 0),
-    }));
   }
 
   // --- Lean Agent Memory (learner.md) & Offline Dreaming Consolidation Logs ---

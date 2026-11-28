@@ -73,11 +73,30 @@ const RELATED_STOPWORDS = new Set([
   "because", "where", "which", "while", "since", "through", "between", "across", "along", "about",
 ]);
 
+const SHORT_MATH_TOKENS = new Set([
+  "ln", "kl", "ce", "l1", "l2", "l0", "qd", "qk", "kv", "nn", "sd", "lr", "wd", "bf", "fp", "pi", "mu", "nu", "xi",
+]);
+
 function domainTokens(text: string): Set<string> {
   const out = new Set<string>();
-  const matches = text.toLowerCase().match(/[a-z][a-z0-9_]{2,}/g) ?? [];
+  const lower = text.toLowerCase();
+  // Capture LaTeX commands (\nabla, \sigma, \partial, \operatorname{cov}, etc.)
+  const latexMatches = lower.match(/\\([a-z]{2,})/g) ?? [];
+  for (const m of latexMatches) {
+    const cmd = m.slice(1);
+    if (!RELATED_STOPWORDS.has(cmd) && cmd !== "text" && cmd !== "mathbf" && cmd !== "mathrm" && cmd !== "mathcal" && cmd !== "left" && cmd !== "right" && cmd !== "frac" && cmd !== "cdot" && cmd !== "operatorname") {
+      out.add(cmd);
+    }
+  }
+  // Capture standard >=3-char alphanumeric/snake_case tokens
+  const matches = lower.match(/[a-z][a-z0-9_]{2,}/g) ?? [];
   for (const tok of matches) {
     if (!RELATED_STOPWORDS.has(tok)) out.add(tok);
+  }
+  // Capture domain-meaningful 2-char symbols/abbreviations (ln, kl, l2, qk, kv, etc.)
+  const shortMatches = lower.match(/\b[a-z][a-z0-9]\b/g) ?? [];
+  for (const tok of shortMatches) {
+    if (SHORT_MATH_TOKENS.has(tok)) out.add(tok);
   }
   return out;
 }
@@ -92,23 +111,24 @@ function fmtShortAge(ms: number): string {
 
 /**
  * Retrieves up to `limit` compact, evidence-grounded related concepts (prerequisites, lexically
- * related units, and recent demonstrations) while strictly excluding the target unit and
- * answer-equivalent near-duplicates. Preserves honest provenance (MCQ vs. assisted vs. unaided).
+ * related units, recent demonstrations, AND recent struggles within 48h) while strictly excluding
+ * the target unit and answer-equivalent near-duplicates. Preserves honest provenance.
  */
 export function buildRelatedEvidenceContext(
   state: State,
   target: Unit,
   now: number,
-  limit = 4,
+  limit = 5,
 ): string[] {
-  const targetToks = domainTokens(`${target.text} ${target.topic ?? ""}`);
+  // Score lexical/math overlap strictly on unit text (not topic) so stale Turn-1 Exploration titles never inflate overlap.
+  const targetToks = domainTokens(target.text);
   const targetTopic = (target.topic ?? "").trim().toLowerCase();
   const restsSet = new Set(target.rests_on);
   const scored: { text: string; score: number; at: number }[] = [];
 
   for (const other of Object.values(state.units)) {
     if (other.id === target.id || other.status !== "active" || other.observe_only) continue;
-    const otherToks = domainTokens(`${other.text} ${other.topic ?? ""}`);
+    const otherToks = domainTokens(other.text);
     let overlap = 0;
     for (const t of targetToks) {
       if (otherToks.has(t)) overlap++;
@@ -119,49 +139,211 @@ export function buildRelatedEvidenceContext(
 
     const isPrereq = restsSet.has(other.id) || other.rests_on.includes(target.id);
     const otherTopic = (other.topic ?? "").trim().toLowerCase();
+    // Cap sameTopic to +1 so stale Turn-1 Exploration titles never drown out real lexical/math overlap.
     const sameTopic = Boolean(targetTopic && targetTopic !== "general" && otherTopic === targetTopic);
 
-    const passingProbes = other.evidence
+    const allSeamProbes = other.evidence
       .map((id) => state.evidence[id])
       .filter(
         (ev): ev is NonNullable<typeof ev> =>
-          Boolean(ev && ev.source === "probe" && ev.slot !== "in_context" && ev.grade && ev.grade !== "again"),
+          Boolean(ev && ev.source === "probe" && ev.slot !== "in_context" && ev.grade),
       )
       .sort((a, b) => a.at - b.at || a.seq - b.seq);
-    const latestPass = passingProbes.at(-1) ?? null;
+    const latestProbe = allSeamProbes.at(-1) ?? null;
 
-    if (!isPrereq && !latestPass) continue;
-    const relevance = (isPrereq ? 10 : 0) + (sameTopic ? 3 : 0) + overlap * 2.5;
+    if (!isPrereq && !latestProbe) continue;
+    const isRecentStruggle = Boolean(
+      latestProbe && latestProbe.grade === "again" && Math.max(0, now - latestProbe.at) <= 48 * 3_600_000,
+    );
+    if (!isPrereq && latestProbe && latestProbe.grade === "again" && !isRecentStruggle) continue;
+
+    const relevance = (isPrereq ? 10 : 0) + (sameTopic ? 1 : 0) + overlap * 2.5;
+    // Require genuine conceptual link (prereq or >=1 shared domain token) unless sameTopic + very recent.
     if (relevance <= 0) continue;
+    if (!isPrereq && overlap === 0 && (!latestProbe || now - latestProbe.at > 3 * 3_600_000)) continue;
 
     let recency = 0;
-    if (latestPass) {
-      const ageMs = Math.max(0, now - latestPass.at);
-      if (ageMs <= 2 * 3_600_000) recency = 5;
-      else if (ageMs <= 48 * 3_600_000) recency = 3;
+    if (latestProbe) {
+      const ageMs = Math.max(0, now - latestProbe.at);
+      if (ageMs <= 3 * 3_600_000) recency = latestProbe.grade === "again" ? 4.5 : 5;
+      else if (ageMs <= 48 * 3_600_000) recency = latestProbe.grade === "again" ? 2.5 : 3;
       else if (ageMs <= 7 * 86_400_000) recency = 1.5;
     }
 
     let tag: string;
-    if (latestPass) {
-      const age = fmtShortAge(now - latestPass.at);
-      const hints = latestPass.hints ?? 0;
-      const how =
-        latestPass.modality === "mcq"
-          ? "recognized via MCQ"
-          : hints === 0
-            ? "recalled unaided"
-            : `worked through with ${hints} ${hints === 1 ? "hint" : "hints"}`;
-      tag = `${how}, ${age}`;
+    if (latestProbe) {
+      const age = fmtShortAge(now - latestProbe.at);
+      const hints = latestProbe.hints ?? 0;
+      if (latestProbe.grade === "again") {
+        tag =
+          hints > 0
+            ? `struggled ${age}: ${hints} ${hints === 1 ? "assist" : "assists"}, grade=again`
+            : `struggled ${age}: grade=again`;
+      } else {
+        const how =
+          latestProbe.modality === "mcq"
+            ? "recognized via MCQ"
+            : hints === 0
+              ? `recalled unaided (${latestProbe.grade})`
+              : `worked through with ${hints} ${hints === 1 ? "hint" : "hints"} (${latestProbe.grade})`;
+        tag = `${how}, ${age}`;
+      }
     } else {
       tag = "prerequisite";
     }
     const snippet = other.text.replace(/\s+/g, " ").trim().slice(0, 220);
-    scored.push({ text: `[${tag}] ${snippet}`, score: relevance + recency, at: latestPass?.at ?? other.found_at });
+    scored.push({ text: `[${tag}] ${snippet}`, score: relevance + recency, at: latestProbe?.at ?? other.found_at });
   }
 
   scored.sort((a, b) => b.score - a.score || b.at - a.at);
   return scored.slice(0, limit).map((s) => s.text);
+}
+
+/**
+ * Compact `<1ms` Situational Context Packet injected once at Turn 1 of every unified attempt session
+ * (and into prompt generation / MCQ clarify). Gives the model the full longitudinal, provenance,
+ * sitting-trajectory, and conceptual-neighborhood picture without redundant prompt lectures.
+ */
+export function buildSituationalContextPacket(args: {
+  state: State;
+  store: ReturnType<Stores["get"]>;
+  unit: Unit;
+  now: number;
+  depth: Depth;
+  prompt: string;
+  expectedCrux?: string | null | undefined;
+  starter?: string | null | undefined;
+  modality?: string | undefined;
+  firstContact?: boolean | undefined;
+  bundledUnits?: string[] | undefined;
+  restsOn?: string[] | undefined;
+  activeHabits?: string[] | undefined;
+  learnerMemory?: string | null | undefined;
+  excludeAttemptId?: string | null | undefined;
+  includeReferenceTarget?: boolean | undefined;
+}): string {
+  const { state, store, unit, now } = args;
+  const sections: string[] = [];
+
+  const mem = (args.learnerMemory ?? "").trim();
+  const habits = (args.activeHabits ?? []).filter(Boolean).slice(0, 5);
+  if (mem || habits.length > 0) {
+    const profileLines: string[] = [];
+    if (mem) profileLines.push(mem.length > 1400 ? `${mem.slice(0, 1400).trimEnd()}…` : mem);
+    if (habits.length > 0) profileLines.push(`Active thinking moves: ${habits.join("; ")}`);
+    sections.push(`<learner_profile>\n${profileLines.join("\n")}\n</learner_profile>`);
+  }
+
+  const exLines = [`Prompt: ${args.prompt}`];
+  if (args.starter?.trim()) {
+    exLines.push(`Starter code:\n\`\`\`\n${args.starter.trim().slice(0, 800)}\n\`\`\``);
+  }
+  sections.push(
+    `<active_exercise kind="${unit.kind}" depth="${args.depth}"${args.modality ? ` modality="${args.modality}"` : ""} first_contact="${args.firstContact ? "yes" : "no"}">\n${exLines.join("\n")}\n</active_exercise>`,
+  );
+
+  if (args.includeReferenceTarget !== false) {
+    const refLines: string[] = [`Target unit: ${unit.text}`];
+    if (args.expectedCrux?.trim()) {
+      refLines.push(`Expected crux (grade strictly against this): ${args.expectedCrux.trim()}`);
+    }
+    if (args.bundledUnits?.length) {
+      refLines.push(`Also covered in this synthesis rep: ${args.bundledUnits.join(" | ")}`);
+    }
+    if (args.restsOn?.length) {
+      refLines.push(`Rests on: ${args.restsOn.join("; ")}`);
+    }
+
+    // Target unit longitudinal dossier (probes + past attempts + origin exploration)
+    const probes = unit.evidence
+      .map((id) => state.evidence[id])
+      .filter((ev): ev is NonNullable<typeof ev> => Boolean(ev && ev.source === "probe" && ev.slot !== "in_context"))
+      .sort((a, b) => a.at - b.at || a.seq - b.seq);
+    if (probes.length > 0) {
+      const recentProbes = probes.slice(-4).map((p) => {
+        const age = fmtShortAge(now - p.at);
+        const mod = p.modality === "mcq" ? "mcq" : p.depth;
+        const assists = p.hints ? `, ${p.hints}a` : "";
+        return `${age} ${mod}→${p.grade ?? "?"}${assists}`;
+      });
+      refLines.push(`Prior probes on this unit (${probes.length} total): ${recentProbes.join(" | ")}`);
+    }
+
+    const pastAttempts = store
+      .listUnitAttempts(unit.id, 4)
+      .filter((a) => a.attempt_id !== args.excludeAttemptId && (a.first_attempt.trim() || a.turns.length > 0))
+      .slice(0, 2);
+    if (pastAttempts.length > 0) {
+      const attLines = pastAttempts.map((a) => {
+        const age = fmtShortAge(now - a.updated_at);
+        const snippet = (a.first_attempt || a.turns[0]?.user || "").replace(/\s+/g, " ").trim().slice(0, 140);
+        const lastCoach = a.turns.filter((t) => !t.failed && t.coach.trim()).at(-1)?.coach.replace(/\s+/g, " ").trim().slice(0, 140);
+        return `  - ${age} (${a.grade ?? a.status}, ${a.assistance_count} assists): learner="${snippet}"${lastCoach ? ` → coach="${lastCoach}"` : ""}`;
+      });
+      refLines.push(`Recent attempts on this unit:\n${attLines.join("\n")}`);
+    }
+
+    const origin = store.findUnitOriginExploration(unit.id);
+    if (origin) {
+      const age = fmtShortAge(now - origin.created_at);
+      const excerpt = [origin.user_excerpt, origin.last_user_excerpt].filter(Boolean).join(" … ").slice(0, 280);
+      refLines.push(`Source exploration "${origin.title}" (${age}, ${origin.turns_count} turns)${excerpt ? `: ${excerpt}` : ""}`);
+    }
+
+    sections.push(`<reference_target hidden_from_learner="true">\n${refLines.join("\n")}\n</reference_target>`);
+  }
+
+  // Current sitting trajectory (last 3 hours across all units)
+  const recentSitting = store
+    .listRecentAttempts(now - 3 * 3_600_000, 6, args.excludeAttemptId ?? undefined)
+    .filter((a) => a.unit_id !== unit.id)
+    .slice(0, 5);
+  if (recentSitting.length > 0) {
+    const trajLines = recentSitting.map((a) => {
+      const age = fmtShortAge(now - a.updated_at);
+      const uRec = state.units[a.unit_id];
+      const label = (uRec?.text ?? a.prompt).replace(/\s+/g, " ").trim().slice(0, 110);
+      const outcome = a.grade ? `grade=${a.grade}` : a.status;
+      const assist = a.assistance_count > 0 ? `, ${a.assistance_count}a` : "";
+      return `- ${age} [${outcome}${assist}] ${label}`;
+    });
+    sections.push(`<sitting_trajectory window="last_3h">\n${trajLines.join("\n")}\n</sitting_trajectory>`);
+  }
+
+  const neighborhood = buildRelatedEvidenceContext(state, unit, now, 5);
+  if (neighborhood.length > 0) {
+    sections.push(`<conceptual_neighborhood>\n${neighborhood.map((x) => `- ${x}`).join("\n")}\n</conceptual_neighborhood>`);
+  }
+
+  return sections.join("\n\n");
+}
+
+function buildUnitPromptHistoryContext(
+  state: State,
+  store: ReturnType<Stores["get"]>,
+  unit: Unit,
+  now: number,
+): string | undefined {
+  const lines: string[] = [];
+  const pastAttempts = store
+    .listUnitAttempts(unit.id, 2)
+    .filter((a) => a.first_attempt.trim() || a.turns.length > 0);
+  if (pastAttempts.length > 0) {
+    const a = pastAttempts[0]!;
+    const age = fmtShortAge(now - a.updated_at);
+    const snippet = (a.first_attempt || a.turns[0]?.user || "").replace(/\s+/g, " ").trim().slice(0, 140);
+    lines.push(`Last attempt (${age}, ${a.grade ?? a.status}, ${a.assistance_count} assists): "${snippet}"`);
+  }
+  const origin = store.findUnitOriginExploration(unit.id);
+  if (origin) {
+    const excerpt = [origin.user_excerpt, origin.last_user_excerpt].filter(Boolean).join(" … ").slice(0, 220);
+    lines.push(`Origin exploration "${origin.title}"${excerpt ? `: ${excerpt}` : ""}`);
+  }
+  const neighbors = buildRelatedEvidenceContext(state, unit, now, 2);
+  if (neighbors.length > 0) {
+    lines.push(`Related context: ${neighbors.join(" | ")}`);
+  }
+  return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 /** Converts a clarification's help_level into durable assistance units (solution = 2 -> guarantees grade="again" on close). */
@@ -2074,7 +2256,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       promote_on_unit?: boolean;
       origin_prompt?: string;
       prior_post_turns?: { user: string; coach: string; question?: string; added?: { unit_id: string; text: string; kind: string; observe_only: boolean }[] }[];
-      rep_context?: { unit_id?: string; depth?: Depth; prompt?: string; probe_id?: string | null; grade?: Grade } | null;
+      rep_context?: { attempt_id?: string | null; unit_id?: string; depth?: Depth; prompt?: string; probe_id?: string | null; grade?: Grade } | null;
     } | null;
     const initial = (body?.initial ?? "").trim();
     const sketch = typeof body?.sketch_data_url === "string" && body.sketch_data_url.startsWith("data:image/") ? body.sketch_data_url : null;
@@ -2157,32 +2339,89 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         : null;
       const decoupleMeta = isStandaloneExploration && !repUnit;
 
-      const res = await judge.explore(
-        {
-          sessionKey: standaloneExpId ? `explore:${scopeExpKey(user.id, standaloneExpId)}` : undefined,
-          decoupleMeta,
-          initial,
-          sketchDataUrl: sketch,
-          turns,
-          reply: body?.reply?.trim() || undefined,
-          existingUnits,
+      const postAttemptId =
+        !isStandaloneExploration && typeof body?.rep_context?.attempt_id === "string" && body.rep_context.attempt_id.trim()
+          ? body.rep_context.attempt_id.trim()
+          : null;
+      const postAttempt = postAttemptId ? store.getAttempt(postAttemptId) : null;
+
+      let res: Awaited<ReturnType<typeof judge.explore>>;
+      if (!isStandaloneExploration && repUnit && postAttemptId) {
+        const repPrompt = postAttempt?.exercise?.prompt || postAttempt?.prompt || (body?.rep_context?.prompt ?? "").trim();
+        const repRestsOn = repUnit.rests_on.map((id) => state.units[id]?.text ?? id);
+        const postSituational = buildSituationalContextPacket({
+          state,
+          store,
+          unit: repUnit,
+          now: preNow,
+          depth: repDepth,
+          prompt: repPrompt,
+          expectedCrux: postAttempt?.exercise?.expected_crux ?? null,
+          starter: postAttempt?.exercise?.starter ?? null,
+          modality: postAttempt?.exercise?.modality ?? undefined,
+          restsOn: repRestsOn,
           activeHabits: habits,
           learnerMemory: learnerMemoryOf(store),
-          ...(repUnit
-            ? {
-                repContext: {
-                  unitText: repUnit.text,
-                  depth: repDepth,
-                  prompt: (body?.rep_context?.prompt ?? "").trim(),
-                  grade: repGrade,
-                },
-              }
-            : {}),
-        },
-        onText,
-        onPerf,
-        signal,
-      );
+          excludeAttemptId: postAttemptId,
+        });
+        const storedAttemptTurns = (postAttempt?.turns ?? []).filter((t) => !t.failed);
+        const priorPostTurnsCount = Array.isArray(body?.prior_post_turns) ? body.prior_post_turns.length : 0;
+        const priorLines: string[] = [];
+        for (const t of storedAttemptTurns) {
+          if (t.user.trim()) priorLines.push(`Learner: ${t.user.trim()}`);
+          if (t.coach.trim()) priorLines.push(`Coach: ${t.coach.trim()}`);
+        }
+        if (Array.isArray(body?.prior_post_turns)) {
+          for (const pt of body.prior_post_turns) {
+            if (typeof pt?.user === "string" && pt.user.trim()) priorLines.push(`Learner: ${pt.user.trim()}`);
+            if (typeof pt?.coach === "string" && pt.coach.trim()) priorLines.push(`Coach: ${pt.coach.trim()}`);
+          }
+        }
+        if (priorLines.length === 0 && turns.length > 0) {
+          for (const t of turns) priorLines.push(`${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`);
+        }
+        res = await judge.postRepFollowUp(
+          {
+            sessionKey: `attempt:${user.id}:${postAttemptId}`,
+            expectedPriorTurns: storedAttemptTurns.length + priorPostTurnsCount,
+            situationalContext: postSituational,
+            priorExchange: priorLines.join("\n"),
+            reply: body?.reply?.trim() || initial,
+            grade: repGrade,
+            sketchDataUrl: sketch,
+          },
+          onText,
+          onPerf,
+          signal,
+        );
+      } else {
+        res = await judge.explore(
+          {
+            sessionKey: standaloneExpId ? `explore:${scopeExpKey(user.id, standaloneExpId)}` : undefined,
+            decoupleMeta,
+            initial,
+            sketchDataUrl: sketch,
+            turns,
+            reply: body?.reply?.trim() || undefined,
+            existingUnits,
+            activeHabits: habits,
+            learnerMemory: learnerMemoryOf(store),
+            ...(repUnit
+              ? {
+                  repContext: {
+                    unitText: repUnit.text,
+                    depth: repDepth,
+                    prompt: (body?.rep_context?.prompt ?? "").trim(),
+                    grade: repGrade,
+                  },
+                }
+              : {}),
+          },
+          onText,
+          onPerf,
+          signal,
+        );
+      }
 
       if (signal?.aborted) {
         return { message: "", added_units: [] };
@@ -2195,11 +2434,12 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       if (repUnit && res.rep_fix && !res.failed) {
         const fixNow = Date.now();
         const changes: string[] = [];
-        let effectiveText = repUnit.text;
+        const originalUnitText = repUnit.text;
+        let effectiveText = originalUnitText;
         let appliedGrade: Grade | undefined;
         let nextInMs: number | null | undefined;
 
-        if (res.rep_fix.reworded_unit && res.rep_fix.reworded_unit.toLowerCase() !== repUnit.text.toLowerCase()) {
+        if (res.rep_fix.reworded_unit && res.rep_fix.reworded_unit.toLowerCase() !== originalUnitText.toLowerCase()) {
           store.append([
             makeEvent(
               "unit.reworded",
@@ -2247,7 +2487,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             changes,
             ...(appliedGrade ? { grade: appliedGrade } : {}),
             ...(nextInMs !== undefined ? { next_in_ms: nextInMs } : {}),
-            ...(effectiveText !== repUnit.text ? { reworded_unit: effectiveText } : {}),
+            ...(effectiveText !== originalUnitText ? { reworded_unit: effectiveText } : {}),
           };
         }
       }
@@ -2545,30 +2785,89 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       });
 
       if (decision.role === "standalone" || decision.role === "preliminary") {
+        const cachedProdEntry = judge.peekPromptEntry(picked, depth, restsOn, stats.depthExposures, modality, bundledIds);
+        const unitHistoryCtx = buildUnitPromptHistoryContext(state, store, picked, now);
         let pairedProduction: { prompt: string; depth: Depth; expectedCrux?: string | undefined } | undefined;
+        let skipBlockingMcq = false;
+
         if (decision.role === "preliminary") {
-          preloadedProdEntry = await judge.promptEntryFor(picked, restsOn, depth, {
+          if (cachedProdEntry) {
+            const peekedPrelim = judge.peekMcqEntry(picked, restsOn, {
+              variant: stats.depthExposures,
+              role: "preliminary",
+              pairedPrompt: cachedProdEntry.prompt,
+            });
+            preloadedProdEntry = cachedProdEntry;
+            if (!peekedPrelim) {
+              // Fast path: never stall 25s generating a cold MCQ when a warm production prompt is ready now.
+              skipBlockingMcq = true;
+              judge.warmMcqs([
+                {
+                  unit: picked,
+                  restsOn,
+                  variant: stats.depthExposures,
+                  priorPrompts: stats.priorPrompts,
+                  role: "preliminary",
+                  pairedProduction: {
+                    prompt: cachedProdEntry.prompt,
+                    depth,
+                    ...(cachedProdEntry.crux ? { expectedCrux: cachedProdEntry.crux } : {}),
+                  },
+                },
+              ]);
+            } else {
+              pairedProduction = {
+                prompt: cachedProdEntry.prompt,
+                depth,
+                expectedCrux: cachedProdEntry.crux,
+              };
+            }
+          } else {
+            preloadedProdEntry = await judge.promptEntryFor(picked, restsOn, depth, {
+              variant: stats.depthExposures,
+              priorPrompts: stats.priorPrompts,
+              delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
+              learnerMemory: learnerMemoryOf(store),
+              situationalContext: unitHistoryCtx,
+              modality,
+              bundledUnits: [],
+            });
+            pairedProduction = {
+              prompt: preloadedProdEntry.prompt,
+              depth,
+              expectedCrux: preloadedProdEntry.crux,
+            };
+          }
+        } else {
+          // Standalone MCQ: if cold AND production prompt is already cached, serve production now and warm MCQ async.
+          const peekedStandalone = judge.peekMcqEntry(picked, restsOn, {
             variant: stats.depthExposures,
-            priorPrompts: stats.priorPrompts,
-            delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
-            learnerMemory: learnerMemoryOf(store),
-            modality,
-            bundledUnits: [],
+            role: "standalone",
           });
-          pairedProduction = {
-            prompt: preloadedProdEntry.prompt,
-            depth,
-            expectedCrux: preloadedProdEntry.crux,
-          };
+          if (!peekedStandalone && cachedProdEntry) {
+            preloadedProdEntry = cachedProdEntry;
+            skipBlockingMcq = true;
+            judge.warmMcqs([
+              {
+                unit: picked,
+                restsOn,
+                variant: stats.depthExposures,
+                priorPrompts: stats.priorPrompts,
+                role: "standalone",
+              },
+            ]);
+          }
         }
 
-        const mcqEntry = await judge.generateMcqEntry(picked, restsOn, {
-          variant: stats.depthExposures,
-          priorPrompts: stats.priorPrompts,
-          learnerMemory: learnerMemoryOf(store),
-          role: decision.role,
-          ...(pairedProduction ? { pairedProduction } : {}),
-        });
+        const mcqEntry = skipBlockingMcq
+          ? null
+          : await judge.generateMcqEntry(picked, restsOn, {
+              variant: stats.depthExposures,
+              priorPrompts: stats.priorPrompts,
+              learnerMemory: learnerMemoryOf(store),
+              role: decision.role,
+              ...(pairedProduction ? { pairedProduction } : {}),
+            });
 
         if (mcqEntry?.mcq) {
           const shuffledSource = [...mcqEntry.mcq.choices];
@@ -2676,6 +2975,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         priorPrompts: stats.priorPrompts,
         delayedTransfer: stats.passes >= 1 && stats.daysSinceLastExposure >= 5,
         learnerMemory: learnerMemoryOf(store),
+        situationalContext: buildUnitPromptHistoryContext(state, store, picked, now),
         modality,
         bundledUnits: bundledUnits.map((b) => ({ id: b.id, text: b.text, kind: b.kind })),
       }));
@@ -3181,18 +3481,37 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const trendClarify = latencyTrend(state, u);
       const priorClarifyTurns: { role: "user" | "assistant"; text: string }[] = [];
       let priorClarifyCount = 0;
+      let totalCommittedTurns = 0;
       for (const t of existingAttempt?.turns ?? []) {
         if (t.failed) continue;
+        totalCommittedTurns++;
         if (t.kind === "clarify") priorClarifyCount++;
         if (t.user.trim()) priorClarifyTurns.push({ role: "user", text: t.user });
         if (t.coach.trim()) priorClarifyTurns.push({ role: "assistant", text: t.coach });
       }
       const relatedEvidence = buildRelatedEvidenceContext(state, u, nowClarify);
+      const clarifySituational = buildSituationalContextPacket({
+        state,
+        store,
+        unit: u,
+        now: nowClarify,
+        depth,
+        prompt,
+        expectedCrux,
+        starter: activeStarter,
+        modality: reqModality,
+        firstContact,
+        bundledUnits: bundledUnits.map((b) => b.text),
+        restsOn,
+        activeHabits: activeHabits(state).map((h) => h.text),
+        learnerMemory: learnerMemoryOf(store),
+        excludeAttemptId: attemptId,
+      });
       return respondMaybeStream(c, async (onText, onPerf, signal) => {
         const clarified = await judge.clarifyDrill(
           {
-            sessionKey: `clarify:${user.id}:${attemptId}`,
-            expectedPriorTurns: priorClarifyCount,
+            sessionKey: `attempt:${user.id}:${attemptId}`,
+            expectedPriorTurns: totalCommittedTurns,
             priorClarifyCount,
             prompt,
             starter: activeStarter,
@@ -3201,6 +3520,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             turns: priorClarifyTurns,
             learnerMemory: learnerMemoryOf(store),
             relatedEvidence,
+            situationalContext: clarifySituational,
           },
           onText,
           onPerf,
@@ -3285,21 +3605,46 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     );
     const hintsUsed = Math.max(0, Math.round(body.hints_used ?? 0), storedCheckAssistance);
 
-    const history = Array.isArray(body.history)
+    const storedPriorTurns = (existingAttempt?.turns ?? []).filter((t) => !t.failed);
+    const clientHistory = Array.isArray(body.history)
       ? body.history
           .filter((h): h is { attempt: string; feedback: string } => typeof h?.attempt === "string" && typeof h?.feedback === "string")
           .slice(-4)
-      : undefined;
+      : [];
+    const history =
+      storedPriorTurns.length > 0
+        ? storedPriorTurns.slice(-6).map((t) => ({ attempt: t.user, feedback: t.coach }))
+        : clientHistory.length > 0
+          ? clientHistory
+          : undefined;
 
     const existingUnits = Object.values(state.units)
       .filter((u2) => u2.status === "active" && !u2.observe_only)
       .map((u2) => u2.text);
     const relatedEvidence = buildRelatedEvidenceContext(state, u, now);
+    const checkSituational = buildSituationalContextPacket({
+      state,
+      store,
+      unit: u,
+      now,
+      depth,
+      prompt,
+      expectedCrux,
+      starter: activeStarter,
+      modality: reqModality,
+      firstContact,
+      bundledUnits: bundledUnits.map((b) => b.text),
+      restsOn,
+      activeHabits: habits.map((h) => h.text),
+      learnerMemory: learnerMemoryOf(store),
+      excludeAttemptId: attemptId,
+    });
 
     return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.check(
         {
-          sessionKey: `drill:${user.id}:${attemptId}`,
+          sessionKey: `attempt:${user.id}:${attemptId}`,
+          expectedPriorTurns: storedPriorTurns.length,
           prompt,
           expectedCrux,
           firstContact,
@@ -3316,6 +3661,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           activeHabits: habits.map((h) => h.text),
           learnerMemory: learnerMemoryOf(store),
           relatedEvidence,
+          situationalContext: checkSituational,
           latencyMs,
           hintsUsed: showPivot ? Math.max(1, hintsUsed) : hintsUsed,
         },
@@ -3379,8 +3725,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         );
         store.append([ev]);
         probeId = ev.id;
-        judge.closeSession(`drill:${user.id}:${attemptId}`);
-        judge.closeSession(`clarify:${user.id}:${attemptId}`);
+        // Keep unified `attempt:${user.id}:${attemptId}` ACP session warm for instant post-rep follow-ups.
 
         // Synthesis multiplier: passing a bundled multi-unit rep cleanly credits companion units in context.
         if (finalGradeCheck !== "again" && !showPivot && bundledUnits.length > 0) {
@@ -3611,12 +3956,27 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       const mcq = existingAttempt.mcq;
       const questionTextMcq = (body.question ?? "").trim();
       const nowMcq = Date.now();
+      const mcqSituational = buildSituationalContextPacket({
+        state,
+        store,
+        unit: u,
+        now: nowMcq,
+        depth: "recall",
+        prompt: existingAttempt.prompt,
+        modality: "mcq",
+        restsOn,
+        learnerMemory: learnerMemoryOf(store),
+        excludeAttemptId: existingAttempt.attempt_id,
+        includeReferenceTarget: false,
+      });
       const clarified = await judge.clarifyMcq({
         prompt: existingAttempt.prompt,
         choices: mcq.choices.map((ch) => ({ id: ch.id, text: ch.text })),
         unitText: u.text,
         question: questionTextMcq,
         turns,
+        learnerMemory: learnerMemoryOf(store),
+        situationalContext: mcqSituational,
       });
       const updatedMcq: StoredMcqAttempt = {
         ...mcq,
@@ -3733,12 +4093,30 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       if (body.feedback?.trim()) priorClarifyTurns.push({ role: "assistant", text: body.feedback.trim() });
       priorClarifyTurns.push(...turns);
       const priorClarifyCount = (existingAttempt?.turns ?? []).filter((t) => !t.failed && t.kind === "clarify").length;
+      const totalCommittedTurns = (existingAttempt?.turns ?? []).filter((t) => !t.failed).length;
       const relatedEvidence = buildRelatedEvidenceContext(state, u, now);
+      const clarifySituational = buildSituationalContextPacket({
+        state,
+        store,
+        unit: u,
+        now,
+        depth,
+        prompt: followupPrompt,
+        expectedCrux,
+        starter: followupStarter,
+        modality: reqModality,
+        firstContact,
+        bundledUnits: bundledUnits.map((b) => b.text),
+        restsOn,
+        activeHabits: habits.map((h) => h.text),
+        learnerMemory: learnerMemoryOf(store),
+        excludeAttemptId: attemptId,
+      });
       return respondMaybeStream(c, async (onText, onPerf, signal) => {
         const clarified = await judge.clarifyDrill(
           {
-            sessionKey: `clarify:${user.id}:${attemptId}`,
-            expectedPriorTurns: priorClarifyCount,
+            sessionKey: `attempt:${user.id}:${attemptId}`,
+            expectedPriorTurns: totalCommittedTurns,
             priorClarifyCount,
             prompt: followupPrompt,
             starter: followupStarter,
@@ -3747,6 +4125,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
             turns: priorClarifyTurns,
             learnerMemory: learnerMemoryOf(store),
             relatedEvidence,
+            situationalContext: clarifySituational,
           },
           onText,
           onPerf,
@@ -3832,15 +4211,32 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
       .filter((u2) => u2.status === "active" && !u2.observe_only)
       .map((u2) => u2.text);
     const relatedEvidence = buildRelatedEvidenceContext(state, u, now);
-    const committedGradedTurns = existingAttempt?.turns
-      ? existingAttempt.turns.filter((t) => !t.failed && t.kind !== "clarify").length
+    const totalCommittedFollowupTurns = existingAttempt?.turns
+      ? existingAttempt.turns.filter((t) => !t.failed).length
       : undefined;
+    const followupSituational = buildSituationalContextPacket({
+      state,
+      store,
+      unit: u,
+      now,
+      depth,
+      prompt: followupPrompt,
+      expectedCrux,
+      starter: followupStarter,
+      modality: reqModality,
+      firstContact,
+      bundledUnits: bundledUnits.map((b) => b.text),
+      restsOn,
+      activeHabits: habits.map((h) => h.text),
+      learnerMemory: learnerMemoryOf(store),
+      excludeAttemptId: attemptId,
+    });
 
     return respondMaybeStream(c, async (onText, onPerf, signal) => {
       const verdict = await judge.continueRep(
         {
-          sessionKey: `drill:${user.id}:${attemptId}`,
-          expectedPriorTurns: committedGradedTurns,
+          sessionKey: `attempt:${user.id}:${attemptId}`,
+          expectedPriorTurns: totalCommittedFollowupTurns,
           prompt: followupPrompt,
           expectedCrux,
           firstContact,
@@ -3854,6 +4250,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
           activeHabits: habits.map((h) => h.text),
           learnerMemory: learnerMemoryOf(store),
           relatedEvidence,
+          situationalContext: followupSituational,
           attempt: body.attempt ?? "",
           feedback: body.feedback ?? "",
           turns,
@@ -3925,8 +4322,7 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
         );
         store.append([ev]);
         probeId = ev.id;
-        judge.closeSession(`drill:${user.id}:${attemptId}`);
-        judge.closeSession(`clarify:${user.id}:${attemptId}`);
+        // Keep unified `attempt:${user.id}:${attemptId}` ACP session warm for instant post-rep follow-ups.
 
         if (finalGrade !== "again" && !showPivot && bundledUnits.length > 0) {
           let offset = 2;
@@ -4092,7 +4488,9 @@ export function createApp({ registry, stores, webRoot, tutors, sandbox, keys, fi
     if (existing && existing.status === "active") {
       store.upsertAttempt({ ...existing, status: "abandoned", updated_at: Date.now() });
     }
-    judge.closeSession(`drill:${id}`);
+    judge.closeSession(`attempt:${user.id}:${id}`);
+    judge.closeSession(`drill:${user.id}:${id}`);
+    judge.closeSession(`clarify:${user.id}:${id}`);
     return c.json({ ok: true, attempt_id: id });
   });
 

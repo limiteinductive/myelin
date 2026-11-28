@@ -150,8 +150,8 @@ export class AgyAcpClient {
     this.binary = opts.binary;
     this.resourceDirs = opts.resourceDirs ?? [];
     this.appDataDir = opts.appDataDir ?? "myelin-acp";
-    this.maxCachedSessions = opts.maxCachedSessions ?? 16;
-    this.maxTurnsPerSession = opts.maxTurnsPerSession ?? 24;
+    this.maxCachedSessions = opts.maxCachedSessions ?? 24;
+    this.maxTurnsPerSession = opts.maxTurnsPerSession ?? 32;
     this.initTimeoutMs = opts.initTimeoutMs ?? 6_000;
   }
 

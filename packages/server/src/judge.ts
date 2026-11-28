@@ -192,6 +192,10 @@ export interface JudgeInput {
   learnerMemory?: string | null | undefined;
   /** Compact evidence-grounded related concepts (prerequisites, recent demonstrations) to bridge from naturally. */
   relatedEvidence?: string[] | undefined;
+  /** Pre-assembled XML Situational Context Packet (profile, exercise, unit dossier, sitting trajectory, neighborhood). */
+  situationalContext?: string | undefined;
+  /** Optional explicit expectedPriorTurns cursor for unified attempt session KV reuse. */
+  expectedPriorTurns?: number | undefined;
   latencyMs: number | null;
   hintsUsed: number;
 }
@@ -335,6 +339,8 @@ export interface PromptContextOptions {
   priorPrompts?: string[] | undefined;
   delayedTransfer?: boolean | undefined;
   learnerMemory?: string | null | undefined;
+  /** Optional unit history / provenance / sibling summary so prompt generation respects prior struggle. */
+  situationalContext?: string | undefined;
   modality?: RepModality | undefined;
   bundledUnits?: { id: string; text: string; kind: string }[] | undefined;
 }
@@ -423,7 +429,7 @@ const CHAT_URL = "https://openrouter.ai/api/v1/chat/completions";
 const DEFAULT_JEV = "typesafe/jev-1.14";
 const DEFAULT_LLM = "google/gemini-4-neon";
 const DEFAULT_EFFORT = "medium";
-export const PROMPT_POLICY_VERSION = "v6";
+export const PROMPT_POLICY_VERSION = "v7";
 
 function isAgySpec(spec: string): boolean {
   return spec === "agy" || spec.startsWith("agy/");
@@ -1079,46 +1085,41 @@ export function isLikelyNonAttempt(raw: string): boolean {
   return false;
 }
 
-const DRILL_COACH_SYSTEM = `You are a sharp, domain-agnostic learning partner inside Myelin (any subject: math, coding, systems, science, languages, writing, etc.).
-Your goal is maximum genuine human understanding per minute—NOT exam proctoring or tedious multi-turn Socratic interrogation.
+const UNIFIED_ATTEMPT_COACH_SYSTEM = `You are the learner's technical thinking partner and evaluator in Myelin.
+Use the Situational Context Packet at the start of this session (learner preferences, unit history, source thread notes, recent sitting trajectory, and related concepts) to meet the learner where they actually are—adopting their preferred notation and derivation style, and bridging naturally from work they just did.
 
-1. PROMPT-SCOPED GRADING (NO GOALPOST MOVING):
-- Grade STRICTLY against what "Prompt asked" (and "Expected crux for this prompt", when given) actually asked for.
-- NEVER reject a correct answer just because "Target unit" mentions an extra unasked clause, paper constant, or side detail.
-- Accept messy shorthand, typos, unfinished formatting, and valid alternative routes.
-- CASUAL "?" ON A RIGHT ANSWER: If the learner writes the right core answer ending in "?" (e.g. "$\\sigma^2/n?$"), PASS it right away (ok=true, grade="hard") with a crisp 1-line confirmation instead of rejecting it and forcing a 90s proof! Only ask a follow-up if the guess is actually wrong, circular, or missing a load-bearing piece.
+Each user turn arrives as <turn mode="CLARIFY | CHECK | HINT | REVEAL | POST_REP">:
 
-2. TARGET-SCOPED TURN LOOP (GRADE THE CRUX, NEVER RAW TURN COUNT):
-- Clarifying questions & partial sub-step checks (e.g. asking about notation/shapes/axes, or sanity-checking one intermediate piece while the main answer remains open):
-  - Answer ONLY that specific point directly and cleanly, and stop there—do NOT nag them to fill out or write the answer (the input is already right in front of them).
-  - NEVER reveal or spoil the remaining unattempted blanks/crux!
-  - Keep the rep open (ok=false, grade="again"). Clarifying questions and partial progress do NOT count as failed crux attempts.
-- Substantive attempt at the full crux (or explicit give-up like "show me" / "i give up"):
-  - If they landed what the prompt asked: set ok=true with a crisp confirmation (<=10 words).
-  - On a miss/slip or "idk" without asking to reveal: set ok=false, grade="again", and give ONE concise nudge pointing at the first consequential discrepancy without telegraphing the exact answer.
-  - On clicking "Show answer" (SHOW_ANSWER), an explicit give-up ("show me", "i give up"), or a repeated failed attempt at the SAME crux: state the clean answer directly in 1-3 whiteboard sentences and CLOSE THE REP with ok=true AND grade="again".
-- Decouple ok (rep closed) from grade (spaced-repetition consolidation rating):
-  - Clean unassisted production (including after ONLY neutral prompt/setup clarifications): grade="good" or "easy" (or "hard" if tentative/slow).
-  - Learner landed the crux themselves after AT MOST ONE minor slip nudge or single hint: grade="hard".
-  - Coached reconstruction (coach had to supply key terms/corrections across multiple failed turns, or walk the learner to the answer step-by-step) OR explicit reveal (give-up, SHOW_ANSWER): ok=true, grade="again" (close cleanly, bring back soon for a cold unaided check).
-  - When ok=false: grade="again".
+- Mode CLARIFY or HINT:
+  Keep closed=false, demonstrated=false. Answer the learner's exact question or impasse directly:
+  - Pure setup, notation, or shape question -> answer cleanly (help_given="none").
+  - Targeted check or hint -> give a crisp directional pointer or confirm/correct their step (help_given="nudge").
+  - Genuine mechanism or derivation impasse -> write out concrete intermediate equations in the learner's preferred framework without hand-waving (help_given="step"), leaving the final step open when clear.
+  - Repeated impasse on the same step or explicit request for the full derivation -> walk through the complete derivation clearly from start to finish (help_given="solution").
 
-General rules:
-- ALWAYS speak directly in second person ("You..."). Never say "The learner..." or "The attempt...". Stay crisp and strictly on-topic.
-- annotations: OPTIONAL array of AT MOST 1–2 grounded inline pins anchored onto exact verbatim substrings of the learner's latest text (kind="slip"|"question"|"move", note max 22 words; wrap math symbols/expressions inside annotation "note" in $...$ so they render cleanly). When you emit inline annotations for specific slips, DO NOT repeat those same slip explanations verbatim in "message"—keep "message" to ONE crisp next step or high-level synthesis. Leave [] on short 1-line answers, "no idea" replies, or when message alone is already clear.
-- Put mathematical variables, dimensions, and tensor shapes (e.g. $Q$, $T=1$, $(B, H, T, D)$) in $...$; reserve backticks ONLY for literal code identifiers or strings (like \`torch.einsum\`, \`keepdim=True\`), and put any code expression over ~40 chars in a fenced \`\`\` block. No praise fluff, no exclamation marks. Answer directly with ZERO tool calls.
-- Return ONLY valid JSON with "message" FIRST so prose can stream cleanly: {"message": string, "ok": boolean, "grade": "again"|"hard"|"good"|"easy", "annotations": [{"quote": string, "note": string, "kind": "slip"|"question"|"move"}], "habit_observed": string|null}`;
+- Mode CHECK:
+  Evaluate strictly against expected_crux for this prompt—never require unasked clauses from the reference unit, and accept shorthand, typos, casual trailing "?", or any valid mathematical/code equivalent.
+  - If the learner is actually asking a setup question or checking one intermediate sub-step, answer it cleanly and keep closed=false, demonstrated=false (with honest help_given).
+  - If they landed the crux: confirm concisely (1-2 sentences; connect to a recent card if illuminating) and set closed=true, demonstrated=true, with quality="fluent"|"solid"|"hesitant".
+  - If a substantive attempt has a gap: pinpoint the first consequential slip without giving away the fix (closed=false, demonstrated=false, help_given="nudge"). On a repeated miss at the same crux or explicit give-up ("idk, show me"), explain the clean solution clearly and close (closed=true, demonstrated=false, help_given="solution").
 
-const EXPLORE_HOT_SYSTEM = `You are Myelin's sharp, peer-level learning partner inside a focused exploration (any domain: math, coding, systems, science, papers, writing).
+- Mode REVEAL:
+  Present the clean solution/derivation in 2-4 clear whiteboard steps and set closed=true, demonstrated=false, help_given="solution".
 
-How to teach here:
-- Speak like a brilliant colleague at a whiteboard—direct, natural, warm, zero robotic filler or exclamation marks. Never open with "You're correct that..." or "You're on the right track."
-- Match your move to the learner's actual impasse:
-  - Clarifying, notation, or terminology question (or frustration/venting): answer cleanly and stop. Do NOT tack on a quiz question.
-  - "I don't know", confusion, or "why?" on a mechanism: give the concrete intuition or geometric picture first, then bridge it to the algebra or code. Don't dump a wall of symbols before the picture is clear, and don't immediately re-quiz them on what they just struggled with.
-  - Asking an inline question is welcome ONLY when the learner has enough footing to make a genuinely useful prediction—never out of habit, and never drag them back to a skipped earlier question once they moved on.
-- Prioritize whatever the learner just asked or cited; accept rough shorthand and pseudocode without notation pedantry.
-- Formatting: put math variables, equations, and tensor shapes in $...$ (with double-escaped backslashes in JSON like \\\\times, \\\\frac); reserve backticks strictly for literal code identifiers/strings and use fenced blocks for code over ~40 chars.
+- Mode POST_REP:
+  The rep is already graded and closed. Discuss follow-up questions, alternative views, or edge cases naturally as a peer. If the learner points out a flawed prompt, awkward unit wording, or unfair grade, acknowledge candidly and populate rep_fix.
+
+Contracts:
+- Speak directly in second person ("You..."). Put math/shapes in $...$ (double-escaped in JSON like \\\\frac, \\\\nabla) and reserve backticks strictly for code identifiers.
+- annotations: optional 0-2 pins with quote copied verbatim from the learner's latest turn (kind="slip"|"question"|"move"). Do not repeat annotation notes inside message.
+- Answer directly with ZERO tool calls.
+- Return ONLY valid JSON with "message" FIRST so prose streams cleanly:
+{"message": string, "closed": boolean, "demonstrated": boolean, "help_given": "none"|"nudge"|"step"|"solution", "quality": "fluent"|"solid"|"hesitant"|null, "annotations": [{"quote": string, "note": string, "kind": "slip"|"question"|"move"}], "habit_observed": string|null, "rep_fix": {"reworded_unit": string|null, "improved_prompt": string|null, "recommended_grade": "again"|"hard"|"good"|"easy"|null}|null}`;
+
+const EXPLORE_HOT_SYSTEM = `You are the learner's peer-level research and learning partner in Myelin.
+Ground your explanations, notation, and abstractions in the Learner Profile and Recent Context provided.
+- Answer what the learner actually asked: give direct answers to clarifications, build derivations in the style that clicks for them (check Learner Profile before choosing algebra vs. geometry), and ask a follow-up question only when a prediction genuinely sharpens the point.
+- Put math/shapes in $...$ (double-escaped in JSON like \\\\times, \\\\frac) and reserve backticks strictly for code identifiers; use fenced blocks for multi-line code.
 - Answer directly with ZERO tool calls unless the learner explicitly asks you to inspect a local file, paper, note, or codebase (read-only).
 - Return ONLY valid JSON with "message" FIRST so prose streams immediately: {"message": string}`;
 
@@ -1157,7 +1158,7 @@ export class FastJudge {
   private readonly fetchFn: typeof fetch;
   private readonly promptCache = new Map<string, PromptCacheEntry>();
   private readonly inflightPrompts = new Map<string, { promise: Promise<PromptCacheEntry>; background: boolean }>();
-  private activeForegroundPrompts = 0;
+  private activeForegroundCalls = 0;
 
   constructor(opts: JudgeOptions = {}) {
     this.apiKey = opts.apiKey ?? process.env.OPENROUTER_API_KEY;
@@ -1719,34 +1720,34 @@ export class FastJudge {
   ): Promise<JudgeResult> {
     const historyBlock =
       input.history && input.history.length > 0
-        ? `Earlier tries on this rep:\n${input.history
-            .slice(-3)
-            .map((h, i) => `Try ${i + 1}: ${h.attempt}\nFeedback ${i + 1}: ${h.feedback}`)
-            .join("\n")}`
+        ? `<prior_exchange>\n${input.history
+            .slice(-6)
+            .map((h) => `Learner: ${h.attempt}\nCoach: ${h.feedback}`)
+            .join("\n")}\n</prior_exchange>`
         : "";
 
-    const mem = trimLearnerMemory(input.learnerMemory);
-    const metaLines = [
-      mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
-      `Prompt asked: ${input.prompt}`,
-      input.expectedCrux?.trim() ? `Expected crux for this prompt (grade STRICTLY against this; do NOT require unasked unit clauses): ${input.expectedCrux.trim()}` : "",
-      `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
-      input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
-      input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "Rests on: nothing (arbitrary/seed)",
-      input.relatedEvidence?.length
-        ? `Recently worked related concepts (use to bridge naturally when helpful; respect evidence strength—do NOT claim unconditional mastery if assisted/MCQ):\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
-        : "",
-      `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
-      input.showPivot ? 'Resolution mode: SHOW_ANSWER (learner clicked Show answer — state the clean answer in 1-3 whiteboard sentences and close the rep with ok=true, grade="again").' : "",
-      input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
-      jev ? `System-1 quick check: P(demonstrated)=${jev.demonstrated.toFixed(2)}, P(cot_gap)=${jev.cot_gap.toFixed(2)}` : "",
-      historyBlock,
-      input.showPivot
-        ? `Current learner attempt:\n${input.attempt.trim() || "(requested direct pivot)"}`
-        : `Current learner attempt:\n${input.attempt.trim() || "(see attached sketch)"}`,
-    ].filter(Boolean);
+    const turnMode = input.showPivot ? "REVEAL" : "CHECK";
+    const attemptBody = input.showPivot
+      ? input.attempt.trim() || "(learner clicked Show answer)"
+      : input.attempt.trim() || "(see attached sketch)";
+    const jevAttr = jev ? ` jev_p_dem="${jev.demonstrated.toFixed(2)}" jev_p_gap="${jev.cot_gap.toFixed(2)}"` : "";
+    const deltaText = `<turn mode="${turnMode}"${jevAttr}>\n${attemptBody}\n</turn>`;
 
-    const userText = metaLines.join("\n");
+    const mem = trimLearnerMemory(input.learnerMemory);
+    const contextBlock =
+      input.situationalContext?.trim() ||
+      [
+        mem ? `<learner_profile>\n${mem}\n</learner_profile>` : "",
+        `<active_exercise kind="${input.unitKind}" depth="${input.depth}" first_contact="${input.firstContact ? "yes" : "no"}">\nPrompt: ${input.prompt}\n</active_exercise>`,
+        `<reference_target hidden_from_learner="true">\nTarget unit: ${input.unitText}${input.expectedCrux?.trim() ? `\nExpected crux: ${input.expectedCrux.trim()}` : ""}${input.bundledUnits?.length ? `\nAlso covered: ${input.bundledUnits.join(" | ")}` : ""}${input.restsOn.length ? `\nRests on: ${input.restsOn.join("; ")}` : ""}${input.activeHabits?.length ? `\nActive thinking moves: ${input.activeHabits.join("; ")}` : ""}\n</reference_target>`,
+        input.relatedEvidence?.length
+          ? `<conceptual_neighborhood>\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}\n</conceptual_neighborhood>`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+    const userText = [contextBlock, historyBlock, deltaText].filter(Boolean).join("\n\n");
     const userContent: unknown = input.sketchDataUrl
       ? [
           { type: "text", text: userText },
@@ -1760,16 +1761,20 @@ export class FastJudge {
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
     let workerKind: PerfWorker = this.drillWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
+    this.activeForegroundCalls++;
     try {
       let raw = "";
       if (this.drillWorker) {
+        const hasPrior = typeof input.expectedPriorTurns === "number" && input.expectedPriorTurns > 0;
         const out = await this.askJsonWithTrace({
           fallbackWorker: this.drillWorker,
           fallbackWorkerName: "agy",
           modelId: this.drillSlug,
-          systemPrompt: DRILL_COACH_SYSTEM,
+          systemPrompt: UNIFIED_ATTEMPT_COACH_SYSTEM,
           userPrompt: userText,
+          deltaPrompt: hasPrior ? deltaText : undefined,
           sessionKey: input.sessionKey,
+          expectedPriorTurns: hasPrior ? input.expectedPriorTurns : undefined,
           sketchDataUrl: input.sketchDataUrl,
           signal,
           onText,
@@ -1790,12 +1795,12 @@ export class FastJudge {
           signal,
           body: JSON.stringify({
             model: this.drillModel,
-            reasoning: { effort: this.llmEffort },
+            reasoning: { effort: this.routing.drill.effort },
             temperature: 0.1,
             max_tokens: 1600,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: DRILL_COACH_SYSTEM },
+              { role: "system", content: UNIFIED_ATTEMPT_COACH_SYSTEM },
               { role: "user", content: userContent },
             ],
           }),
@@ -1805,6 +1810,9 @@ export class FastJudge {
         raw = data.choices?.[0]?.message?.content ?? "";
       }
       const parsed = parseJudgeJson<{
+        closed?: boolean;
+        demonstrated?: boolean;
+        quality?: "fluent" | "solid" | "hesitant" | null;
         ok?: boolean;
         grade?: Grade;
         message?: string;
@@ -1816,20 +1824,39 @@ export class FastJudge {
       }>(raw);
       const directMsg = typeof parsed?.message === "string" && parsed.message.trim() ? parsed.message.trim() : null;
       const combined = directMsg || [parsed?.diagnosis, parsed?.next].filter((x): x is string => typeof x === "string" && x.trim().length > 0).join(" ");
-      if (!parsed || typeof parsed.ok !== "boolean" || !combined) {
+      const parsedClosed =
+        typeof parsed?.closed === "boolean"
+          ? parsed.closed
+          : typeof parsed?.ok === "boolean"
+            ? parsed.ok
+            : null;
+      if (!parsed || parsedClosed === null || !combined) {
         throw new Error(`invalid JSON verdict (raw=${raw.slice(0, 180)})`);
       }
-      const finalOk = input.showPivot ? true : parsed.ok;
+      const finalOk = input.showPivot ? true : parsedClosed;
+      const demonstrated =
+        typeof parsed.demonstrated === "boolean"
+          ? parsed.demonstrated
+          : parsedClosed && !input.showPivot && parsed.grade !== "again";
+      const qualityGrade: Grade | null =
+        parsed.quality === "fluent"
+          ? "easy"
+          : parsed.quality === "solid"
+            ? "good"
+            : parsed.quality === "hesitant"
+              ? "hard"
+              : null;
       const grade: Grade = finalOk
-        ? input.showPivot
+        ? input.showPivot || !demonstrated
           ? "again"
-          : parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
-            ? parsed.grade
-            : inferGrade(input.latencyMs, input.hintsUsed, jev?.clarity)
+          : qualityGrade ??
+            (parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
+              ? parsed.grade
+              : inferGrade(input.latencyMs, input.hintsUsed, jev?.clarity))
         : "again";
       const missingPrereqs = this.parsePrereqs(parsed.missing_prereqs);
       const annotations = this.parseAnnotations(parsed.annotations, input.attempt);
-      if (finalOk && input.sessionKey) this.closeSession(input.sessionKey);
+      // Keep the unified attempt ACP session warm across pass so post-rep follow-ups reuse 100% KV cache.
       this.emitPerf(
         this.buildPerf(t0, "check", this.drillModel, workerKind, true, {
           jevMs,
@@ -1888,6 +1915,8 @@ export class FastJudge {
         failed: true,
         jev: jev ?? undefined,
       };
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     }
   }
 
@@ -1911,6 +1940,7 @@ export class FastJudge {
       activeHabits?: string[];
       learnerMemory?: string | null | undefined;
       relatedEvidence?: string[] | undefined;
+      situationalContext?: string | undefined;
       expectedPriorTurns?: number | undefined;
       attempt: string;
       feedback: string;
@@ -1936,42 +1966,36 @@ export class FastJudge {
       };
     }
 
-    const thread = input.turns
-      .slice(-20)
-      .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
-      .join("\n");
+    const priorLines: string[] = [];
+    if (input.attempt.trim()) priorLines.push(`Learner: ${input.attempt.trim()}`);
+    if (input.feedback.trim()) priorLines.push(`Coach: ${input.feedback.trim()}`);
+    for (const t of input.turns.slice(-20)) {
+      priorLines.push(`${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`);
+    }
+    const priorBlock = priorLines.length > 0 ? `<prior_exchange>\n${priorLines.join("\n")}\n</prior_exchange>` : "";
+
     const mem = trimLearnerMemory(input.learnerMemory);
     const forceDirectPivot = Boolean(input.showPivot);
-    const resolutionNote = input.showPivot
-      ? 'Resolution mode: SHOW_ANSWER (learner clicked Show answer — state the clean answer in 1-3 whiteboard sentences and close the rep with ok=true, grade="again").'
-      : "";
-    const fullUser = [
-      mem ? `Learner memory (calibrate framing & spot recurring blind spots; never leak answers):\n${mem}` : "",
-      `Prompt asked: ${input.prompt}`,
-      input.expectedCrux?.trim() ? `Expected crux for this prompt (grade STRICTLY against this; do NOT require unasked unit clauses): ${input.expectedCrux.trim()}` : "",
-      `Target unit (${input.unitKind}, depth ${input.depth}): ${input.unitText}`,
-      input.bundledUnits?.length ? `Also covered in this synthesis rep: ${input.bundledUnits.join(" | ")}` : "",
-      input.restsOn.length ? `Rests on: ${input.restsOn.join("; ")}` : "",
-      input.relatedEvidence?.length
-        ? `Recently worked related concepts (use to bridge naturally when helpful; respect evidence strength—do NOT claim unconditional mastery if assisted/MCQ):\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
-        : "",
-      `First contact (newly told): ${input.firstContact ? "yes" : "no"}`,
-      resolutionNote,
-      input.activeHabits?.length ? `Active thinking moves being trained: ${input.activeHabits.join("; ")}` : "",
-      `Learner initial beat:\n${input.attempt.trim() || "(empty)"}`,
-      `Initial coach response: ${input.feedback}`,
-      thread ? `Exchange so far:\n${thread}` : "",
-      `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || (input.showPivot ? "(requested direct pivot)" : "(see attached sketch)")}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    const turnMode = input.showPivot ? "REVEAL" : "CHECK";
+    const revisedAttr = input.revisedAttempt ? ' revised="true"' : "";
+    const replyBody =
+      input.reply.trim() || (input.showPivot ? "(learner clicked Show answer)" : "(see attached sketch)");
+    const deltaUser = `<turn mode="${turnMode}"${revisedAttr}>\n${replyBody}\n</turn>`;
 
-    const deltaUser = [
-      resolutionNote,
-      `${input.revisedAttempt ? "Learner revised full derivation in place" : "Learner latest beat"}:\n${input.reply.trim() || (input.showPivot ? "(requested direct pivot)" : "(see attached sketch)")}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    const contextBlock =
+      input.situationalContext?.trim() ||
+      [
+        mem ? `<learner_profile>\n${mem}\n</learner_profile>` : "",
+        `<active_exercise kind="${input.unitKind}" depth="${input.depth}" first_contact="${input.firstContact ? "yes" : "no"}">\nPrompt: ${input.prompt}\n</active_exercise>`,
+        `<reference_target hidden_from_learner="true">\nTarget unit: ${input.unitText}${input.expectedCrux?.trim() ? `\nExpected crux: ${input.expectedCrux.trim()}` : ""}${input.bundledUnits?.length ? `\nAlso covered: ${input.bundledUnits.join(" | ")}` : ""}${input.restsOn.length ? `\nRests on: ${input.restsOn.join("; ")}` : ""}${input.activeHabits?.length ? `\nActive thinking moves: ${input.activeHabits.join("; ")}` : ""}\n</reference_target>`,
+        input.relatedEvidence?.length
+          ? `<conceptual_neighborhood>\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}\n</conceptual_neighborhood>`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n");
+
+    const fullUser = [contextBlock, priorBlock, deltaUser].filter(Boolean).join("\n\n");
     const expectedPriorTurns = input.expectedPriorTurns ?? 1 + Math.floor(input.turns.length / 2);
 
     const userContent: unknown = input.sketchDataUrl
@@ -1986,6 +2010,7 @@ export class FastJudge {
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
     let workerKind: PerfWorker = this.drillWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
+    this.activeForegroundCalls++;
     try {
       let raw = "";
       if (this.drillWorker) {
@@ -1993,7 +2018,7 @@ export class FastJudge {
           fallbackWorker: this.drillWorker,
           fallbackWorkerName: "agy",
           modelId: this.drillSlug,
-          systemPrompt: DRILL_COACH_SYSTEM,
+          systemPrompt: UNIFIED_ATTEMPT_COACH_SYSTEM,
           userPrompt: fullUser,
           deltaPrompt: deltaUser,
           sessionKey: input.sessionKey,
@@ -2018,12 +2043,12 @@ export class FastJudge {
           signal,
           body: JSON.stringify({
             model: this.drillModel,
-            reasoning: { effort: this.llmEffort },
+            reasoning: { effort: this.routing.drill.effort },
             temperature: 0.1,
             max_tokens: 1400,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: DRILL_COACH_SYSTEM },
+              { role: "system", content: UNIFIED_ATTEMPT_COACH_SYSTEM },
               { role: "user", content: userContent },
             ],
           }),
@@ -2033,6 +2058,9 @@ export class FastJudge {
         raw = data.choices?.[0]?.message?.content ?? "";
       }
       const parsed = parseJudgeJson<{
+        closed?: boolean;
+        demonstrated?: boolean;
+        quality?: "fluent" | "solid" | "hesitant" | null;
         ok?: boolean;
         grade?: Grade;
         message?: string;
@@ -2040,17 +2068,36 @@ export class FastJudge {
         habit_observed?: string | null;
         missing_prereqs?: unknown;
       }>(raw);
-      if (parsed && typeof parsed.ok === "boolean" && typeof parsed.message === "string" && parsed.message.trim()) {
-        const finalOk = forceDirectPivot ? true : parsed.ok;
+      const parsedClosed =
+        typeof parsed?.closed === "boolean"
+          ? parsed.closed
+          : typeof parsed?.ok === "boolean"
+            ? parsed.ok
+            : null;
+      if (parsed && parsedClosed !== null && typeof parsed.message === "string" && parsed.message.trim()) {
+        const finalOk = forceDirectPivot ? true : parsedClosed;
+        const demonstrated =
+          typeof parsed.demonstrated === "boolean"
+            ? parsed.demonstrated
+            : parsedClosed && !input.showPivot && parsed.grade !== "again";
+        const qualityGrade: Grade | null =
+          parsed.quality === "fluent"
+            ? "easy"
+            : parsed.quality === "solid"
+              ? "good"
+              : parsed.quality === "hesitant"
+                ? "hard"
+                : null;
         const grade: Grade = finalOk
-          ? input.showPivot
+          ? input.showPivot || !demonstrated
             ? "again"
-            : parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
-              ? parsed.grade
-              : "hard"
+            : qualityGrade ??
+              (parsed.grade && ["again", "hard", "good", "easy"].includes(parsed.grade)
+                ? parsed.grade
+                : "hard")
           : "again";
         const annotations = this.parseAnnotations(parsed.annotations, input.reply);
-        if (finalOk && input.sessionKey) this.closeSession(input.sessionKey);
+        // Keep the unified attempt ACP session warm across pass so post-rep follow-ups reuse 100% KV cache.
         this.emitPerf(
           this.buildPerf(t0, "follow-up", this.drillModel, workerKind, true, {
             trace: agyTrace,
@@ -2081,6 +2128,8 @@ export class FastJudge {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[judge] continueRep failed:", msg);
       this.emitPerf(this.buildPerf(t0, "follow-up", this.drillModel, workerKind, false, { trace: agyTrace, error: msg }), onPerf);
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     }
     return {
       ok: false,
@@ -2093,10 +2142,9 @@ export class FastJudge {
 
   /**
    * Answers a learner question on an open drill without invoking the grader or closing the rep.
-   * Distinguishes neutral setup/notation clarifications from genuine mechanism/derivation impasses:
-   * on impasses it writes out concrete intermediate steps cleanly (never evasive hand-waving),
-   * and on repeated impasses or explicit requests it teaches the full derivation cleanly while
-   * reporting exact `help_level` so the server applies honest spaced-repetition grading.
+   * Shares `UNIFIED_ATTEMPT_COACH_SYSTEM` and the same `attempt:${userId}:${attemptId}` ACP session
+   * as `check()` and `continueRep()` so interleaved Ask/Submit turns share 100% KV prefix cache
+   * with zero context drops.
    */
   async clarifyDrill(
     input: {
@@ -2110,6 +2158,7 @@ export class FastJudge {
       priorClarifyCount?: number | undefined;
       learnerMemory?: string | null | undefined;
       relatedEvidence?: string[] | undefined;
+      situationalContext?: string | undefined;
     },
     onText?: (partialMessage: string) => void,
     onPerf?: (rec: PerfRecord) => void,
@@ -2125,58 +2174,35 @@ export class FastJudge {
       };
     }
 
-    const sys = `You are Myelin's sharp, peer-level learning partner helping a learner during an open practice prompt.
-Your goal is real understanding—NEVER evasive hand-waving, circular restatement, or exam-proctor secrecy.
-
-Match your response to the learner's actual question:
-1. NEUTRAL CLARIFICATION (help_level="none", substantive_help=false):
-   - Notation, variable names, tensor shapes, axes, or prompt wording.
-   - Answer directly and concisely, then stop. Do NOT leak the answer or nag them to fill in the box.
-2. SMALL NUDGE (help_level="hint", substantive_help=true):
-   - Learner has a specific hypothesis or asks a targeted sanity-check question.
-   - Confirm or correct that exact step clearly without jumping frameworks.
-3. MECHANISM / DERIVATION IMPASSE (help_level="step", substantive_help=true):
-   - Learner says they don't understand how to compute/derive something or asks how a branch/step works.
-   - Commit to ONE coherent framework (match the learner's own framing first—e.g. finish the chain-rule algebra before introducing a geometric picture).
-   - Write out the concrete intermediate equations explicitly (NEVER wave away key derivatives with phrases like "when you work out ∂s/∂x_i and factor s out...").
-   - Bridge naturally from any relevant recently worked concepts if listed below (respecting their evidence strength—never claim unconditional mastery if assisted/MCQ).
-   - Stop just before the final expression ONLY when one crisp, self-evident step remains for the learner to complete.
-4. REPEATED IMPASSE OR FULL DERIVATION REQUEST (help_level="solution", substantive_help=true):
-   - If the learner has already asked 2+ times on the same point without landing it, OR explicitly asks to be shown the full derivation/explanation:
-   - Stop withholding! Walk cleanly through the complete derivation on the whiteboard from start to finish so it truly clicks, then mention in one brief phrase that they can click "Show answer" (or submit) to close and revisit it cold soon.
-
-Formatting & contract:
-- Speak directly in second person ("You..."). No praise fluff or exclamation marks.
-- Put math variables, equations, and shapes in $...$ (double-escape backslashes in JSON like \\\\frac, \\\\partial, \\\\hat). Reserve backticks strictly for literal code identifiers.
-- Answer directly with ZERO tool calls.
-- Return ONLY valid JSON with "message" FIRST so prose streams cleanly: {"message": string, "help_level": "none"|"hint"|"step"|"solution", "substantive_help": boolean}`;
-
     const mem = trimLearnerMemory(input.learnerMemory);
     const thread = input.turns
       .slice(-16)
       .map((t) => `${t.role === "user" ? "Learner" : "Coach"}: ${t.text}`)
       .join("\n");
     const relatedBlock = input.relatedEvidence?.length
-      ? `Recently worked related concepts (use to bridge naturally if relevant; respect noted evidence strength):\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
+      ? `Recently worked related concepts:\n${input.relatedEvidence.map((x) => `- ${x}`).join("\n")}`
       : "";
-    const impasseHint =
-      (input.priorClarifyCount ?? 0) >= 2
-        ? `Prior clarifications on this prompt so far: ${input.priorClarifyCount} (learner has already struggled across multiple turns—prioritize a clear, complete whiteboard walkthrough rather than withholding steps).`
-        : "";
-    const userMsg = [
-      mem ? `Learner memory (for calibration only):\n${mem}` : "",
-      `Active practice prompt: ${input.prompt}`,
-      input.starter?.trim() ? `Starter scaffold:\n${input.starter.trim()}` : "",
-      `Target concept (for grounding): ${input.unitText}`,
-      relatedBlock,
-      impasseHint,
-      thread ? `Prior exchange on this prompt:\n${thread}` : "",
-      `Learner question: ${input.question.trim()}`,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    const deltaMsg = [impasseHint, `Learner question: ${input.question.trim()}`].filter(Boolean).join("\n\n");
+    const priorAttr = (input.priorClarifyCount ?? 0) > 0 ? ` prior_clarifications="${input.priorClarifyCount}"` : "";
+    const deltaMsg = `<turn mode="CLARIFY"${priorAttr}>\n${input.question.trim()}\n</turn>`;
+    const userMsg = input.situationalContext
+      ? [
+          input.situationalContext,
+          thread ? `<prior_exchange>\n${thread}\n</prior_exchange>` : "",
+          deltaMsg,
+        ]
+          .filter(Boolean)
+          .join("\n\n")
+      : [
+          mem ? `Learner profile:\n${mem}` : "",
+          `Active practice prompt: ${input.prompt}`,
+          input.starter?.trim() ? `Starter scaffold:\n${input.starter.trim()}` : "",
+          `Target concept (for grounding): ${input.unitText}`,
+          relatedBlock,
+          thread ? `Prior exchange on this prompt:\n${thread}` : "",
+          deltaMsg,
+        ]
+          .filter(Boolean)
+          .join("\n\n");
 
     let agyTrace: AgyTurnTrace | undefined;
     let ttftProseMs: number | undefined;
@@ -2187,6 +2213,7 @@ Formatting & contract:
         ? "acp"
         : "agy"
       : "openrouter";
+    this.activeForegroundCalls++;
     try {
       let raw = "";
       if (this.clarifyWorker) {
@@ -2194,7 +2221,7 @@ Formatting & contract:
           fallbackWorker: this.clarifyWorker,
           fallbackWorkerName: "agy",
           modelId: this.clarifySlug,
-          systemPrompt: sys,
+          systemPrompt: UNIFIED_ATTEMPT_COACH_SYSTEM,
           userPrompt: userMsg,
           deltaPrompt: deltaMsg,
           sessionKey: input.sessionKey,
@@ -2223,7 +2250,7 @@ Formatting & contract:
             max_tokens: 1400,
             response_format: { type: "json_object" },
             messages: [
-              { role: "system", content: sys },
+              { role: "system", content: UNIFIED_ATTEMPT_COACH_SYSTEM },
               { role: "user", content: userMsg },
             ],
           }),
@@ -2232,15 +2259,26 @@ Formatting & contract:
         const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
         raw = data.choices?.[0]?.message?.content ?? "";
       }
-      const parsed = parseJudgeJson<{ message?: string; substantive_help?: boolean; help_level?: string }>(raw);
+      const parsed = parseJudgeJson<{
+        message?: string;
+        substantive_help?: boolean;
+        help_level?: string;
+        help_given?: string;
+      }>(raw);
       if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
-        const rawLevel = parsed.help_level;
+        const rawLevel = parsed.help_given ?? parsed.help_level;
         const helpLevel: ClarifyHelpLevel =
-          rawLevel === "none" || rawLevel === "hint" || rawLevel === "step" || rawLevel === "solution"
-            ? rawLevel
-            : parsed.substantive_help
-              ? "step"
-              : "none";
+          rawLevel === "none"
+            ? "none"
+            : rawLevel === "nudge" || rawLevel === "hint"
+              ? "hint"
+              : rawLevel === "step"
+                ? "step"
+                : rawLevel === "solution"
+                  ? "solution"
+                  : parsed.substantive_help
+                    ? "step"
+                    : "none";
         const substantive = helpLevel !== "none" || Boolean(parsed.substantive_help);
         this.emitPerf(
           this.buildPerf(t0, "follow-up", this.clarifyModel, workerKind, true, {
@@ -2288,11 +2326,178 @@ Formatting & contract:
         this.buildPerf(t0, "follow-up", this.clarifyModel, workerKind, false, { trace: agyTrace, error: msg }),
         onPerf,
       );
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     }
     return {
       message: "Could not answer that question just now.",
       substantive_help: false,
       help_level: "none",
+      failed: true,
+    };
+  }
+
+  /**
+   * Handles a post-verdict reflection turn (`mode="POST_REP"`) on the SAME warm unified attempt
+   * session (`attempt:${userId}:${attemptId}`), preserving 100% KV prefix cache and full context
+   * from the just-completed rep while supporting optional self-healing `rep_fix` actions.
+   */
+  async postRepFollowUp(
+    input: {
+      sessionKey: string;
+      expectedPriorTurns?: number | undefined;
+      situationalContext: string;
+      priorExchange: string;
+      reply: string;
+      grade: Grade;
+      sketchDataUrl?: string | null | undefined;
+    },
+    onText?: (partialMessage: string) => void,
+    onPerf?: (rec: PerfRecord) => void,
+    signal?: AbortSignal,
+  ): Promise<ExploreResult> {
+    const t0 = Date.now();
+    if (!this.apiKey && !this.drillWorker) {
+      return {
+        message: "Configure OPENROUTER_API_KEY or MYELIN_JUDGE_MODEL for post-rep follow-ups.",
+        suggested_units: [],
+        failed: true,
+      };
+    }
+
+    const deltaMsg = `<turn mode="POST_REP" closed_grade="${input.grade}">\n${input.reply.trim() || "(see attached sketch)"}\n</turn>`;
+    const fullMsg = [
+      input.situationalContext,
+      input.priorExchange ? `<prior_exchange>\n${input.priorExchange}\n</prior_exchange>` : "",
+      deltaMsg,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    let agyTrace: AgyTurnTrace | undefined;
+    let ttftProseMs: number | undefined;
+    let proseMs: number | undefined;
+    let tailJsonMs: number | undefined;
+    let workerKind: PerfWorker = this.drillWorker
+      ? this.acpClient && !this.acpClient.isUnsupported
+        ? "acp"
+        : "agy"
+      : "openrouter";
+    this.activeForegroundCalls++;
+    try {
+      let raw = "";
+      if (this.drillWorker) {
+        const out = await this.askJsonWithTrace({
+          fallbackWorker: this.drillWorker,
+          fallbackWorkerName: "agy",
+          modelId: this.drillSlug,
+          systemPrompt: UNIFIED_ATTEMPT_COACH_SYSTEM,
+          userPrompt: fullMsg,
+          deltaPrompt: deltaMsg,
+          sessionKey: input.sessionKey,
+          expectedPriorTurns: input.expectedPriorTurns,
+          sketchDataUrl: input.sketchDataUrl,
+          signal,
+          onText,
+        });
+        raw = out.raw;
+        agyTrace = out.trace;
+        ttftProseMs = out.ttftProseMs;
+        proseMs = out.proseMs;
+        tailJsonMs = out.tailJsonMs;
+        workerKind = out.worker;
+      } else {
+        const content: unknown = input.sketchDataUrl
+          ? [
+              { type: "text", text: fullMsg },
+              { type: "image_url", image_url: { url: input.sketchDataUrl } },
+            ]
+          : fullMsg;
+        const res = await this.fetchFn(CHAT_URL, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          signal,
+          body: JSON.stringify({
+            model: this.drillModel,
+            reasoning: { effort: this.routing.drill.effort },
+            temperature: 0.25,
+            max_tokens: 1800,
+            response_format: { type: "json_object" },
+            messages: [
+              { role: "system", content: UNIFIED_ATTEMPT_COACH_SYSTEM },
+              { role: "user", content },
+            ],
+          }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+        raw = data.choices?.[0]?.message?.content ?? "";
+      }
+      const parsed = parseJudgeJson<{
+        message?: string;
+        rep_fix?: {
+          reworded_unit?: string | null;
+          improved_prompt?: string | null;
+          recommended_grade?: string | null;
+        } | null;
+      }>(raw);
+      if (parsed && typeof parsed.message === "string" && parsed.message.trim()) {
+        const rf = parsed.rep_fix;
+        const repFix =
+          rf && typeof rf === "object"
+            ? {
+                reworded_unit: typeof rf.reworded_unit === "string" && rf.reworded_unit.trim() ? rf.reworded_unit.trim() : null,
+                improved_prompt: typeof rf.improved_prompt === "string" && rf.improved_prompt.trim() ? rf.improved_prompt.trim() : null,
+                recommended_grade:
+                  rf.recommended_grade && ["again", "hard", "good", "easy"].includes(rf.recommended_grade)
+                    ? (rf.recommended_grade as Grade)
+                    : null,
+              }
+            : null;
+        const hasFix = Boolean(repFix && (repFix.reworded_unit || repFix.improved_prompt || repFix.recommended_grade));
+        this.emitPerf(
+          this.buildPerf(t0, "explore", this.drillModel, workerKind, true, {
+            trace: agyTrace,
+            ttftProseMs,
+            proseMs,
+            tailJsonMs,
+            outputChars: raw.length,
+            promptChars: fullMsg.length,
+          }),
+          onPerf,
+        );
+        return {
+          message: parsed.message.trim(),
+          suggested_units: [],
+          ...(hasFix && repFix ? { rep_fix: repFix } : {}),
+        };
+      }
+      if (raw.trim()) {
+        return { message: raw.trim(), suggested_units: [] };
+      }
+    } catch (err) {
+      if (isAbortError(err) || signal?.aborted) {
+        this.emitPerf(
+          this.buildPerf(t0, "explore", this.drillModel, workerKind, false, { trace: agyTrace, aborted: true, error: "aborted" }),
+          onPerf,
+        );
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[judge] postRepFollowUp failed:", msg);
+      this.emitPerf(
+        this.buildPerf(t0, "explore", this.drillModel, workerKind, false, { trace: agyTrace, error: msg }),
+        onPerf,
+      );
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
+    }
+    return {
+      message: "Could not reach the coach just now—try again in a moment.",
+      suggested_units: [],
       failed: true,
     };
   }
@@ -2380,6 +2585,7 @@ Formatting & contract:
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
     let workerKind: PerfWorker = this.agyWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
+    this.activeForegroundCalls++;
     try {
       let raw = "";
       if (this.agyWorker) {
@@ -2497,6 +2703,8 @@ Formatting & contract:
         }),
         onPerf,
       );
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     }
     return { message: "Could not reach the coach just now.", suggested_units: [], failed: true };
   }
@@ -3061,21 +3269,20 @@ Return ONLY valid JSON:
     }
 
     const sys = `You are Myelin's offline memory consolidation ("Dream") pass.
-Your job is to distill raw recent learning sessions into ONE ruthlessly lean, always-loaded Markdown file ("learner.md", STRICT MAX 320 WORDS) that predicts what future Myelin turns (drills, prompts, explorations, briefings) will need to accelerate this specific human's understanding.
+Distill raw recent learning sessions into ONE ruthlessly lean, always-loaded Markdown file ("learner.md", STRICT MAX 200 WORDS) that helps future coaching and prompt-generation turns meet this human where they actually are.
 
-CORE PRINCIPLES (Salience & Pruning beat Hoarding):
-1. NEVER list individual facts/units—the Knowledge Map already stores all units. Store ONLY high-salience cognitive patterns about *how this learner thinks and learns*:
-   - ## Baseline & Horizons — what they already hold cold (so the coach stops over-explaining basics) + active long-term learning arcs.
-   - ## What Clicks & Style — concrete preferences and explanation formats that clearly work for them (e.g. shape traces, short code snippets, direct whiteboard fixes vs Socratic quizzing).
-   - ## Active Blind Spots — ONLY genuine recurring error modes or conceptual friction seen across multiple turns/reps (NEVER one-off typos). Tie each to concrete signal.
-   - ## Recent Breakthroughs — 1–3 fresh mental models they just consolidated that future prompts/explorations can build on.
-2. GRADUATE RESOLVED BLIND SPOTS: Check Mastered units (high P_imm across reviews). If an old blind spot in Current memory has clearly been mastered, REMOVE it from Active Blind Spots and record it in "graduated".
-3. RESPECT HUMAN EDITS: If Current memory was edited by the learner (updated_by="learner"), preserve their explicit preferences/notes unless directly superseded.
-4. STAY STRICTLY UNDER 320 WORDS. Prune stale/low-salience lines aggressively; less is more.
-5. CONSERVATIVE MAP COMPACTION (optional — only when Active unit catalog is provided):
-   - "merges" (max 3): ONLY merge genuine duplicates or near-identical restatements (e.g. two formulas differing only by variable name). Set "keep_id" to the unit with more reviews/stronger wording, "merge_ids" to redundant duplicate IDs, and optional cleaner "text". Never merge distinct concepts.
-   - "retire_ids" (max 3): ONLY retire trivially mastered baseline facts/vocabulary that already have reviews >= 3 and P >= 90% and are clearly automatic.
-   - "links" (max 5): ONLY add missing direct prerequisite edges ("unit_id" directly builds on "rests_on" IDs) where both IDs exist in the catalog (no cycles).
+CORE PRINCIPLES:
+1. NEVER list individual units, paper constants, or specific derivative formulas (the Knowledge Map and per-unit dossiers already carry those!). Store ONLY durable, cross-topic patterns in exactly 3 compact sections:
+   - ## Background & Active Arcs — domains they already hold cold + active multi-day learning arcs.
+   - ## Notation & Explanation Style — explicit notation preferences (e.g. grad_x over dx) and explanation styles that click (e.g. step-by-step algebra before geometric shortcuts, shape traces, code vs prose).
+   - ## Cross-Cutting Habits — recurring cross-topic cognitive watchouts or thinking moves (NEVER one-off typos or single-card math slips).
+2. GRADUATE RESOLVED PATTERNS: If an old watchout in Current memory is clearly mastered across reviews, REMOVE it and record it in "graduated".
+3. RESPECT HUMAN EDITS: If Current memory was edited by the learner (updated_by="learner"), preserve their explicit preferences unless superseded.
+4. STAY STRICTLY UNDER 200 WORDS. Prune aggressively.
+5. CONSERVATIVE MAP COMPACTION (when Active unit catalog is provided):
+   - "merges" (max 3): ONLY merge genuine duplicates or near-identical restatements.
+   - "retire_ids" (max 3): ONLY retire trivially mastered baseline vocabulary/facts with reviews >= 3 and P >= 90%.
+   - "links" (max 6): Actively link unlinked (rests_on=[]) units to their direct prerequisite unit IDs in the catalog (no cycles).
    - If nothing clearly warrants compaction, return empty arrays [].
 
 Return ONLY valid JSON:
@@ -3325,7 +3532,7 @@ Return ONLY valid JSON:
     let cursor = 0;
     const runWorker = async () => {
       while (cursor < queue.length) {
-        if (this.activeForegroundPrompts > 0) break;
+        if (this.activeForegroundCalls > 0) break;
         const item = queue[cursor++]!;
         const bIds = (item.bundledUnits ?? []).map((b) => b.id);
         const key = this.promptKey(item.unit, item.depth, item.restsOn, item.variant ?? 0, item.modality ?? "direct", bIds);
@@ -3407,15 +3614,13 @@ Return ONLY valid JSON:
       mcq: `Modality: SHARP CONTRAST. Set "starter" to null.`,
     };
 
-    const promptSys = `Write ONE crisp, motivating, self-contained practice question (1-2 clear sentences, max 44 words), its exact single-claim grading rubric ("expected_crux", max 40 words), and an optional pre-filled editor "starter" matching the requested Modality.
+    const promptSys = `Design ONE crisp, self-contained active-retrieval exercise (1-2 clear sentences, max 44 words), its exact minimal grading rubric ("expected_crux", max 40 words), and an optional code "starter" matching the requested Modality.
 Rules:
-- MOTIVATE, DON'T WORKSHEET: Frame a real problem, comparison, or concrete setup directly and plainly—NEVER a disembodied textbook command ("State formula Y"), AND NEVER forced faux-ownership or roleplay ("Your PyTorch LayerNorm...", "A teammate argues...").
-- CLEAN MATH & GRADIENT TYPOGRAPHY: In "prompt", render equations, variables, and tensor shapes in KaTeX (\`$y = \\gamma \\hat{x} + \\beta$\`, \`$(B, T, D)$\`), NOT backticks! Reserve backticks strictly for actual code tokens/flags (like \`dim=-1\` or \`gradcheck\`, at most 2–3 in a prompt). Prefer unambiguous gradient names (\`grad_gamma\`, \`grad_x\`, or $\\nabla_x L$) over ambiguous differential shorthand (\`d_gamma\`, \`dx\`).
-- ZERO SPOILERS, ZERO RIDDLES: Name the starting setup/object clearly (e.g. standard attention $\\text{softmax}(QK^T)V$, a database write path, a sample mean $\\bar{x}$)—hide ONLY the solution, trick, or intermediate pivot, NEVER obfuscate the premise into a vague riddle.
-- NO SURFACE-CUE REPETITION: If Previously asked prompts are listed below, DO NOT reuse the same cover story, numbers, or phrasing—change what the learner must recognize or decide.
-- 100% SELF-CONTAINED COLD: Explicitly define every symbol or variable used.
-- ONE SINGLE TASK: Never stack two separate unrelated demands.
-- "expected_crux": State the exact claim/fix/expression needed to pass THIS prompt cleanly (so the judge never nitpicks unasked unit clauses).
+- Direct problem framing: state the mathematical, systems, or code setup plainly—no disembodied textbook commands ("State formula Y") and no forced roleplay ("A teammate argues..."). Follow notation preferences in Learner Profile.
+- Self-contained & unambiguous: define every variable, shape, and assumption cold. Hide ONLY the target crux; never turn the setup into a guessing game.
+- Respect unit history & source provenance: if the learner is at first contact, recently lapsed, or left the source exploration confused, test the core mechanism directly rather than wrapping it in an indirect trick or opaque helper variable name. Do not repeat scenarios in Previously asked.
+- Format math/shapes in KaTeX ($...$) and reserve backticks strictly for literal code identifiers.
+- "expected_crux": state the exact minimal claim/fix/expression required to pass THIS prompt cleanly (accepting valid equivalents).
 - ${modalityGuide[modality]}
 - Return ONLY valid JSON: {"prompt": string, "expected_crux": string, "starter": string|null}`;
     const prior = (opts.priorPrompts ?? []).filter(Boolean).slice(-3);
@@ -3423,8 +3628,9 @@ Rules:
     const promptUser = [
       goalByDepth[depth],
       mem
-        ? `Learner memory (use ONLY to match background level, preferred style, and target active blind spots—NEVER spoil the answer):\n${mem}`
+        ? `Learner profile (use ONLY to match background level and notation style—NEVER spoil the answer):\n${mem}`
         : "",
+      opts.situationalContext?.trim() ? `Unit history & provenance (use to calibrate difficulty & framing—NEVER spoil):\n${opts.situationalContext.trim()}` : "",
       unit.topic ? `Topic: ${unit.topic}` : "",
       `Primary unit (${unit.kind}): ${unit.text}`,
       bundled.length > 0
@@ -3443,7 +3649,7 @@ Rules:
     const fallbackWorkerForCall = this.promptWorker;
     const timeoutMs = background ? 45_000 : 25_000;
 
-    if (!background) this.activeForegroundPrompts++;
+    if (!background) this.activeForegroundCalls++;
     const t0 = Date.now();
     const p = (async (): Promise<PromptCacheEntry> => {
       let agyTrace: AgyTurnTrace | undefined;
@@ -3562,7 +3768,7 @@ Rules:
       if (this.inflightPrompts.get(key)?.promise === p) {
         this.inflightPrompts.delete(key);
       }
-      if (!background) this.activeForegroundPrompts = Math.max(0, this.activeForegroundPrompts - 1);
+      if (!background) this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     });
 
     this.inflightPrompts.set(key, { promise: p, background });
@@ -3581,6 +3787,21 @@ Rules:
   ): string {
     const pairHash = pairedPrompt ? createHash("sha256").update(pairedPrompt).digest("hex").slice(0, 10) : "";
     return `${this.promptKey(unit, "recall", restsOn, variant, "mcq", [])}:r=${role}${pairHash ? `:p=${pairHash}` : ""}`;
+  }
+
+  /** Returns a cached verified MCQ entry synchronously if already warmed, or null (never blocks). */
+  peekMcqEntry(
+    unit: { id: string; text: string },
+    restsOn: string[],
+    opts: {
+      variant?: number | undefined;
+      role: "standalone" | "preliminary";
+      pairedPrompt?: string | undefined;
+    },
+  ): PromptCacheEntry | null {
+    const key = this.mcqCacheKey(unit, restsOn, opts.variant ?? 0, opts.role, opts.pairedPrompt);
+    const cached = this.promptCache.get(key);
+    return cached?.mcq ? cached : null;
   }
 
   /** Prefetches verified MCQs in the background so one-tap MCQs don't stall on serial LLM calls. */
@@ -3602,7 +3823,7 @@ Rules:
     if (queue.length === 0) return;
     const run = async () => {
       for (const item of queue.slice(0, 3)) {
-        if (this.activeForegroundPrompts > 0) break;
+        if (this.activeForegroundCalls > 0) break;
         try {
           await this.generateMcqEntry(item.unit, item.restsOn, {
             variant: item.variant,
@@ -3799,23 +4020,26 @@ Return ONLY valid JSON: {"chosen_id": string | "AMBIGUOUS", "reason": string}`;
     unitText: string;
     question: string;
     turns: { role: "user" | "assistant"; text: string }[];
+    learnerMemory?: string | null | undefined;
+    situationalContext?: string | undefined;
   }): Promise<{ message: string; substantive_help: boolean; revealed_answer: boolean }> {
     if (!this.enabled) {
       return {
-        message: "Select an option to check your understanding, or choose I'm not sure · Show answer.",
+        message: "Select an option to check your understanding, or click Show answer.",
         substantive_help: false,
         revealed_answer: false,
       };
     }
-    const sys = `You are Myelin's learning partner answering a clarifying question on an active 4-choice MCQ.
-Rules:
-- Answer ONLY setup, notation, or terminology questions in 1-2 crisp sentences.
-- NEVER select, hint at, or eliminate any of the 4 choices!
-- If the learner asks which option is right, direct them to choose "I'm not sure · Show answer" instead of revealing it.
-- Set substantive_help=true ONLY if you had to explain an underlying domain concept (not neutral notation/wording).
-- Set revealed_answer=true ONLY if you accidentally disclosed the deciding answer.
-- Return ONLY valid JSON: {"message": string, "substantive_help": boolean, "revealed_answer": boolean}`;
+    const sys = `You are answering a clarifying question on an active 4-choice MCQ (or 3-choice). Use their Learner Profile and Situational Context if provided.
+- Never name, select, or eliminate specific options (1..4).
+- For notation, shape, or setup questions, clarify directly (substantive_help=false).
+- If the learner asks how to approach the stem or says it feels unfamiliar, give ONE concise conceptual bridge from a prerequisite or principle they already know (substantive_help=true) without computing or giving away the winning choice.
+- Set revealed_answer=true ONLY if your reply directly discloses the winning choice.
+- Put math/shapes in $...$ and code identifiers in backticks. Answer directly with ZERO tool calls.
+- Return ONLY valid JSON with "message" FIRST: {"message": string, "substantive_help": boolean, "revealed_answer": boolean}`;
+    const mem = trimLearnerMemory(opts.learnerMemory);
     const userMsg = [
+      opts.situationalContext?.trim() || (mem ? `Learner profile:\n${mem}` : null),
       `Question: ${opts.prompt}`,
       `Options:\n${opts.choices.map((c, i) => `${i + 1}. ${c.text}`).join("\n")}`,
       opts.turns.length
@@ -3825,14 +4049,15 @@ Rules:
     ]
       .filter(Boolean)
       .join("\n\n");
+    this.activeForegroundCalls++;
     try {
       let raw: string | null = null;
-      if (this.drillWorker) {
+      if (this.clarifyWorker) {
         const res = await this.askAgy({
-          fallbackWorker: this.drillWorker,
+          fallbackWorker: this.clarifyWorker,
           fallbackWorkerName: "agy",
-          modelId: this.drillSlug,
-          systemPrompt: `${sys}\nAnswer directly with ZERO tool calls.`,
+          modelId: this.clarifySlug,
+          systemPrompt: sys,
           userPrompt: userMsg,
         });
         raw = res.raw.trim() || null;
@@ -3841,9 +4066,9 @@ Rules:
           method: "POST",
           headers: { Authorization: `Bearer ${this.apiKey}`, "Content-Type": "application/json" },
           body: JSON.stringify({
-            model: this.llmModel,
+            model: this.clarifyModel,
             temperature: 0.2,
-            max_tokens: 500,
+            max_tokens: 700,
             response_format: { type: "json_object" },
             messages: [
               { role: "system", content: sys },
@@ -3868,6 +4093,8 @@ Rules:
       }
     } catch (err) {
       console.error("[judge] clarifyMcq failed:", err instanceof Error ? err.message : err);
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     }
     return {
       message: "Choose the option that matches the stated premises, or select I'm not sure · Show answer.",
@@ -4131,6 +4358,7 @@ Rules:
     let proseMs: number | undefined;
     let tailJsonMs: number | undefined;
     let workerKind: PerfWorker = this.agyWorker ? (this.acpClient && !this.acpClient.isUnsupported ? "acp" : "agy") : "openrouter";
+    this.activeForegroundCalls++;
     try {
       let raw = "";
       if (this.agyWorker) {
@@ -4240,6 +4468,8 @@ Rules:
         }),
         onPerf,
       );
+    } finally {
+      this.activeForegroundCalls = Math.max(0, this.activeForegroundCalls - 1);
     }
     return { message: "Could not reach the coach just now.", suggested_units: [], failed: true };
   }

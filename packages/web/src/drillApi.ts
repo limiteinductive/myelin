@@ -474,6 +474,7 @@ export function exploreDrill(
     origin_prompt?: string;
     prior_post_turns?: { user: string; coach: string; question?: string; added?: AddedUnit[] }[];
     rep_context?: {
+      attempt_id?: string | null;
       unit_id: string;
       depth: Depth;
       prompt: string;
